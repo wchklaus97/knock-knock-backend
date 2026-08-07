@@ -1,0 +1,22 @@
+name = "knock-knock-backend"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-04-16"
+
+[build]
+command = "worker-build --release"
+
+[vars]
+PUSH_MODE = "dev"
+CORS_ORIGIN = "*"
+SERVICE_VERSION = "rust-worker-0.1.0"
+# Set these for real APNs delivery; secrets belong in `wrangler secret put`.
+# PUSH_MODE = "both"
+# APNS_BUNDLE_ID = "hk.knockknock.app"
+# APNS_PRODUCTION = "true"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "knock-knock"
+# Replace with the UUID returned by `wrangler d1 create knock-knock` before deploy.
+database_id = "local"
+migrations_dir = "migrations"

@@ -1,0 +1,156 @@
+use serde_json::Value;
+use worker::{D1Database, Env};
+
+use crate::apns;
+use crate::auth::config_value;
+use crate::auth::new_id;
+use crate::db;
+use crate::error::{ApiError, ApiResult};
+use crate::models::PushRow;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DeviceTokenRow {
+    platform: String,
+    push_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PushDelivery {
+    pub inbox: bool,
+    pub apns_sent: usize,
+    pub apns_errors: Vec<String>,
+}
+
+pub async fn enqueue_push(
+    db: &D1Database,
+    user_id: &str,
+    session_id: &str,
+    title: &str,
+    body: &str,
+    voice_script: Option<&str>,
+    payload: Value,
+) -> ApiResult<Value> {
+    let push_id = new_id("push")?;
+    let created_at = db::now_iso();
+    db::run(
+        db,
+        "INSERT INTO pushes (id, user_id, session_id, title, body, voice_script, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        vec![
+            db::text(&push_id),
+            db::text(user_id),
+            db::text(session_id),
+            db::text(title),
+            db::text(body),
+            db::optional_text(voice_script),
+            db::text(&payload.to_string()),
+            db::text(&created_at),
+        ],
+    )
+    .await?;
+    Ok(serde_json::json!({
+        "push_id": push_id,
+        "session_id": session_id,
+        "title": title,
+        "body": body,
+        "voice_script": voice_script,
+        "created_at": created_at,
+    }))
+}
+
+pub async fn list_pushes(db: &D1Database, user_id: &str, limit: i32) -> ApiResult<Vec<Value>> {
+    let rows: Vec<PushRow> = db::all(
+        db,
+        "SELECT id, session_id, title, body, voice_script, created_at FROM pushes WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+        vec![db::text(user_id), db::number(limit.clamp(1, 200) as i64)],
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "push_id": row.id,
+                "session_id": row.session_id,
+                "title": row.title,
+                "body": row.body,
+                "voice_script": row.voice_script,
+                "created_at": row.created_at,
+            })
+        })
+        .collect())
+}
+
+async fn user_apns_tokens(db: &D1Database, user_id: &str) -> ApiResult<Vec<String>> {
+    let rows: Vec<DeviceTokenRow> = db::all(
+        db,
+        "SELECT platform, push_token FROM devices WHERE user_id = ? AND push_token IS NOT NULL AND push_token != ''",
+        vec![db::text(user_id)],
+    )
+    .await?;
+    let mut tokens = rows
+        .into_iter()
+        .filter(|row| row.platform == "ios")
+        .filter_map(|row| row.push_token)
+        .filter(|token| apns::looks_like_token(token))
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    Ok(tokens)
+}
+
+pub async fn notify_user(
+    db: &D1Database,
+    env: &Env,
+    user_id: &str,
+    session_id: &str,
+    title: &str,
+    body: &str,
+    voice_script: Option<&str>,
+    payload: Value,
+) -> ApiResult<PushDelivery> {
+    let mode = config_value(env, "PUSH_MODE", "dev");
+    if !["dev", "apns", "both"].contains(&mode.as_str()) {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "PUSH_MODE must be dev, apns, or both",
+        ));
+    }
+    let apns_ready = apns::is_ready(env);
+    let mut inbox = false;
+    if mode == "dev" || mode == "both" || !apns_ready {
+        enqueue_push(
+            db,
+            user_id,
+            session_id,
+            title,
+            body,
+            voice_script,
+            payload.clone(),
+        )
+        .await?;
+        inbox = true;
+    }
+
+    let mut apns_sent = 0;
+    let mut apns_errors = Vec::new();
+    if (mode == "apns" || mode == "both") && apns_ready {
+        for token in user_apns_tokens(db, user_id).await? {
+            match apns::send_alert(env, &token, title, body, session_id, voice_script).await {
+                Ok(()) => apns_sent += 1,
+                Err(error) => apns_errors.push(error.message),
+            }
+        }
+    }
+
+    // Keep the existing development phone polling loop alive if APNs is
+    // configured but no physical device token was available or delivery failed.
+    if !inbox && apns_sent == 0 {
+        enqueue_push(db, user_id, session_id, title, body, voice_script, payload).await?;
+        inbox = true;
+    }
+    Ok(PushDelivery {
+        inbox,
+        apns_sent,
+        apns_errors,
+    })
+}
