@@ -11,7 +11,12 @@ use crate::auth::config_value;
 use crate::error::{ApiError, ApiResult};
 
 pub fn is_ready(env: &worker::Env) -> bool {
-    !config_value(env, "APNS_KEY", "").trim().is_empty()
+    let key = config_value(env, "APNS_KEY", "");
+    let key_is_valid = decode_private_key(&key)
+        .ok()
+        .and_then(|der| SigningKey::from_pkcs8_der(&der).ok())
+        .is_some();
+    key_is_valid
         && !config_value(env, "APNS_KEY_ID", "").trim().is_empty()
         && !config_value(env, "APNS_TEAM_ID", "").trim().is_empty()
         && !config_value(env, "APNS_BUNDLE_ID", "hk.knockknock.app")
