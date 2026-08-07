@@ -66,6 +66,9 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
                 "runtime": "cloudflare-worker",
                 "api": "rust",
                 "version": config_value(&env, "SERVICE_VERSION", "unknown"),
+                "push_mode": config_value(&env, "PUSH_MODE", "dev"),
+                "apns_ready": crate::apns::is_ready(&env),
+                "apns_production": config_value(&env, "APNS_PRODUCTION", "false") == "true",
             }),
             200,
         );
