@@ -1,0 +1,50 @@
+name: Production D1 backup
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 02 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Wrangler
+        run: npm install --global wrangler@4.81.1
+      - name: Materialize non-secret production config
+        env:
+          D1_DATABASE_ID: ${{ vars.KNOCK_KNOCK_D1_DATABASE_ID }}
+          CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_CORS_ORIGIN }}
+        run: |
+          test -n "$D1_DATABASE_ID"
+          test -n "$CORS_ORIGIN"
+          sed \
+            -e "s|REPLACE_WITH_D1_DATABASE_ID|$D1_DATABASE_ID|g" \
+            -e "s|REPLACE_WITH_ALLOWED_ORIGIN|$CORS_ORIGIN|g" \
+            -e "s|REPLACE_WITH_RELEASE_VERSION|backup-${GITHUB_RUN_ID}|g" \
+            wrangler.production.toml.example > "$RUNNER_TEMP/wrangler.production.toml"
+      - name: Export production D1
+        env:
+          KNOCK_KNOCK_PRODUCTION_CONFIG: ${{ runner.temp }}/wrangler.production.toml
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          backup_dir="$RUNNER_TEMP/knock-knock-backup"
+          mkdir -p "$backup_dir"
+          ./scripts/export-production-d1.sh "$backup_dir/knock-knock-${GITHUB_RUN_ID}.sql"
+          test -s "$backup_dir/knock-knock-${GITHUB_RUN_ID}.sql"
+          grep -q "CREATE TABLE" "$backup_dir/knock-knock-${GITHUB_RUN_ID}.sql"
+      - name: Retain backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: knock-knock-d1-${{ github.run_id }}
+          path: ${{ runner.temp }}/knock-knock-backup/*.sql
+          retention-days: 30

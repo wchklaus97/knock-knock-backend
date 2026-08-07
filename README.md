@@ -24,7 +24,9 @@ wrangler d1 migrations apply DB --local
 wrangler dev
 ```
 
-Run the repeatable contract loop while `wrangler dev` is running:
+Run the repeatable contract loop while `wrangler dev` is running. It covers
+the full auth/pairing/phone loop and two consecutive decisions on the same
+`session_id` and `chat_id`:
 
 ```sh
 ./scripts/contract-smoke.sh
@@ -39,25 +41,29 @@ Set a development secret in `.dev.vars`:
 JWT_SECRET=replace-this-for-local-development
 ```
 
-For Cloudflare deployment:
+The checked-in `wrangler.toml` is local-only: it explicitly sets
+`NODE_ENV=development` and binds to local D1. Do not use it for a remote
+production deployment. Prepare the production config first:
 
 ```sh
+cp wrangler.production.toml.example wrangler.production.toml
 wrangler d1 create knock-knock
-# Put the returned UUID into wrangler.toml as database_id.
-wrangler d1 migrations apply DB --remote
-wrangler secret put JWT_SECRET
+# Put the returned UUID into wrangler.production.toml as database_id and
+# replace CORS_ORIGIN and SERVICE_VERSION.
+wrangler d1 migrations apply knock-knock --remote --config wrangler.production.toml
+wrangler secret put JWT_SECRET --config wrangler.production.toml
 # Required for real APNs delivery (use the .p8 contents as the key value).
-wrangler secret put APNS_KEY
-wrangler secret put APNS_KEY_ID
-wrangler secret put APNS_TEAM_ID
-wrangler deploy
+wrangler secret put APNS_KEY --config wrangler.production.toml
+wrangler secret put APNS_KEY_ID --config wrangler.production.toml
+wrangler secret put APNS_TEAM_ID --config wrangler.production.toml
+wrangler deploy --config wrangler.production.toml
 ```
 
-Before the first production deploy, change the remote vars from their local
-defaults to `NODE_ENV=production`, `PUSH_MODE=apns` (or `both`), a specific
-`CORS_ORIGIN`, and the correct APNs bundle/environment. The Worker returns a
-generic message for HTTP 5xx responses so database or signing details are not
-leaked to clients.
+The Worker rejects production traffic until `NODE_ENV=production`, a random
+`JWT_SECRET` (at least 32 characters), explicit CORS, APNs credentials,
+`PUSH_MODE=apns|both`, `APNS_PRODUCTION`, and `SERVICE_VERSION` are present.
+It returns a generic message for HTTP 5xx responses so database or signing
+details are not leaked to clients.
 
 `PUSH_MODE=dev` stores push events in D1 so the current iPhone development
 inbox continues to work. For a production phone build, set `PUSH_MODE=apns`
@@ -67,6 +73,44 @@ or `PUSH_MODE=both`, configure `APNS_BUNDLE_ID` and
 configured Apple `.p8` key; missing or failed APNs delivery falls back to the
 development inbox when appropriate instead of being reported as a false
 success.
+
+`PUSH_MODE=dev` is not APNs: it writes a push event to the D1-backed development
+inbox for polling. Production uses `PUSH_MODE=both` during rollout so the app
+can keep the inbox fallback while Apple delivery is verified; use
+`APNS_PRODUCTION=true` for TestFlight/App Store builds. An Xcode development
+build uses the sandbox APNs environment and must use a separate config with
+`APNS_PRODUCTION=false` if it is tested against APNs directly.
+
+## Operations
+
+Production Wrangler config enables Workers Observability. Run the repeatable
+probe with:
+
+```sh
+./scripts/production-healthcheck.sh https://your-worker.workers.dev
+```
+
+D1 production databases provide point-in-time recovery through Cloudflare
+Time Travel. For an export that must be retained outside D1, run:
+
+```sh
+./scripts/export-production-d1.sh /secure/backups/knock-knock-$(date +%Y%m%d).sql
+```
+
+The scheduled GitHub workflow runs the health probe every ten minutes. A
+failure opens one `production-alert` issue and a later healthy run closes it;
+enable GitHub Actions and issue notifications for the account/team that should
+receive failures.
+
+The scheduled D1 backup workflow exports the production database daily and
+retains a GitHub Actions artifact for 30 days. Before enabling it, add the
+repository Actions secret `CLOUDFLARE_API_TOKEN` (D1 read access); never put
+that value in this repository. The non-secret repository Actions variables
+`KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID`, `KNOCK_KNOCK_D1_DATABASE_ID`, and
+`KNOCK_KNOCK_CORS_ORIGIN` are non-secret deployment settings used to
+materialize the ignored production Wrangler config during the job. The workflow
+can also be started manually
+from the Actions tab.
 
 The old Node API remains in the original `voice-agent-bridge` tree as a
 migration reference. The Rust Worker is now the backend in this repository and

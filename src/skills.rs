@@ -202,3 +202,63 @@ pub fn resolve_actions(skill: &SkillDef, requested: Option<&[ActionInput]>) -> V
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_skill() -> SkillDef {
+        SkillDef {
+            skill_id: "deploy.result".into(),
+            template: "{{service}} in {{env}}: {{status}}".into(),
+            facts_schema: vec!["service".into(), "env".into(), "status".into()],
+            actions: vec![SkillAction {
+                id: "rollback".into(),
+                risk: "destructive".into(),
+                confirm: true,
+                title: "Rollback".into(),
+                payload: None,
+            }],
+            ttl: SkillTtl {
+                default_sec: 100_000,
+                destructive_sec: 2_000,
+            },
+            version: Some(1),
+        }
+    }
+
+    #[test]
+    fn summary_rendering_uses_facts_and_ignores_missing_values() {
+        let facts = serde_json::from_value(json!({
+            "service": "api",
+            "env": "production",
+            "status": "failed"
+        }))
+        .unwrap();
+        assert_eq!(
+            render_summary("{{service}} in {{env}}: {{status}} / {{missing}}", &facts),
+            "api in production: failed / "
+        );
+    }
+
+    #[test]
+    fn skill_limits_are_normalized_and_destructive_actions_require_confirmation() {
+        let normalized = normalize_skill(sample_skill());
+        assert_eq!(normalized.ttl.default_sec, 86_400);
+        assert_eq!(normalized.ttl.destructive_sec, 1_800);
+        assert!(action_needs_confirm(&normalized.actions[0]));
+    }
+
+    #[test]
+    fn requested_known_action_is_resolved_and_unknown_key_is_dropped() {
+        let skill = sample_skill();
+        let requested = vec![
+            ActionInput::Key("rollback".into()),
+            ActionInput::Key("does-not-exist".into()),
+        ];
+        let resolved = resolve_actions(&skill, Some(&requested));
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, "rollback");
+    }
+}

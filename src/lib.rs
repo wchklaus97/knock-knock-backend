@@ -16,7 +16,7 @@ use worker::*;
 use crate::auth::{
     config_value, create_agent_for_user, hash_api_key, hash_password, issue_user_auth,
     mint_api_key, mint_pairing_code, new_id, require_agent, require_user, require_user_or_agent,
-    sha256_hex, verify_password,
+    runtime_configuration, sha256_hex, verify_password,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::models::{
@@ -54,6 +54,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
     let path = req.path();
     let method = req.method();
+    runtime_configuration(&env)?;
 
     if method == Method::Options {
         return Ok(Response::empty()?);
@@ -64,7 +65,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
                 "ok": true,
                 "runtime": "cloudflare-worker",
                 "api": "rust",
-                "version": config_value(&env, "SERVICE_VERSION", "rust-worker-0.1.0"),
+                "version": config_value(&env, "SERVICE_VERSION", "unknown"),
             }),
             200,
         );
@@ -832,11 +833,15 @@ fn add_common_headers(
     env: &Env,
     _request_origin: Option<String>,
 ) -> Result<Response> {
-    let configured_origin = config_value(env, "CORS_ORIGIN", "*");
-    let origin = configured_origin;
-    response
-        .headers_mut()
-        .set("Access-Control-Allow-Origin", &origin)?;
+    let production = config_value(env, "NODE_ENV", "development")
+        .trim()
+        .eq_ignore_ascii_case("production");
+    let configured_origin = config_value(env, "CORS_ORIGIN", if production { "" } else { "*" });
+    if !configured_origin.trim().is_empty() {
+        response
+            .headers_mut()
+            .set("Access-Control-Allow-Origin", &configured_origin)?;
+    }
     response.headers_mut().set(
         "Access-Control-Allow-Headers",
         "Authorization, Content-Type, X-Agent-Key",

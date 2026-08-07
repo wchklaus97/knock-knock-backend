@@ -1,0 +1,62 @@
+name: Production health
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check production Worker
+        run: ./scripts/production-healthcheck.sh https://knock-knock-backend-production.wch-klaus.workers.dev
+      - name: Open or update production alert
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+            const title = "[Production alert] Knock Knock Worker health check failing";
+            const label = "production-alert";
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({ owner, repo, name: label, color: "b60205" });
+            }
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner, repo, state: "open", labels: label, per_page: 100
+            });
+            if (!openIssues.some((issue) => issue.title === title)) {
+              await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                labels: [label],
+                body: `The scheduled production health check failed.\n\nRun: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}\nEndpoint: https://knock-knock-backend-production.wch-klaus.workers.dev`
+              });
+            }
+      - name: Resolve production alert
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+            const title = "[Production alert] Knock Knock Worker health check failing";
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner, repo, state: "open", labels: "production-alert", per_page: 100
+            });
+            for (const issue of openIssues.filter((item) => item.title === title)) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue.number,
+                body: `Health recovered in scheduled run ${context.runId}.`
+              });
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: "closed" });
+            }

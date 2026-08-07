@@ -35,6 +35,10 @@ pub fn decimal(value: f64) -> JsValue {
     JsValue::from_f64(value)
 }
 
+pub fn optional_decimal(value: Option<f64>) -> JsValue {
+    value.map(JsValue::from_f64).unwrap_or_else(JsValue::null)
+}
+
 pub fn prepare(db: &D1Database, sql: &str, values: Vec<JsValue>) -> ApiResult<D1PreparedStatement> {
     Ok(db.prepare(sql).bind(&values)?)
 }

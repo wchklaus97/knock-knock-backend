@@ -6,9 +6,10 @@ compatibility_date = "2026-04-16"
 command = "worker-build --release"
 
 [vars]
+NODE_ENV = "development"
 PUSH_MODE = "dev"
 CORS_ORIGIN = "*"
-SERVICE_VERSION = "rust-worker-0.1.0"
+SERVICE_VERSION = "local-dev"
 # Set these for real APNs delivery; secrets belong in `wrangler secret put`.
 # PUSH_MODE = "both"
 # APNS_BUNDLE_ID = "hk.knockknock.app"

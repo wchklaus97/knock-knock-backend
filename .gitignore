@@ -2,3 +2,4 @@
 /build
 .wrangler
 .dev.vars
+wrangler.production.toml

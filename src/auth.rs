@@ -102,10 +102,96 @@ pub fn config_value(env: &Env, name: &str, default: &str) -> String {
     env_value(env, name).unwrap_or_else(|| default.to_string())
 }
 
+/// Validate settings that are unsafe to infer in a production Worker.
+///
+/// Local development deliberately uses permissive defaults. Production must
+/// opt in explicitly so deploying the local Wrangler file cannot silently
+/// fall back to a demo JWT secret, wildcard CORS, or development push inbox.
+pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
+    let node_env = config_value(env, "NODE_ENV", "development")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(node_env.as_str(), "development" | "test" | "production") {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "NODE_ENV must be development, test, or production",
+        ));
+    }
+    if node_env != "production" {
+        return Ok(());
+    }
+
+    // jwt_secret rejects the development fallback and short values.
+    let _ = jwt_secret(env)?;
+
+    let cors_origin = config_value(env, "CORS_ORIGIN", "");
+    if cors_origin.trim().is_empty()
+        || cors_origin.trim() == "*"
+        || cors_origin.trim().starts_with("REPLACE_")
+    {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "CORS_ORIGIN must be an explicit production origin",
+        ));
+    }
+
+    let push_mode = config_value(env, "PUSH_MODE", "")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(push_mode.as_str(), "apns" | "both") {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "PUSH_MODE must be apns or both in production",
+        ));
+    }
+
+    let service_version = config_value(env, "SERVICE_VERSION", "");
+    if service_version.trim().is_empty() || service_version.trim().starts_with("REPLACE_") {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "SERVICE_VERSION must be supplied for production",
+        ));
+    }
+
+    for (name, value) in [
+        ("APNS_KEY", config_value(env, "APNS_KEY", "")),
+        ("APNS_KEY_ID", config_value(env, "APNS_KEY_ID", "")),
+        ("APNS_TEAM_ID", config_value(env, "APNS_TEAM_ID", "")),
+        ("APNS_BUNDLE_ID", config_value(env, "APNS_BUNDLE_ID", "")),
+    ] {
+        if value.trim().is_empty() || value.trim().starts_with("REPLACE_") {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                format!("{name} must be configured for production APNs"),
+            ));
+        }
+    }
+
+    let apns_production = config_value(env, "APNS_PRODUCTION", "")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(apns_production.as_str(), "true" | "false") {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "APNS_PRODUCTION must be true or false in production",
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn jwt_secret(env: &Env) -> ApiResult<String> {
     let value = config_value(env, "JWT_SECRET", "dev-change-me");
     let node_env = config_value(env, "NODE_ENV", "development");
-    if node_env == "production" && (value == "dev-change-me" || value.len() < 32) {
+    if node_env.trim().eq_ignore_ascii_case("production")
+        && (value == "dev-change-me" || value.len() < 32)
+    {
         return Err(ApiError::new(
             500,
             "configuration_error",
@@ -352,4 +438,44 @@ pub async fn create_agent_for_user(
         },
         "api_key": api_key,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_is_stable_and_hex_encoded() {
+        assert_eq!(
+            sha256_hex("knock-knock"),
+            "4af706022fbaae08abb4685d8e70acfb0c4f25143420bd43e67572729cc11abc"
+        );
+    }
+
+    #[test]
+    fn password_hash_verifies_only_the_original_password() {
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        assert_ne!(password_hash, "correct horse battery staple");
+        assert!(verify_password(
+            "correct horse battery staple",
+            &password_hash
+        ));
+        assert!(!verify_password("wrong password", &password_hash));
+        assert!(!verify_password("anything", "not-a-bcrypt-hash"));
+    }
+
+    #[test]
+    fn minted_tokens_have_scoped_prefixes_and_non_empty_entropy() {
+        let api_key = mint_api_key().unwrap();
+        let refresh_token = mint_refresh_token().unwrap();
+        let pairing_code = mint_pairing_code().unwrap();
+
+        assert!(api_key.starts_with("vak_"));
+        assert!(refresh_token.starts_with("vbr_"));
+        assert_eq!(pairing_code.len(), 6);
+        assert!(pairing_code
+            .chars()
+            .all(|character| character.is_ascii_digit()));
+        assert_ne!(api_key, mint_api_key().unwrap());
+    }
 }

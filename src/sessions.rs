@@ -174,7 +174,7 @@ pub async fn create_or_resume_session(
     let session_id = new_id("ses")?;
     let now = db::now_iso();
     let expires_at = db::add_seconds_iso(skill.ttl.default_sec);
-    let facts = input.facts.clone().unwrap_or_else(Map::new);
+    let facts = input.facts.clone().unwrap_or_default();
     let chat_id = input.chat_id.clone().or_else(|| {
         input
             .metadata
@@ -287,7 +287,10 @@ pub async fn update_progress(
             db::text(&next_state),
             db::text(&input.status),
             db::optional_text(input.message.as_deref().or(current.progress_message.as_deref())),
-            input.percent.map(db::decimal).unwrap_or_else(|| db::decimal(current.progress_percent.unwrap_or(0.0))),
+            input
+                .percent
+                .map(db::decimal)
+                .unwrap_or_else(|| db::optional_decimal(current.progress_percent)),
             db::text(&facts.to_string()),
             db::text(&db::now_iso()),
             db::text(&current.id),
@@ -466,16 +469,18 @@ pub async fn report_event(
         if let Ok(delivery) = crate::push::notify_user(
             db,
             env,
-            &current.user_id,
-            &current.id,
-            current.title.as_deref().unwrap_or(&skill.skill_id),
-            &summary,
-            Some(&voice),
-            serde_json::json!({
+            crate::push::PushRequest {
+                user_id: &current.user_id,
+                session_id: &current.id,
+                title: current.title.as_deref().unwrap_or(&skill.skill_id),
+                body: &summary,
+                voice_script: Some(&voice),
+                payload: serde_json::json!({
                 "event_id": event_id,
                 "status": input.status,
                 "actions": action_keys,
-            }),
+                }),
+            },
         )
         .await
         {
@@ -1042,4 +1047,39 @@ pub async fn submit_action_result(
         .await?
         .ok_or_else(|| ApiError::action("Action not found", 404))?;
     Ok(action_to_api(&result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn progress_status_allowlist_rejects_unknown_values() {
+        assert!(valid_progress_status("started"));
+        assert!(valid_progress_status("running"));
+        assert!(valid_progress_status("cancelled"));
+        assert!(!valid_progress_status("needs_user"));
+        assert!(!valid_progress_status("finished"));
+    }
+
+    #[test]
+    fn facts_merge_preserves_existing_values_and_applies_new_values() {
+        let incoming = serde_json::from_value(json!({
+            "status": "running",
+            "percent": 25
+        }))
+        .unwrap();
+        let merged = merge_facts(r#"{"service":"api","status":"started"}"#, Some(&incoming));
+        assert_eq!(merged["service"], "api");
+        assert_eq!(merged["status"], "running");
+        assert_eq!(merged["percent"], 25);
+    }
+
+    #[test]
+    fn malformed_facts_are_safe_empty_objects() {
+        assert!(parse_object("not-json").is_empty());
+        assert_eq!(parse_result(Some("null")), Value::Null);
+        assert_eq!(parse_result(Some("not-json")), Value::Null);
+    }
 }

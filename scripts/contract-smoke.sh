@@ -61,15 +61,21 @@ test "$second_claim_status" = "409"
 skills="$(get "${agent_auth[@]}" "$BASE_URL/v1/skills")"
 test "$(jq -r '.skills | length' <<<"$skills")" -ge 1
 
+chat_id="rust-contract-chat-$(date +%s%N)"
 session="$(json "${agent_auth[@]}" -X POST "$BASE_URL/v1/sessions" \
-  -d "$(jq -nc --arg key "rust-contract-$(date +%s%N)" \
-    '{skill_id:"deploy.result",idempotency_key:$key,title:"Rust contract smoke",facts:{service:"knock-knock",env:"local"}}')")"
+  -d "$(jq -nc --arg key "rust-contract-$(date +%s%N)" --arg chat "$chat_id" \
+    '{skill_id:"deploy.result",idempotency_key:$key,title:"Rust contract smoke",chat_id:$chat,facts:{service:"knock-knock",env:"local"}}')")"
 session_id="$(jq -r '.session_id' <<<"$session")"
 test -n "$session_id" && test "$session_id" != "null"
+test "$(jq -r '.chat_id' <<<"$session")" = "$chat_id"
 
+progress_unknown="$(json "${agent_auth[@]}" -X POST "$BASE_URL/v1/sessions/$session_id/progress" \
+  -d '{"status":"running","message":"Rust contract smoke — estimate unknown"}')"
+test "$(jq -r '.progress_percent' <<<"$progress_unknown")" = "null"
 progress="$(json "${agent_auth[@]}" -X POST "$BASE_URL/v1/sessions/$session_id/progress" \
-  -d '{"status":"running","message":"Rust contract smoke","percent":25}')"
+  -d '{"status":"running","message":"Rust contract smoke — measured milestone","percent":25}')"
 test "$(jq -r '.progress_status' <<<"$progress")" = "running"
+test "$(jq -r '.progress_percent == 25' <<<"$progress")" = "true"
 
 session_view="$(get "${user_auth[@]}" "$BASE_URL/v1/sessions/$session_id")"
 test "$(jq -r '.session_id' <<<"$session_view")" = "$session_id"
@@ -103,11 +109,44 @@ result="$(json "${agent_auth[@]}" -X POST "$BASE_URL/v1/actions/$action_id/resul
   -d '{"ok":true,"message":"done","output":{"smoke":true}}')"
 test "$(jq -r '.status' <<<"$result")" = "done"
 
+resumed="$(json "${agent_auth[@]}" -X POST "$BASE_URL/v1/sessions" \
+  -d "$(jq -nc --arg session "$session_id" --arg chat "$chat_id" \
+    '{skill_id:"deploy.result",session_id:$session,chat_id:$chat,title:"Rust contract smoke"}')")"
+test "$(jq -r '.session_id' <<<"$resumed")" = "$session_id"
+test "$(jq -r '.chat_id' <<<"$resumed")" = "$chat_id"
+
+event_two="$(json "${agent_auth[@]}" -X POST "$BASE_URL/v1/sessions/$session_id/events" \
+  -d "$(jq -nc --arg key "needs-user-two-$(date +%s%N)" \
+    '{status:"needs_user",idempotency_key:$key,facts:{status:"follow-up"},actions:["ack"]}')")"
+test "$(jq -r '.session.session_id' <<<"$event_two")" = "$session_id"
+test "$(jq -r '.pushed' <<<"$event_two")" = "true"
+
+reply_two="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/sessions/$session_id/reply" \
+  -d '{"action_key":"ack","utterance":"确认第二轮"}')"
+test "$(jq -r '.needs_confirm' <<<"$reply_two")" = "false"
+test "$(jq -r '.session.session_id' <<<"$reply_two")" = "$session_id"
+action_two_id="$(jq -r '.action.action_id' <<<"$reply_two")"
+test -n "$action_two_id" && test "$action_two_id" != "null"
+
+pending_two="$(get "${agent_auth[@]}" "$BASE_URL/v1/sessions/$session_id/actions/pending?claim=true")"
+test "$(jq -r '.actions | length' <<<"$pending_two")" = "1"
+test "$(jq -r '.actions[0].action_id' <<<"$pending_two")" = "$action_two_id"
+test "$(jq -r '.actions[0].status' <<<"$pending_two")" = "claimed"
+
+result_two="$(json "${agent_auth[@]}" -X POST "$BASE_URL/v1/actions/$action_two_id/result" \
+  -d '{"ok":true,"message":"follow-up done","output":{"smoke":true,"turn":2}}')"
+test "$(jq -r '.status' <<<"$result_two")" = "done"
+
+final_session="$(get "${agent_auth[@]}" "$BASE_URL/v1/sessions/$session_id")"
+test "$(jq -r '.session_id' <<<"$final_session")" = "$session_id"
+test "$(jq -r '.chat_id' <<<"$final_session")" = "$chat_id"
+test "$(jq -r '.state' <<<"$final_session")" = "running"
+
 pushes="$(get "${user_auth[@]}" "$BASE_URL/v1/dev/pushes")"
 test "$(jq -r '.pushes | length' <<<"$pushes")" -ge 1
 
 history="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/sessions/$session_id/history")"
-test "$(jq -r '.entries | length' <<<"$history")" -ge 1
+test "$(jq -r '.entries | length' <<<"$history")" -ge 2
 
 rotated="$(json -X POST "$BASE_URL/v1/auth/refresh" \
   -d "$(jq -nc --arg refresh "$refresh" '{refresh_token:$refresh}')")"
@@ -119,4 +158,4 @@ logout="$(json -X POST "$BASE_URL/v1/auth/logout" \
   -d "$(jq -nc --arg refresh "$rotated_refresh" '{refresh_token:$refresh}')")"
 test "$(jq -r '.ok' <<<"$logout")" = "true"
 
-printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/event/phone/confirm/claim/result/push/refresh'
+printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/chat/multi-turn/phone/confirm/claim/result/push/refresh'

@@ -1,0 +1,34 @@
+# Copy this file to wrangler.production.toml and replace every REPLACE_* value
+# before deploying. The Worker rejects this configuration until all required
+# production settings are explicit.
+name = "knock-knock-backend-production"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-04-16"
+workers_dev = true
+
+[build]
+command = "worker-build --release"
+
+[vars]
+NODE_ENV = "production"
+PUSH_MODE = "both"
+CORS_ORIGIN = "REPLACE_WITH_ALLOWED_ORIGIN"
+SERVICE_VERSION = "REPLACE_WITH_RELEASE_VERSION"
+APNS_BUNDLE_ID = "hk.knockknock.app"
+APNS_PRODUCTION = "true"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[[d1_databases]]
+binding = "DB"
+database_name = "knock-knock"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Secrets must be added separately:
+# wrangler secret put JWT_SECRET --config wrangler.production.toml
+# wrangler secret put APNS_KEY --config wrangler.production.toml
+# wrangler secret put APNS_KEY_ID --config wrangler.production.toml
+# wrangler secret put APNS_TEAM_ID --config wrangler.production.toml

@@ -21,6 +21,15 @@ pub struct PushDelivery {
     pub apns_errors: Vec<String>,
 }
 
+pub struct PushRequest<'a> {
+    pub user_id: &'a str,
+    pub session_id: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub voice_script: Option<&'a str>,
+    pub payload: Value,
+}
+
 pub async fn enqueue_push(
     db: &D1Database,
     user_id: &str,
@@ -100,12 +109,7 @@ async fn user_apns_tokens(db: &D1Database, user_id: &str) -> ApiResult<Vec<Strin
 pub async fn notify_user(
     db: &D1Database,
     env: &Env,
-    user_id: &str,
-    session_id: &str,
-    title: &str,
-    body: &str,
-    voice_script: Option<&str>,
-    payload: Value,
+    request: PushRequest<'_>,
 ) -> ApiResult<PushDelivery> {
     let mode = config_value(env, "PUSH_MODE", "dev");
     if !["dev", "apns", "both"].contains(&mode.as_str()) {
@@ -120,12 +124,12 @@ pub async fn notify_user(
     if mode == "dev" || mode == "both" || !apns_ready {
         enqueue_push(
             db,
-            user_id,
-            session_id,
-            title,
-            body,
-            voice_script,
-            payload.clone(),
+            request.user_id,
+            request.session_id,
+            request.title,
+            request.body,
+            request.voice_script,
+            request.payload.clone(),
         )
         .await?;
         inbox = true;
@@ -134,8 +138,17 @@ pub async fn notify_user(
     let mut apns_sent = 0;
     let mut apns_errors = Vec::new();
     if (mode == "apns" || mode == "both") && apns_ready {
-        for token in user_apns_tokens(db, user_id).await? {
-            match apns::send_alert(env, &token, title, body, session_id, voice_script).await {
+        for token in user_apns_tokens(db, request.user_id).await? {
+            match apns::send_alert(
+                env,
+                &token,
+                request.title,
+                request.body,
+                request.session_id,
+                request.voice_script,
+            )
+            .await
+            {
                 Ok(()) => apns_sent += 1,
                 Err(error) => apns_errors.push(error.message),
             }
@@ -145,7 +158,16 @@ pub async fn notify_user(
     // Keep the existing development phone polling loop alive if APNs is
     // configured but no physical device token was available or delivery failed.
     if !inbox && apns_sent == 0 {
-        enqueue_push(db, user_id, session_id, title, body, voice_script, payload).await?;
+        enqueue_push(
+            db,
+            request.user_id,
+            request.session_id,
+            request.title,
+            request.body,
+            request.voice_script,
+            request.payload,
+        )
+        .await?;
         inbox = true;
     }
     Ok(PushDelivery {
