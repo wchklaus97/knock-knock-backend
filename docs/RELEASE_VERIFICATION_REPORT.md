@@ -10,7 +10,7 @@ and Phase 0–3 integration baseline
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
 | Backend base | `main` | `185b5e9` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | `8445d9510fd25d2a4502c6b3888c571267ef1c07` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
+| Backend follow-up | `agent/phase45-completion-backend` | `0c52d0ccaa433e361cb956860b02fef5d86b687b` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
 The follow-up branch is based on merged PR #10. PR #11 is pushed and its
@@ -94,7 +94,7 @@ require human approval.
 - `scripts/production-config-smoke.sh` — passed, including the staging
   template and staging fail-closed checks
 - `scripts/phase45-release-gate.sh` — passed
-- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31340539080) — passed for commit `8445d9510fd25d2a4502c6b3888c571267ef1c07`
+- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31340648555) — passed for commit `0c52d0ccaa433e361cb956860b02fef5d86b687b`
 - Read-only production health probe — passed; deployed version was
   `2026.08.08-build-25`, so this does not count as PR #11 deployment evidence.
 - `scripts/staging-contract-gate.sh` and manual
