@@ -683,6 +683,9 @@ mod tests {
             providers::action_attempt_provider("send_message"),
             Some("action.message")
         );
-        assert_eq!(providers::action_attempt_provider("create_draft"), None);
+        assert_eq!(
+            providers::action_attempt_provider("create_draft"),
+            Some("local.draft")
+        );
     }
 }

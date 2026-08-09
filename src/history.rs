@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 use worker::{D1Database, Env};
 
 use crate::db;
@@ -16,13 +17,37 @@ struct ExpiredRetrievalRow {
     r2_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct R2ReferenceRow {
+    r2_key: String,
+    reference_count: i64,
+}
+
+/// R2 objects are private user data. New retrieval references must be stored
+/// below this backend-owned namespace so a client cannot point at another
+/// user's object key and then read it through the authenticated download
+/// route.
+pub fn user_r2_key_prefix(user_id: &str) -> String {
+    format!("users/{user_id}/retrievals/")
+}
+
+pub fn is_user_r2_key(user_id: &str, key: &str) -> bool {
+    let prefix = user_r2_key_prefix(user_id);
+    key.starts_with(&prefix)
+        && key.len() > prefix.len()
+        && !key.contains('\\')
+        && !key
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+}
+
 pub async fn purge_expired(db: &D1Database, env: &Env, user_id: &str) -> ApiResult<()> {
     let now = db::now_iso();
     // Retrievals reference messages, so remove source metadata before the
     // message row. This is an opportunistic sweep; a scheduled worker can
     // later compact old rows for users who are never active.
     let retrievals = expired_retrievals(db, Some(user_id), &now, RETENTION_SWEEP_BATCH).await?;
-    delete_r2_objects(env, &retrievals).await?;
+    delete_r2_objects(db, env, &retrievals).await?;
     delete_retrieval_rows(db, &retrievals).await?;
     db::run(
         db,
@@ -39,7 +64,7 @@ pub async fn purge_expired(db: &D1Database, env: &Env, user_id: &str) -> ApiResu
 pub async fn purge_expired_all(db: &D1Database, env: &Env) -> ApiResult<usize> {
     let now = db::now_iso();
     let expired = expired_retrievals(db, None, &now, RETENTION_SWEEP_BATCH).await?;
-    delete_r2_objects(env, &expired).await?;
+    delete_r2_objects(db, env, &expired).await?;
     let retrievals = delete_retrieval_rows(db, &expired).await?;
     let messages = db::run(
         db,
@@ -80,15 +105,45 @@ async fn expired_retrievals(
     }
 }
 
-async fn delete_r2_objects(env: &Env, retrievals: &[ExpiredRetrievalRow]) -> ApiResult<()> {
+async fn delete_r2_objects(
+    db: &D1Database,
+    env: &Env,
+    retrievals: &[ExpiredRetrievalRow],
+) -> ApiResult<()> {
     let keys = retrievals
         .iter()
         .filter_map(|row| row.r2_key.as_deref())
         .filter(|key| !key.trim().is_empty())
-        .collect::<Vec<_>>();
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
     if keys.is_empty() {
         return Ok(());
     }
+
+    // Several retrieval rows may point to one immutable snapshot. Delete the
+    // object only when no non-expired/out-of-batch row still references it.
+    // Otherwise retention of one row could break another row's download.
+    let key_placeholders = std::iter::repeat_n("?", keys.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let id_placeholders = std::iter::repeat_n("?", retrievals.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut reference_params = keys.iter().map(|key| db::text(key)).collect::<Vec<_>>();
+    reference_params.extend(retrievals.iter().map(|row| db::text(&row.id)));
+    let protected: BTreeSet<String> = db::all::<R2ReferenceRow>(
+        db,
+        &format!(
+            "SELECT r2_key, COUNT(*) AS reference_count FROM retrieval_items WHERE r2_key IN ({key_placeholders}) AND id NOT IN ({id_placeholders}) GROUP BY r2_key"
+        ),
+        reference_params,
+    )
+    .await?
+    .into_iter()
+    .filter(|row| row.reference_count > 0)
+    .map(|row| row.r2_key)
+    .collect();
+
     let bucket = env.bucket("R2").map_err(|_| {
         ApiError::new(
             503,
@@ -97,7 +152,10 @@ async fn delete_r2_objects(env: &Env, retrievals: &[ExpiredRetrievalRow]) -> Api
         )
     })?;
     for key in keys {
-        bucket.delete(key).await.map_err(|_| {
+        if protected.contains(&key) {
+            continue;
+        }
+        bucket.delete(&key).await.map_err(|_| {
             ApiError::new(
                 502,
                 "retrieval_storage_error",

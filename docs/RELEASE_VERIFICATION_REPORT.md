@@ -9,8 +9,8 @@ and Phase 0–3 integration baseline
 
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
-| Backend base | `agent/phase45-completion-backend` | `2977322` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | current PR #11 head | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
+| Backend base | `main` | `185b5e9` | merged Phase 4/5 base |
+| Backend follow-up | `agent/phase45-completion-backend` | `6786126b7473d34150ab3c5c9692cfd93c4767ae` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
 The follow-up branch is based on merged PR #10. PR #11 is pushed and its
@@ -39,11 +39,18 @@ require human approval.
   and scheduled message/retrieval retention sweep.
 - Authenticated retrieval download streaming from R2 with user/session/expiry
   checks, private no-store response headers, no `r2_key` disclosure, and
-  retention cleanup that removes R2 objects before deleting D1 metadata.
+  retention cleanup that removes only unreferenced R2 objects before deleting
+  D1 metadata. New object references are restricted to the authenticated
+  user's `users/{user_id}/retrievals/` namespace.
 - Provider lifecycle operations for external reminders/messages: delivery,
   status lookup, reminder cancellation for Undo, timeout-to-unknown handling,
   and idempotent status reconciliation without a duplicate provider delivery;
-  provider keys are user/action scoped and legacy keys remain reconcilable.
+  provider keys are user/action scoped, the running attempt is persisted before
+  the provider call, and legacy keys remain reconcilable.
+- Outbox idempotency keys are user/operation scoped while the original client
+  `CommandEnvelope.idempotency_key` remains unchanged in the command resource.
+- Local reminder stale leases are bounded by the attempt limit, and a deleted
+  session cannot trigger a local due-time notification.
 - Safe staging Wrangler template with explicit origin/version validation and
   disabled external effects.
 - OpenAPI compatibility baseline and breaking-change smoke for retained v1
@@ -79,7 +86,7 @@ require human approval.
 - `scripts/provider-safety-smoke.sh` — passed
 - `scripts/r2-download-smoke.sh` against an isolated local Worker + local D1/R2
   — passed for authorized streaming, metadata headers, no key disclosure,
-  retention cleanup, and cross-user isolation.
+  user-namespaced keys, shared-key retention cleanup, and cross-user isolation.
 - `scripts/provider-lifecycle-smoke.sh` against an isolated local Worker and
   mock provider — passed for delivery, provider cancellation, timeout,
   status reconciliation, idempotent completion, and three distinct scoped
@@ -87,7 +94,7 @@ require human approval.
 - `scripts/production-config-smoke.sh` — passed, including the staging
   template and staging fail-closed checks
 - `scripts/phase45-release-gate.sh` — passed
-- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31337862970) — passed
+- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31339024822) — passed for commit `6786126b7473d34150ab3c5c9692cfd93c4767ae`
 - Read-only production health probe — passed; deployed version was
   `2026.08.08-build-25`, so this does not count as PR #11 deployment evidence.
 - `scripts/staging-contract-gate.sh` and manual
@@ -125,9 +132,11 @@ write barriers for sessions and commands, non-atomic event idempotency claims,
 un-fenced compatibility-operation lease takeover, permanently stuck Outbox
 leases, unverified rate-limit identity, discarded structured retry metadata,
 incomplete local tombstone cleanup, a globally writable skill registry, an iOS
-permanent-error retry loop, non-additive checkpoint response requirements, and
-cross-user Provider idempotency-key collision risk. The last issue is now
-closed with user/action-scoped hashes plus legacy-key reconciliation.
+permanent-error retry loop, non-additive checkpoint response requirements,
+cross-user Provider and Outbox idempotency-key collision risk, unscoped R2
+references, shared-key retention deletion, and the provider-call crash window.
+The latter issues are closed in PR #11 for new data; legacy records remain
+reconcilable and still require staged migration evidence.
 
 ## Remaining release gates
 

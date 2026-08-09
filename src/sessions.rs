@@ -5,6 +5,7 @@ use crate::audit::record_audit;
 use crate::auth::new_id;
 use crate::db;
 use crate::error::{ApiError, ApiResult};
+use crate::history;
 use crate::models::{
     ActionRow, EventRequest, EventRow, ProgressRequest, SessionRequest, SessionRow, SkillAction,
 };
@@ -571,10 +572,13 @@ pub async fn report_event(
         }
         if retrieval.r2_key.as_deref().is_some_and(|key| {
             let trimmed = key.trim();
-            trimmed.is_empty() || trimmed.len() > 1_024 || trimmed.chars().any(char::is_control)
+            trimmed.is_empty()
+                || trimmed.len() > 1_024
+                || trimmed.chars().any(char::is_control)
+                || !history::is_user_r2_key(&current.user_id, trimmed)
         }) {
             return Err(ApiError::validation(
-                "retrieval r2_key must be a non-empty path of at most 1024 characters",
+                "retrieval r2_key must be a user-scoped path under users/{user_id}/retrievals/",
             ));
         }
         let retrieval_id = new_id("ret")?;

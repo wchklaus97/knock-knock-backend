@@ -8,7 +8,7 @@ use crate::db;
 use crate::error::{ApiError, ApiResult};
 use crate::models::{CommandEnvelope, CommandRow};
 use crate::pagination;
-use crate::providers::ActionProviderConfig;
+use crate::providers::{self, ActionProviderConfig};
 
 #[derive(Debug, Deserialize)]
 struct IdOnly {
@@ -465,6 +465,8 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
     let expires_at = db::add_seconds_iso(900);
     let confirmation_required = requires_confirmation(&envelope, registry_requires);
     let final_version = 2_i64;
+    let outbox_idempotency_key =
+        providers::scoped_idempotency_key(user_id, "command.execute", &envelope.idempotency_key);
     let mut statements = vec![
         db::prepare(
             db,
@@ -535,7 +537,7 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
                 db::text(user_id),
                 db::text(&command_id),
                 db::text(&json!({"command_id": command_id}).to_string()),
-                db::text(&envelope.idempotency_key),
+                db::text(&outbox_idempotency_key),
                 db::text(&now),
                 db::text(&now),
             ],
@@ -638,6 +640,8 @@ pub async fn confirm(
     let now = db::now_iso();
     let next_version = command.version + 1;
     let outbox_id = new_id("out")?;
+    let outbox_idempotency_key =
+        providers::scoped_idempotency_key(user_id, "command.execute.confirm", command_id);
     let mut statements = vec![
         db::prepare(
             db,
@@ -686,7 +690,7 @@ pub async fn confirm(
                 db::text(user_id),
                 db::text(command_id),
                 db::text(&json!({"command_id": command_id}).to_string()),
-                db::text(&format!("confirm:{command_id}")),
+                db::text(&outbox_idempotency_key),
                 db::text(&now),
                 db::text(&now),
                 db::text(command_id),

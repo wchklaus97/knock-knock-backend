@@ -288,6 +288,7 @@ pub fn action_attempt_provider(intent: &str) -> Option<&'static str> {
     match intent {
         "create_reminder" => Some("action.reminder"),
         "send_message" => Some("action.message"),
+        "create_draft" => Some("local.draft"),
         _ => None,
     }
 }

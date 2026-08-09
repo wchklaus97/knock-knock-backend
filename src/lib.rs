@@ -1119,6 +1119,15 @@ async fn phone_delete_session(
                 db::text(&now),
             ],
         )?,
+        db::prepare(
+            db,
+            "UPDATE reminders SET status = 'cancelled', notification_state = 'cancelled', last_notification_error = 'session_deleted', updated_at = ? WHERE user_id = ? AND session_id = ? AND status = 'scheduled' AND provider = 'local.reminder'",
+            vec![
+                db::text(&now),
+                db::text(&user.user_id),
+                db::text(session_id),
+            ],
+        )?,
     ];
     let results = db.batch(statements).await?;
     if results.first().map(db::changes).unwrap_or(0) == 0 {
@@ -1189,6 +1198,9 @@ async fn phone_retrieval_download(
         .r2_key
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ApiError::not_found("Retrieval asset is not stored"))?;
+    if !history::is_user_r2_key(&user.user_id, &key) {
+        return Err(ApiError::not_found("Retrieval asset not found"));
+    }
     let bucket = env.bucket("R2").map_err(|_| {
         ApiError::new(
             503,

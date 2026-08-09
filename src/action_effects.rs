@@ -44,7 +44,7 @@ pub async fn execute(
     provider_config: ActionProviderConfig,
 ) -> ApiResult<Value> {
     let mut reconciled_provider_response = None;
-    if let Some(previous) = previous_attempt(db, command).await? {
+    if let Some(previous) = previous_attempt(db, user_id, command).await? {
         match previous.state.as_str() {
             "succeeded" => return parse_response(previous.response_json.as_deref()),
             "running" | "unknown" | "retrying"
@@ -107,6 +107,17 @@ pub async fn execute(
             }
             _ => {}
         }
+    }
+
+    // Persist the provider-level running fence before making any external
+    // request. If the Worker stops during the request, the next outbox retry
+    // can reconcile this durable key through the provider status endpoint
+    // instead of blindly issuing a second send.
+    if matches!(
+        command.intent.as_str(),
+        "create_reminder" | "create_draft" | "send_message"
+    ) {
+        mark_attempt_running(db, user_id, command).await?;
     }
 
     match command.intent.as_str() {
@@ -567,14 +578,46 @@ async fn queue_message(
 
 async fn previous_attempt(
     db: &D1Database,
+    user_id: &str,
     command: &CommandRow,
 ) -> ApiResult<Option<EffectAttemptRow>> {
     db::first(
         db,
-        "SELECT provider, provider_idempotency_key, state, response_json FROM action_attempts WHERE command_id = ? ORDER BY created_at DESC LIMIT 1",
-        vec![db::text(&command.id)],
+        "SELECT provider, provider_idempotency_key, state, response_json FROM action_attempts WHERE command_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1",
+        vec![db::text(&command.id), db::text(user_id)],
     )
     .await
+}
+
+async fn mark_attempt_running(
+    db: &D1Database,
+    user_id: &str,
+    command: &CommandRow,
+) -> ApiResult<()> {
+    let provider =
+        providers::action_attempt_provider(&command.intent).unwrap_or(command.intent.as_str());
+    let provider_idempotency_key = providers::scoped_action_idempotency_key(
+        user_id,
+        &command.intent,
+        &command.idempotency_key,
+    );
+    let now = db::now_iso();
+    db::run(
+        db,
+        "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, 'running', ?, NULL, 1, NULL, NULL, ?, ?) ON CONFLICT(provider, provider_idempotency_key) DO UPDATE SET state = 'running', attempts = action_attempts.attempts + 1, response_json = NULL, next_attempt_at = NULL, last_error = NULL, updated_at = excluded.updated_at",
+        vec![
+            db::text(&new_id("attempt")?),
+            db::text(user_id),
+            db::text(&command.id),
+            db::text(provider),
+            db::text(&provider_idempotency_key),
+            db::text(&command.command_hash),
+            db::text(&command.created_at),
+            db::text(&now),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 async fn record_attempt(

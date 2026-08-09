@@ -27,12 +27,17 @@ struct DueReminderRow {
 /// effect, not a second command invocation. A dedupe key on the push record
 /// makes a retry after a Worker interruption safe.
 pub async fn drain_due(db: &D1Database, env: &Env) -> ApiResult<usize> {
+    cancel_deleted_session_reminders(db).await?;
     recover_stale_claims(db).await?;
     let now = db::now_iso();
     let rows: Vec<DueReminderRow> = db::all(
         db,
-        "SELECT id, user_id, session_id, title, due_at, timezone, notification_attempts FROM reminders WHERE status = 'scheduled' AND provider = 'local.reminder' AND notification_state IN ('pending', 'retrying') AND due_at <= ? ORDER BY due_at ASC, id ASC LIMIT ?",
-        vec![db::text(&now), db::number(BATCH_SIZE)],
+        "SELECT id, user_id, session_id, title, due_at, timezone, notification_attempts FROM reminders WHERE status = 'scheduled' AND provider = 'local.reminder' AND notification_state IN ('pending', 'retrying') AND notification_attempts < ? AND due_at <= ? AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = reminders.session_id AND user_id = reminders.user_id AND deleted_at IS NULL)) ORDER BY due_at ASC, id ASC LIMIT ?",
+        vec![
+            db::number(MAX_ATTEMPTS),
+            db::text(&now),
+            db::number(BATCH_SIZE),
+        ],
     )
     .await?;
 
@@ -50,12 +55,27 @@ pub async fn drain_due(db: &D1Database, env: &Env) -> ApiResult<usize> {
     Ok(processed)
 }
 
+async fn cancel_deleted_session_reminders(db: &D1Database) -> ApiResult<()> {
+    let now = db::now_iso();
+    db::run(
+        db,
+        "UPDATE reminders SET status = 'cancelled', notification_state = 'cancelled', last_notification_error = 'session_deleted', updated_at = ? WHERE status = 'scheduled' AND provider = 'local.reminder' AND session_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = reminders.session_id AND user_id = reminders.user_id AND deleted_at IS NULL)",
+        vec![db::text(&now)],
+    )
+    .await?;
+    Ok(())
+}
+
 async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
     let cutoff = db::add_seconds_iso(-LEASE_SECONDS);
     db::run(
         db,
-        "UPDATE reminders SET notification_state = 'retrying', last_notification_error = 'worker_lease_expired', updated_at = ? WHERE status = 'scheduled' AND provider = 'local.reminder' AND notification_state = 'processing' AND updated_at <= ?",
-        vec![db::text(&db::now_iso()), db::text(&cutoff)],
+        "UPDATE reminders SET notification_state = CASE WHEN notification_attempts >= ? THEN 'failed' ELSE 'retrying' END, last_notification_error = 'worker_lease_expired', updated_at = ? WHERE status = 'scheduled' AND provider = 'local.reminder' AND notification_state = 'processing' AND updated_at <= ?",
+        vec![
+            db::number(MAX_ATTEMPTS),
+            db::text(&db::now_iso()),
+            db::text(&cutoff),
+        ],
     )
     .await?;
     Ok(())
@@ -64,8 +84,13 @@ async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
 async fn claim(db: &D1Database, row: &DueReminderRow, now: &str) -> ApiResult<bool> {
     let result = db::run(
         db,
-        "UPDATE reminders SET notification_state = 'processing', notification_attempts = notification_attempts + 1, last_notification_error = NULL, updated_at = ? WHERE id = ? AND status = 'scheduled' AND provider = 'local.reminder' AND notification_state IN ('pending', 'retrying') AND due_at <= ?",
-        vec![db::text(now), db::text(&row.id), db::text(now)],
+        "UPDATE reminders SET notification_state = 'processing', notification_attempts = notification_attempts + 1, last_notification_error = NULL, updated_at = ? WHERE id = ? AND status = 'scheduled' AND provider = 'local.reminder' AND notification_state IN ('pending', 'retrying') AND notification_attempts < ? AND due_at <= ? AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = reminders.session_id AND user_id = reminders.user_id AND deleted_at IS NULL))",
+        vec![
+            db::text(now),
+            db::text(&row.id),
+            db::number(MAX_ATTEMPTS),
+            db::text(now),
+        ],
     )
     .await?;
     Ok(db::changes(&result) == 1)

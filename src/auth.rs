@@ -177,7 +177,10 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
     let node_env = config_value(env, "NODE_ENV", "development")
         .trim()
         .to_ascii_lowercase();
-    if !matches!(node_env.as_str(), "development" | "test" | "production") {
+    if !matches!(
+        node_env.as_str(),
+        "development" | "test" | "staging" | "production"
+    ) {
         return Err(ApiError::new(
             500,
             "configuration_error",
