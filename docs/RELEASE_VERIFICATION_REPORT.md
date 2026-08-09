@@ -8,8 +8,8 @@
 
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
-| Backend | `agent/phase5-backend-release-integration` | `1eb452b` | [backend PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8) |
-| iOS | `codex/phase5-ios-command-api` | `02141eb` | [iOS PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) |
+| Backend | `agent/phase5-backend-release-integration` | `db8394e` | [backend PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8) |
+| iOS | `codex/phase5-ios-command-api` | `0fce2cd` | [iOS PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) |
 
 The branches are intentionally stacked on earlier phase PRs. They are not
 merged automatically; the checkpoint and phase dependency sequence still
@@ -84,6 +84,6 @@ These are deliberately not marked as passed:
 ## Rollback
 
 Do not merge the draft PRs until the gates above are approved. Revert the latest
-integration commits (`1eb452b` and `02141eb`) or close the draft PRs; no
+integration commits (`db8394e` and `0fce2cd`) or close the draft PRs; no
 production data or migration has been changed. Migration 0009 is additive and
 requires a separately approved rollback plan if it is ever applied.
