@@ -10,7 +10,7 @@ and Phase 0–3 integration baseline
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
 | Backend base | `main` | `185b5e9` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | `0c52d0ccaa433e361cb956860b02fef5d86b687b` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
+| Backend follow-up | `agent/phase45-completion-backend` | `a8d9e98aae28dc44c75a602ac46e134a92ceb834` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
 The follow-up branch is based on merged PR #10. PR #11 is pushed and its
@@ -74,7 +74,7 @@ require human approval.
 
 - `cargo fmt --all -- --check` — passed
 - `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test -q` — 36 passed
+- `cargo test -q` — 39 passed
 - `cargo check --target wasm32-unknown-unknown -q` — passed
 - `worker-build --release` — passed; optimized Worker bundle generated
 - `scripts/architecture-migration-smoke.sh` — passed
@@ -88,13 +88,14 @@ require human approval.
   — passed for authorized streaming, metadata headers, no key disclosure,
   user-namespaced keys, shared-key retention cleanup, and cross-user isolation.
 - `scripts/provider-lifecycle-smoke.sh` against an isolated local Worker and
-  mock provider — passed for delivery, provider cancellation, timeout,
-  status reconciliation, idempotent completion, and three distinct scoped
-  delivery keys.
+  mock provider — passed for reminder delivery/cancellation, timeout status
+  reconciliation, and an asynchronous high-risk message moving from provider
+  `accepted` to status `delivered` before the command became `sent`; provider
+  keys remained user/action scoped and no duplicate delivery was observed.
 - `scripts/production-config-smoke.sh` — passed, including the staging
   template and staging fail-closed checks
 - `scripts/phase45-release-gate.sh` — passed
-- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31340648555) — passed for commit `0c52d0ccaa433e361cb956860b02fef5d86b687b`
+- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31342661525) — passed for commit `a8d9e98aae28dc44c75a602ac46e134a92ceb834`
 - Read-only production health probe — passed; deployed version was
   `2026.08.08-build-25`, so this does not count as PR #11 deployment evidence.
 - `scripts/staging-contract-gate.sh` and manual
@@ -109,8 +110,9 @@ require human approval.
 - Local reminder due-time smoke — passed: a due reminder generated one
   deduplicated development push across repeated scheduled runs.
 - Local external-provider smoke with a mock HTTPS-boundary adapter — passed
-  for reminder delivery and confirmed high-risk message delivery; both
-  returned `provider_id=mock-provider-1` and the message returned `sent`.
+  for reminder delivery, provider cancellation, timeout reconciliation, and
+  confirmed high-risk message delivery; the message remained `queued`/unknown
+  while only accepted and became `sent` only after status reconciliation.
 - guarded event/outbox/confirmation SQL was prepared and executed against
   SQLite — passed
 - `git diff --check` — passed

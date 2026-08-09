@@ -54,8 +54,11 @@ requires delivery/status lifecycle endpoints for enabled production actions;
 external reminder Undo calls the provider cancellation endpoint, and timeout
 results are reconciled through provider status. A provider attempt is persisted
 before the external call, so a Worker restart must reconcile the same key
-before retrying. It was verified against a local mock provider for delivery,
-cancellation, timeout, status recovery, and user/action-scoped provider
+before retrying. Asynchronous message acceptance remains queued/unknown until
+status reports delivery, while an external reminder without a provider
+identifier fails closed so Undo cannot claim a cancellation it cannot perform.
+It was verified against a local mock provider for delivery, cancellation,
+timeout, asynchronous message status recovery, and user/action-scoped provider
 idempotency keys.
 The R2 retrieval download route is also implemented and verified with a local
 R2 object plus cross-user isolation. Provider vendor selection, sandbox

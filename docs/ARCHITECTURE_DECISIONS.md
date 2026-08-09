@@ -69,8 +69,10 @@ safety gaps without changing the REST + SSE baseline:
 - Reminder and message effects now pass through an explicit provider mode and
   feature flags. Local development may persist D1 effects/queues; external
   mode uses a secret-authenticated HTTPS webhook with the command idempotency
-  key and fails closed when an endpoint is not configured. A queued message is
-  never reported as externally sent.
+  key and fails closed when an endpoint is not configured. An asynchronously
+  accepted message remains queued/unknown until status reconciliation reports
+  delivery, and an external reminder without a provider identifier cannot be
+  reported as a successful undoable effect.
 - Local reminders have a leaseable due-time scanner, retry state, provider
   identity, deduplicated push key, bounded stale-lease attempts, and a deleted
   session barrier. External reminders are excluded from that scanner so a
@@ -96,9 +98,11 @@ safety gaps without changing the REST + SSE baseline:
   cancellation endpoints before an enabled production action is considered
   ready. Provider timeouts are reconciled through the status endpoint, and
   external reminder Undo calls cancellation before changing local state.
-  Provider and Outbox idempotency keys are stable hashes scoped to user and
-  operation, while the original command key stays in the command contract and
-  legacy provider keys remain available for status reconciliation.
+  Accepted asynchronous message sends are not promoted to `sent` until status
+  returns a terminal delivery state. Provider and Outbox idempotency keys are
+  stable hashes scoped to user and operation, while the original command key
+  stays in the command contract and legacy provider keys remain available for
+  status reconciliation.
 
 The remaining backend work is release evidence and deployment configuration,
 not a new transport: create the independent staging D1/Worker and R2 bucket,
@@ -146,7 +150,7 @@ and the current gap. IDs are stable and must not be reused.
 | D27 | APNs is a wake-up/reminder channel, never the data source. | Push loss is safe because REST sync recovers state; payloads stay privacy-light. | Drop push delivery and confirm foreground/resume sync produces the same state. | Push read/dismiss routes, dev inbox, and REST/SSE recovery exist; real APNs token/device and payload review remain. |
 | D28 | Commands within one session have backend ordering/version checks. | Clients cannot use wall-clock timestamps to resolve concurrent state changes. | Stale version returns conflict; concurrent same-session writes serialize. | Command versions, phone-change versions, and cursor ordering exist; multi-device concurrent session E2E remains. |
 | D29 | State, domain event, audit, and phone change are committed atomically. | Clients must never be notified about a state that was not durably written. | Batch failure leaves no partial event or notification cursor. | Core command/event batches are atomic; some compatibility/business audit paths remain separate and require an outbox or explicit reliability review. |
-| D30 | External side effects use an Outbox/Worker and provider idempotency. | Database transactions cannot atomically include email, messaging, payment, or provider APIs. | Timeout becomes `unknown/retryable`; status reconciliation, cancellation, and repeated scheduled runs never duplicate a provider effect. | Outbox, pre-call running fence, user/action-scoped action keys, generic delivery/status/cancel adapter, and local mock evidence are implemented; a selected production vendor, sandbox proof, and durable cancel-operation policy remain. |
+| D30 | External side effects use an Outbox/Worker and provider idempotency. | Database transactions cannot atomically include email, messaging, payment, or provider APIs. | Timeout becomes `unknown/retryable`; accepted asynchronous delivery remains queued until status reconciliation; cancellation and repeated scheduled runs never duplicate a provider effect. | Outbox, pre-call running fence, user/action-scoped action keys, conservative delivery/status/cancel adapter, and local async message/reminder mock evidence are implemented; a selected production vendor, sandbox proof, and durable cancel-operation policy remain. |
 | D31 | First voice UX is push-to-talk with VAD end detection. | Avoids always-on microphone privacy, battery, and background complexity. | Permission, interruption, silence, cancel, and background transitions are tested. | iOS push-to-talk/VAD boundary exists; real-device interruption, thermal, and crash evidence remains. |
 | D32 | Locale and timezone are explicit protocol metadata. | Backend must normalize dates, amounts, and names using device context. | Hong Kong Chinese/English fixtures parse against `Asia/Hong_Kong` deterministically. | `CommandEnvelope v1` requires locale/timezone and validation preserves them; full locale/clarification golden fixtures remain. |
 | D33 | Rate-limit users, devices, SSE, commands, model fallback, and downloads. | Protects D1/AI cost and avoids reconnect storms. | Limits return stable error code and `retry_after`; normal usage remains unaffected. | User/device/SSE/command/model/download buckets are implemented; production thresholds and alert calibration remain. |
