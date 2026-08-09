@@ -735,6 +735,7 @@ pub async fn reconcile_waiting_session(db: &D1Database, row: SessionRow) -> ApiR
     Ok(current)
 }
 
+#[allow(dead_code)]
 pub async fn list_phone_sessions(
     db: &D1Database,
     user_id: &str,
