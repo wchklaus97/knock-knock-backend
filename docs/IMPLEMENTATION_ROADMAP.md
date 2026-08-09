@@ -30,6 +30,25 @@ production migrations, APNs changes, and model rollout.
 The detailed evidence and rollback record is in
 `docs/RELEASE_VERIFICATION_REPORT.md`.
 
+### Active Phase 4/5 completion branch
+
+The follow-up branch now extends the earlier staged work with:
+
+- durable `reminders`, `drafts`, and `outbound_messages` effects keyed by
+  command and protected by provider-idempotency records;
+- real reminder/draft undo and an explicit internal message queue result;
+- `GET /v1/phone/models/{model_id}` plus production model configuration checks;
+- an iOS 15 system on-device STT path, push-to-talk controller, the official
+  LiteRT-LM 0.12 C-framework Gemma command generator, signed artifact store,
+  and rollback-aware manager;
+- a static `scripts/phase45-release-gate.sh` that runs Rust, contract,
+  migration, adversarial, configuration, and secret-hygiene checks.
+
+This does not close release by itself. The official WhisperKit package is not
+linked while the app deployment floor remains iOS 15; a signed model artifact,
+the pinned iOS public key, deployed D1/E2E checks, real-device voice evidence,
+security review, and human approval are still explicit gates.
+
 ## Operating rules
 
 1. The existing iOS and backend checkpoint PRs are the baseline. Do not add

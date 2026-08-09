@@ -679,11 +679,19 @@ pub async fn undo(db: &D1Database, user_id: &str, command_id: &str) -> ApiResult
     {
         return Err(ApiError::conflict("Command is not currently undoable"));
     }
-    Err(ApiError::new(
-        501,
-        "undo_executor_unavailable",
-        "Undo is reserved until the action executor publishes an undo handle",
-    ))
+    let undo = crate::action_effects::undo(db, user_id, &command).await?;
+    Ok(json!({
+        "command_id": command.id,
+        "state": command.state,
+        "command": envelope_from_row(&command),
+        "confirmation_token": Value::Null,
+        "result": undo,
+        "error": Value::Null,
+        "undo_command_id": Value::Null,
+        "version": command.version,
+        "created_at": command.created_at,
+        "updated_at": db::now_iso(),
+    }))
 }
 
 #[cfg(test)]

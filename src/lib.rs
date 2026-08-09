@@ -1,3 +1,4 @@
+mod action_effects;
 mod apns;
 mod audit;
 mod auth;
@@ -202,6 +203,9 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         }
         (Method::Post, ["v1", "phone", "commands", command_id, "undo"]) => {
             phone_undo_command(&req, &env, &db, command_id).await
+        }
+        (Method::Get, ["v1", "phone", "models", model_id]) => {
+            phone_model_descriptor(&req, &env, &db, model_id).await
         }
         (Method::Get, ["v1", "phone", "search"]) => phone_search(&req, &env, &db).await,
         (Method::Post, ["v1", "phone", "pushes", push_id, "read"]) => {
@@ -1109,6 +1113,66 @@ async fn phone_search(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Re
     let query = query_value(req, "q")?.unwrap_or_default();
     json_response(
         history::search(db, &user.user_id, &query, query_limit(req, 50)?).await?,
+        200,
+    )
+}
+
+/// Returns signed model metadata and a short-lived artifact URL configured by
+/// the release environment. The app verifies the manifest and artifact before
+/// activation; this endpoint never returns provider credentials.
+async fn phone_model_descriptor(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    model_id: &str,
+) -> ApiResult<Response> {
+    let _user = require_user(req, env, db).await?;
+    if model_id.is_empty()
+        || model_id.len() > 128
+        || !model_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+    {
+        return Err(ApiError::validation("Invalid model id"));
+    }
+
+    let manifest_json = config_value(env, "VOICE_MODEL_MANIFEST_JSON", "");
+    let download_url = config_value(env, "VOICE_MODEL_URL", "");
+    if manifest_json.trim().is_empty() || download_url.trim().is_empty() {
+        return Err(ApiError::new(
+            503,
+            "model_unavailable",
+            "This model is not configured for the current release",
+        ));
+    }
+    if !download_url.starts_with("https://")
+        && config_value(env, "ALLOW_INSECURE_MODEL_URL", "false") != "true"
+    {
+        return Err(ApiError::new(
+            503,
+            "model_unavailable",
+            "The configured model URL is not secure",
+        ));
+    }
+
+    let manifest: Value = serde_json::from_str(&manifest_json)
+        .map_err(|_| ApiError::new(503, "model_unavailable", "The model manifest is invalid"))?;
+    let manifest_model_id = manifest
+        .get("model_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::new(503, "model_unavailable", "The model manifest is invalid"))?;
+    if manifest_model_id != model_id {
+        return Err(ApiError::not_found("Model not found"));
+    }
+
+    let expires_at = config_value(env, "VOICE_MODEL_EXPIRES_AT", "");
+    json_response(
+        json!({
+            "model_id": model_id,
+            "manifest": manifest,
+            "download_url": download_url,
+            "expires_at": if expires_at.is_empty() { Value::Null } else { Value::String(expires_at) },
+        }),
         200,
     )
 }

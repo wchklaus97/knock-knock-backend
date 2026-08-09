@@ -578,6 +578,21 @@ paths:
                 $ref: '#/components/schemas/CommandResponse'
         default:
           $ref: '#/components/responses/Error'
+  /v1/phone/models/{model_id}:
+    get:
+      tags: [Phone]
+      operationId: getPhoneModelArtifactDescriptor
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      responses:
+        '200':
+          description: Signed model metadata and an artifact URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelArtifactDescriptor'
+        default:
+          $ref: '#/components/responses/Error'
   /v1/phone/search:
     get:
       tags: [Phone]
@@ -674,6 +689,13 @@ components:
       in: path
       required: true
       schema: { type: string }
+    ModelId:
+      name: model_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
     AfterCursor:
       name: after
       in: query
@@ -836,6 +858,28 @@ components:
           type: [object, 'null']
           additionalProperties: true
         undo_command_id: { type: [string, 'null'] }
+    ModelArtifactDescriptor:
+      type: object
+      additionalProperties: false
+      required: [model_id, manifest, download_url]
+      properties:
+        model_id: { type: string }
+        manifest:
+          $ref: '#/components/schemas/ModelManifest'
+        download_url: { type: string, format: uri }
+        expires_at: { type: [string, 'null'], format: date-time }
+    ModelManifest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, model_id, model_version, sha256, signature, size_bytes, minimum_capability]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        model_id: { type: string, minLength: 1, maxLength: 128 }
+        model_version: { type: string, pattern: '^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$' }
+        sha256: { type: string, pattern: '^[0-9a-fA-F]{64}$' }
+        signature: { type: string, minLength: 1 }
+        size_bytes: { type: integer, minimum: 1 }
+        minimum_capability: { type: string, minLength: 1, maxLength: 64 }
     ConfirmationRequest:
       type: object
       required: [confirmation_token]

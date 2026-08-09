@@ -2,6 +2,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use worker::D1Database;
 
+use crate::action_effects;
 use crate::auth::new_id;
 use crate::commands;
 use crate::db;
@@ -343,15 +344,9 @@ async fn execute_command(
                 .map_err(classify_error)
         }
         "create_draft" | "create_reminder" | "send_message" => {
-            // These intents are deliberately not reported as successful until
-            // their provider/domain adapters exist. A queued command may be
-            // retried or end in unknown/failed, but it must never pretend that
-            // an external side effect happened.
-            Err(ExecutionFailure::Retryable(ApiError::new(
-                503,
-                "executor_unavailable",
-                "The action executor is not configured",
-            )))
+            action_effects::execute(db, user_id, command, &args)
+                .await
+                .map_err(classify_error)
         }
         intent => Err(ExecutionFailure::Permanent(ApiError::new(
             422,

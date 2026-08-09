@@ -3,3 +3,4 @@
 .wrangler
 .dev.vars
 wrangler.production.toml
+.DS_Store

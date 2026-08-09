@@ -1,29 +1,36 @@
 # Knock Knock Release Verification Report
 
 **Date:** 2026-08-09  
-**Scope:** staged architecture implementation through draft PRs  
+**Scope:** current Phase 4/5 completion worktrees based on the merged checkpoint
+and Phase 0–3 integration baseline
 **Production changes:** none
 
-## Integrated branches
+## Completion branches
 
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
-| Backend | `agent/phase5-backend-release-integration` | `db8394e` | [backend PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8) |
-| iOS | `codex/phase5-ios-command-api` | `0fce2cd` | [iOS PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) |
+| Backend | `agent/phase45-completion-backend` | pending commit | pending draft PR |
+| iOS | `agent/phase45-completion-ios` | pending commit | pending draft PR |
 
-The branches are intentionally stacked on earlier phase PRs. They are not
-merged automatically; the checkpoint and phase dependency sequence still
-requires human review.
+The branches are intentionally based on the merged Phase 0–3 integration
+baseline. They are not merged, deployed, or applied to production
+automatically; the paired review and release gates still require human
+approval.
 
 ## Implemented baseline
 
 - Canonical D01–D40 architecture decisions with a Chinese summary.
 - OpenAPI 3.1 REST, SSE, error, pagination, and `CommandEnvelope v1` contract.
-- Backend migrations 0003–0009 for commands, confirmation, messages,
+- Backend migrations 0003–0010 for commands, confirmation, messages,
   retrievals, phone changes, outbox, retention/deletion metadata, rate limits,
-  and compatibility-operation claim fencing.
+  compatibility-operation claim fencing, and durable vertical-action effects.
 - Server-side command validation, action registry, idempotency, confirmation,
   undo/cancel routes, retryable unknown outcomes, and outbox execution boundary.
+- Durable local reminder and draft effects, an internal queued message effect,
+  and provider-idempotency records for the three release vertical actions.
+- Signed model descriptor endpoint and production fail-closed model
+  configuration checks; the iOS target consumes the official LiteRT-LM 0.12
+  C framework without the upstream unsafe SwiftPM linker flags.
 - User-scoped history/retrieval/search/session/push routes and deletion
   tombstones.
 - Cursor-based sync and notification-only SSE semantics.
@@ -39,7 +46,7 @@ requires human review.
 
 - `cargo fmt --all -- --check` — passed
 - `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test -q` — 24 passed
+- `cargo test -q` — 26 passed
 - `cargo check --target wasm32-unknown-unknown -q` — passed
 - `scripts/architecture-migration-smoke.sh` — passed
 - `scripts/adversarial-data-smoke.sh` — passed for cross-user isolation,
@@ -52,8 +59,11 @@ requires human review.
 
 ### iOS
 
-- iOS Simulator `VoiceAgentBridgeTests` — 30 passed, 0 failed
-- Generic iOS build with iOS 15 deployment target — passed
+- iOS Simulator `VoiceAgentBridgeTests` — 33 passed, 0 failed
+- Generic unsigned Release iOS device build with iOS 15 deployment target — passed
+- Full UI test target — compiled, but the three E2E tests stopped at the login
+  screen because the deployed Worker/`needs_user` fixture was not configured
+  for this local run; this is an explicit release gate, not a passing result.
 - `git diff --check` — passed
 
 ## Review findings addressed
@@ -72,7 +82,9 @@ These are deliberately not marked as passed:
 
 - route-level D1/E2E smoke against deployed bindings;
 - backend GitHub CI, which was still pending at report time;
-- provider-backed executors for reminder, draft, and send-message actions;
+- provider-backed executors for reminder delivery and external send-message
+  delivery (the current implementation safely persists/queues these effects
+  and reports external delivery as not configured);
 - 20–100 example golden voice dataset, ≥95% accuracy evidence, and zero
   high-risk false execution evidence;
 - physical iPhone 13 audio, memory, thermal, and crash testing;
@@ -83,7 +95,7 @@ These are deliberately not marked as passed:
 
 ## Rollback
 
-Do not merge the draft PRs until the gates above are approved. Revert the latest
-integration commits (`db8394e` and `0fce2cd`) or close the draft PRs; no
-production data or migration has been changed. Migration 0009 is additive and
-requires a separately approved rollback plan if it is ever applied.
+Do not merge the completion PRs until the gates above are approved. Revert the
+completion commits or close the draft PRs; no production data or migration has
+been changed. Migration 0010 is additive and requires a separately approved
+rollback plan if it is ever applied.

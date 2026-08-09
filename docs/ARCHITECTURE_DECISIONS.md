@@ -44,6 +44,20 @@ The current implementation status and remaining release gates are tracked in
 they explain why each migration and compatibility adapter exists; they are not
 permission to silently change an accepted decision inside a feature PR.
 
+## Phase 4/5 follow-up status
+
+The current completion branch adds durable vertical-action effects, the model
+descriptor route, an iOS 15 push-to-talk/VAD controller, system on-device STT,
+a LiteRT-LM 0.12 C-framework Gemma adapter, signed model
+download/verification/rollback management, and a static release preflight.
+The remaining gaps are
+intentionally operational: the official WhisperKit package currently requires
+iOS 16, so it is not linked into the iOS 15 target; the signed Gemma artifact
+and iOS public key must be supplied by the release environment; external
+messaging/reminder providers are not configured; and deployed D1/E2E, golden
+voice, physical-device, security, and human release gates still require
+execution and approval.
+
 ## Decision register
 
 Each decision includes the approved behavior, why it matters, how it is tested,

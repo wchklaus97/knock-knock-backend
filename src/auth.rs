@@ -230,6 +230,23 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
         ));
     }
 
+    if config_value(env, "VOICE_MODEL_ENABLED", "false") == "true" {
+        let model_url = config_value(env, "VOICE_MODEL_URL", "");
+        let manifest = config_value(env, "VOICE_MODEL_MANIFEST_JSON", "");
+        if !model_url.starts_with("https://")
+            || model_url.starts_with("https://REPLACE_")
+            || manifest.trim().is_empty()
+            || manifest.trim().starts_with("REPLACE_")
+            || serde_json::from_str::<Value>(&manifest).is_err()
+        {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "VOICE_MODEL_URL and VOICE_MODEL_MANIFEST_JSON must be configured for model rollout",
+            ));
+        }
+    }
+
     for (name, value) in [
         ("APNS_KEY", config_value(env, "APNS_KEY", "")),
         ("APNS_KEY_ID", config_value(env, "APNS_KEY_ID", "")),
