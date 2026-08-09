@@ -93,6 +93,9 @@ pub struct SessionRow {
     pub expires_at: String,
     pub created_at: String,
     pub updated_at: String,
+    pub archived_at: Option<String>,
+    pub deleted_at: Option<String>,
+    pub retention_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,6 +244,7 @@ pub struct PhoneChangeRow {
     pub session_id: Option<String>,
     pub version: i64,
     pub created_at: String,
+    pub deleted_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -385,6 +389,18 @@ pub struct EventRequest {
     pub actions: Option<Vec<ActionInput>>,
     pub idempotency_key: String,
     pub force_push: Option<bool>,
+    #[serde(default)]
+    pub retrievals: Option<Vec<RetrievalInput>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetrievalInput {
+    pub title: String,
+    pub url: String,
+    pub snippet: Option<String>,
+    pub score: Option<f64>,
+    pub content_hash: String,
+    pub r2_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -9,6 +9,10 @@ const LEASE_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, Deserialize)]
 struct PhoneOperationRow {
+    operation: String,
+    request_hash: Option<String>,
+    session_id: Option<String>,
+    action_id: Option<String>,
     response_json: Option<String>,
     expires_at: String,
 }
@@ -21,6 +25,9 @@ pub async fn begin(
     user_id: &str,
     operation: &str,
     idempotency_key: Option<&str>,
+    request_hash: &str,
+    session_id: &str,
+    action_id: Option<&str>,
 ) -> ApiResult<Option<Value>> {
     let Some(key) = idempotency_key
         .map(str::trim)
@@ -35,11 +42,14 @@ pub async fn begin(
     let expires_at = db::add_seconds_iso(LEASE_SECONDS);
     let inserted = db::run(
         db,
-        "INSERT OR IGNORE INTO phone_operations (user_id, idempotency_key, operation, response_json, expires_at, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, ?)",
+        "INSERT OR IGNORE INTO phone_operations (user_id, idempotency_key, operation, request_hash, session_id, action_id, response_json, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
         vec![
             db::text(user_id),
             db::text(key),
             db::text(operation),
+            db::text(request_hash),
+            db::text(session_id),
+            db::optional_text(action_id),
             db::text(&expires_at),
             db::text(&now),
             db::text(&now),
@@ -52,11 +62,20 @@ pub async fn begin(
 
     let existing = db::first::<PhoneOperationRow>(
         db,
-        "SELECT response_json, expires_at FROM phone_operations WHERE user_id = ? AND idempotency_key = ? AND operation = ?",
-        vec![db::text(user_id), db::text(key), db::text(operation)],
+        "SELECT operation, request_hash, session_id, action_id, response_json, expires_at FROM phone_operations WHERE user_id = ? AND idempotency_key = ?",
+        vec![db::text(user_id), db::text(key)],
     )
     .await?
     .ok_or_else(|| ApiError::conflict("Idempotency record is unavailable"))?;
+    if existing.operation != operation
+        || existing.request_hash.as_deref() != Some(request_hash)
+        || existing.session_id.as_deref() != Some(session_id)
+        || existing.action_id.as_deref() != action_id
+    {
+        return Err(ApiError::conflict(
+            "Idempotency key was already used for a different phone request",
+        ));
+    }
     if let Some(response) = existing.response_json {
         return serde_json::from_str(&response).map(Some).map_err(|_| {
             ApiError::new(
@@ -69,13 +88,15 @@ pub async fn begin(
     if db::is_expired(&existing.expires_at) {
         let replaced = db::run(
             db,
-            "UPDATE phone_operations SET response_json = NULL, expires_at = ?, updated_at = ? WHERE user_id = ? AND idempotency_key = ? AND operation = ? AND response_json IS NULL AND expires_at <= ?",
+            "UPDATE phone_operations SET response_json = NULL, expires_at = ?, updated_at = ? WHERE user_id = ? AND idempotency_key = ? AND operation = ? AND request_hash = ? AND session_id = ? AND response_json IS NULL AND expires_at <= ?",
             vec![
                 db::text(&expires_at),
                 db::text(&now),
                 db::text(user_id),
                 db::text(key),
                 db::text(operation),
+                db::text(request_hash),
+                db::text(session_id),
                 db::text(&now),
             ],
         )
@@ -94,6 +115,8 @@ pub async fn complete(
     user_id: &str,
     operation: &str,
     idempotency_key: Option<&str>,
+    request_hash: &str,
+    session_id: &str,
     response: &Value,
 ) -> ApiResult<()> {
     let Some(key) = idempotency_key
@@ -104,13 +127,15 @@ pub async fn complete(
     };
     db::run(
         db,
-        "UPDATE phone_operations SET response_json = ?, updated_at = ? WHERE user_id = ? AND idempotency_key = ? AND operation = ?",
+        "UPDATE phone_operations SET response_json = ?, updated_at = ? WHERE user_id = ? AND idempotency_key = ? AND operation = ? AND request_hash = ? AND session_id = ? AND response_json IS NULL",
         vec![
             db::text(&response.to_string()),
             db::text(&db::now_iso()),
             db::text(user_id),
             db::text(key),
             db::text(operation),
+            db::text(request_hash),
+            db::text(session_id),
         ],
     )
     .await?;

@@ -627,8 +627,9 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [updated, read_at]
+                required: [ok, updated, read_at]
                 properties:
+                  ok: { type: boolean, const: true }
                   updated: { type: integer, minimum: 0 }
                   read_at: { type: string, format: date-time }
         default:
@@ -771,6 +772,18 @@ components:
           type: object
           additionalProperties: true
         force_push: { type: boolean, default: false }
+        retrievals:
+          type: array
+          items:
+            type: object
+            required: [title, url, content_hash]
+            properties:
+              title: { type: string, minLength: 1, maxLength: 500 }
+              url: { type: string, format: uri, maxLength: 2048 }
+              snippet: { type: [string, 'null'] }
+              score: { type: [number, 'null'] }
+              content_hash: { type: string, minLength: 1, maxLength: 256 }
+              r2_key: { type: [string, 'null'] }
     CommandEnvelope:
       type: object
       additionalProperties: false
@@ -885,6 +898,9 @@ components:
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         version: { type: integer, minimum: 0 }
+        archived_at: { type: [string, 'null'], format: date-time }
+        deleted_at: { type: [string, 'null'], format: date-time }
+        retention_expires_at: { type: [string, 'null'], format: date-time }
     SessionDetail:
       allOf:
         - $ref: '#/components/schemas/SessionSummary'
@@ -938,8 +954,11 @@ components:
         created_at: { type: string, format: date-time }
     MessagePage:
       type: object
-      required: [messages, next_cursor, has_more]
+      required: [items, messages, next_cursor, has_more]
       properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
         messages:
           type: array
           items: { $ref: '#/components/schemas/Message' }
@@ -966,9 +985,14 @@ components:
         has_more: { type: boolean }
     SearchPage:
       type: object
-      required: [query, sessions, messages, retrieval_items]
+      required: [items, next_cursor, query, sessions, messages, retrieval_items]
       properties:
         query: { type: string }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
         sessions:
           type: array
           items: { $ref: '#/components/schemas/SessionSummary' }
@@ -997,15 +1021,16 @@ components:
         entity_id: { type: string }
         session_id: { type: [string, 'null'] }
         version: { type: integer, minimum: 0 }
+        deleted_at: { type: [string, 'null'], format: date-time }
     SseEvent:
       type: object
-      required: [id, type, data]
+      description: Invalidation payload carried in each non-comment SSE frame. Full data is fetched through REST or /v1/phone/sync.
+      required: [id, type, session_id, version]
       properties:
         id: { type: string }
         type: { type: string, enum: [sync.required, session.updated, message.created, command.updated, push.updated] }
-        data:
-          type: object
-          additionalProperties: true
+        session_id: { type: [string, 'null'] }
+        version: { type: integer, minimum: 0 }
     EventResult:
       type: object
       required: [event_id, session]

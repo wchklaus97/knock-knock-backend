@@ -123,6 +123,7 @@ pub async fn mark_all_read(db: &D1Database, user_id: &str) -> ApiResult<Value> {
     )
     .await?;
     Ok(serde_json::json!({
+        "ok": true,
         "updated": db::changes(&result),
         "read_at": now,
     }))
@@ -130,6 +131,7 @@ pub async fn mark_all_read(db: &D1Database, user_id: &str) -> ApiResult<Value> {
 
 fn push_value(row: PushRow) -> Value {
     serde_json::json!({
+        "ok": true,
         "push_id": row.id,
         "session_id": row.session_id,
         "title": row.title,
