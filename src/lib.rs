@@ -203,7 +203,7 @@ fn path_segments(path: &str) -> Vec<&str> {
 }
 
 fn request_id() -> String {
-    let timestamp = worker::Date::now().as_millis() as u64;
+    let timestamp = worker::Date::now().as_millis();
     let mut entropy = [0_u8; 8];
     if getrandom::fill(&mut entropy).is_err() {
         return format!("req_{timestamp:x}");
