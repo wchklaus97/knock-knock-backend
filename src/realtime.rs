@@ -33,10 +33,12 @@ pub fn parse_cursor(raw: Option<&str>) -> Result<Option<i64>, CursorError> {
     Ok(Some(cursor))
 }
 
+#[allow(dead_code)]
 pub fn valid_entity_type(entity_type: &str) -> bool {
     ENTITY_TYPES.contains(&entity_type)
 }
 
+#[allow(dead_code)]
 pub fn change_payload(
     cursor: i64,
     entity_type: &str,
