@@ -625,10 +625,11 @@ pub async fn report_event(
             env,
             crate::push::PushRequest {
                 user_id: &current.user_id,
-                session_id: &current.id,
+                session_id: Some(&current.id),
                 title: current.title.as_deref().unwrap_or(&skill.skill_id),
                 body: &summary,
                 voice_script: Some(&voice),
+                dedupe_key: None,
                 payload: serde_json::json!({
                 "event_id": event_id,
                 "status": input.status,

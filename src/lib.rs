@@ -14,6 +14,7 @@ mod providers;
 mod push;
 mod rate_limits;
 mod realtime;
+mod reminders;
 mod sessions;
 mod skills;
 
@@ -89,6 +90,8 @@ pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: Schedu
     }
     if let Ok(db) = env.d1("DB") {
         let _ = outbox::drain(&db, &env).await;
+        let _ = reminders::drain_due(&db, &env).await;
+        let _ = history::purge_expired_all(&db).await;
     }
 }
 
@@ -112,7 +115,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
                 "apns_ready": crate::apns::is_ready(&env),
                 "apns_production": config_value(&env, "APNS_PRODUCTION", "false") == "true",
                 "action_provider_mode": action_provider_config.mode().as_str(),
-                "action_provider_ready": providers::ready(action_provider_config.mode()),
+                "action_provider_ready": providers::ready(&action_provider_config),
                 "action_reminder_enabled": action_provider_config.enabled("create_reminder"),
                 "action_message_enabled": action_provider_config.enabled("send_message"),
             }),

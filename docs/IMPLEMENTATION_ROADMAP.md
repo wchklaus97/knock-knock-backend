@@ -45,9 +45,14 @@ three local vertical effects through `/__scheduled`: reminder and draft become
 durable D1 effects, while message remains explicitly `queued` with
 `external_delivery: not_configured`.
 
-This checkpoint is not a production provider delivery. A concrete external
-reminder/message adapter, due-time scanner, deployed-binding E2E, CI security
-review, and human merge/deployment approval remain release work.
+This checkpoint now includes a generic secret-authenticated HTTPS provider
+adapter for reminder/message delivery, a local reminder due-time scanner with
+deduplicated pushes, a scheduled retention sweep, a staging configuration
+template, and a formal contract-breaking compatibility smoke. The adapter was
+verified against a local mock provider for reminder and confirmed message
+delivery. Provider vendor selection, sandbox evidence, production credentials,
+remote staging D1/Worker E2E, formal security/observability review, and human
+merge/deployment approval remain release work.
 
 ### Active Phase 4/5 completion branch
 
@@ -61,7 +66,13 @@ The follow-up branch now extends the earlier staged work with:
   LiteRT-LM 0.12 C-framework Gemma command generator, signed artifact store,
   and rollback-aware manager;
 - a static `scripts/phase45-release-gate.sh` that runs Rust, contract,
-  migration, adversarial, configuration, and secret-hygiene checks.
+  migration, adversarial, provider-safety, configuration, compatibility, and
+  secret-hygiene checks;
+- `migrations/0012_reminder_delivery_state.sql`, a leaseable local reminder
+  notifier, a deduplicated push path, and a scheduled message/retrieval
+  retention sweep;
+- `wrangler.staging.toml.example`, with staging fail-closed validation and
+  external action flags disabled by default.
 
 This does not close release by itself. The official WhisperKit package is not
 linked while the app deployment floor remains iOS 15; a signed model artifact,

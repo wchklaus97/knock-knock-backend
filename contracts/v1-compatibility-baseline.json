@@ -1,0 +1,145 @@
+{
+  "openapi": "3.1.0",
+  "paths": {
+    "/health": ["get"],
+    "/v1/health": ["get"],
+    "/v1/auth/register": ["post"],
+    "/v1/auth/login": ["post"],
+    "/v1/auth/refresh": ["post"],
+    "/v1/auth/logout": ["post"],
+    "/v1/agents": ["get", "post"],
+    "/v1/agents/me/actions/pending": ["get"],
+    "/v1/pairing/code": ["post"],
+    "/v1/pairing/code/{code}": ["get"],
+    "/v1/pairing/claim": ["post"],
+    "/v1/sessions": ["post"],
+    "/v1/sessions/{session_id}/events": ["post"],
+    "/v1/sessions/{session_id}/actions/pending": ["get"],
+    "/v1/actions/{action_id}/result": ["post"],
+    "/v1/phone/devices": ["post"],
+    "/v1/phone/events": ["get"],
+    "/v1/phone/sync": ["get"],
+    "/v1/phone/sessions": ["get"],
+    "/v1/phone/sessions/{session_id}": ["get", "patch", "delete"],
+    "/v1/phone/sessions/{session_id}/history": ["get"],
+    "/v1/phone/sessions/{session_id}/messages": ["get"],
+    "/v1/phone/sessions/{session_id}/export": ["get"],
+    "/v1/phone/sessions/{session_id}/reply": ["post"],
+    "/v1/phone/sessions/{session_id}/confirm": ["post"],
+    "/v1/phone/commands": ["get", "post"],
+    "/v1/phone/commands/{command_id}": ["get"],
+    "/v1/phone/commands/{command_id}/confirm": ["post"],
+    "/v1/phone/commands/{command_id}/cancel": ["post"],
+    "/v1/phone/commands/{command_id}/undo": ["post"],
+    "/v1/phone/models/{model_id}": ["get"],
+    "/v1/phone/search": ["get"],
+    "/v1/phone/pushes/{push_id}/read": ["post"],
+    "/v1/phone/pushes/{push_id}/dismiss": ["post"],
+    "/v1/phone/pushes/read-all": ["post"],
+    "/v1/dev/pushes": ["get"]
+  },
+  "schemas": {
+    "CommandEnvelope": {
+      "required": [
+        "schema_version",
+        "command_id",
+        "intent",
+        "args",
+        "risk_level",
+        "needs_confirmation",
+        "idempotency_key",
+        "confidence",
+        "locale",
+        "timezone"
+      ],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 1},
+        "command_id": {"type": "string"},
+        "intent": {"type": "string"},
+        "args": {"type": "object"},
+        "risk_level": {"type": "string", "enum": ["low", "medium", "high", "destructive"]},
+        "needs_confirmation": {"type": "boolean"},
+        "idempotency_key": {"type": "string"},
+        "confidence": {"type": "number"},
+        "locale": {"type": "string"},
+        "timezone": {"type": "string"}
+      }
+    },
+    "CommandResponse": {
+      "required": ["command_id", "state", "version", "created_at", "updated_at"],
+      "properties": {
+        "command_id": {"type": "string"},
+        "state": {"ref": "#/components/schemas/CommandState"},
+        "version": {"type": "integer"}
+      }
+    },
+    "CommandState": {
+      "enum": ["pending", "validated", "awaiting_confirmation", "queued", "running", "succeeded", "failed", "expired", "cancelled", "unknown"]
+    },
+    "ErrorResponse": {
+      "required": ["error"],
+      "properties": {
+        "error": {"type": "object", "required": ["code", "message", "retryable", "request_id"]}
+      }
+    },
+    "SseEvent": {
+      "required": ["id", "type"],
+      "properties": {
+        "id": {"type": "string"},
+        "type": {"type": "string", "enum": ["sync.required", "session.updated", "message.created", "command.updated", "push.updated"]}
+      }
+    },
+    "SyncResponse": {
+      "required": ["cursor", "changes", "has_more"],
+      "properties": {
+        "cursor": {"type": "string"},
+        "changes": {"type": "array"},
+        "has_more": {"type": "boolean"}
+      }
+    },
+    "ActionDescriptor": {
+      "required": ["action_key", "title", "risk", "confirm_required"],
+      "properties": {
+        "action_key": {"type": "string"},
+        "risk": {"type": "string", "enum": ["low", "medium", "high", "destructive"]},
+        "confirm_required": {"type": "boolean"}
+      }
+    },
+    "CommandPage": {
+      "required": ["commands", "next_cursor", "has_more"],
+      "properties": {
+        "commands": {"type": "array"},
+        "next_cursor": {"type": ["string", "null"]},
+        "has_more": {"type": "boolean"}
+      }
+    },
+    "PairingCodeStatus": {
+      "required": ["code", "status", "expires_at"],
+      "properties": {
+        "code": {"type": "string"},
+        "status": {"type": "string", "enum": ["waiting", "claimed", "expired"]},
+        "expires_at": {"type": "string"}
+      }
+    },
+    "Push": {
+      "required": ["push_id", "title", "body", "created_at"],
+      "properties": {
+        "push_id": {"type": "string"},
+        "title": {"type": "string"},
+        "body": {"type": "string"}
+      }
+    },
+    "ModelManifest": {
+      "required": ["schema_version", "model_id", "model_version", "sha256", "signature", "size_bytes", "minimum_capability"],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 1},
+        "model_id": {"type": "string"},
+        "model_version": {"type": "string"},
+        "sha256": {"type": "string"},
+        "signature": {"type": "string"},
+        "size_bytes": {"type": "integer"},
+        "minimum_capability": {"type": "string"}
+      }
+    }
+  }
+}

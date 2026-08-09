@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use worker::D1Database;
+use worker::{D1Database, Env};
 
 use crate::auth::new_id;
 use crate::db;
@@ -23,6 +23,8 @@ struct EffectAttemptRow {
 struct EffectRow {
     id: String,
     status: String,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 /// Execute an action whose effect is fully represented in D1.
@@ -31,6 +33,7 @@ struct EffectRow {
 /// repeatedly. Each effect table has a `(user_id, command_id)` uniqueness
 /// constraint and `action_attempts` records the provider-level result.
 pub async fn execute(
+    env: &Env,
     db: &D1Database,
     user_id: &str,
     command: &CommandRow,
@@ -57,9 +60,11 @@ pub async fn execute(
     }
 
     match command.intent.as_str() {
-        "create_reminder" => create_reminder(db, user_id, command, args, provider_config).await,
+        "create_reminder" => {
+            create_reminder(env, db, user_id, command, args, provider_config).await
+        }
         "create_draft" => create_draft(db, user_id, command, args).await,
-        "send_message" => queue_message(db, user_id, command, args, provider_config).await,
+        "send_message" => queue_message(env, db, user_id, command, args, provider_config).await,
         _ => Err(ApiError::new(
             422,
             "unsupported_intent",
@@ -74,18 +79,34 @@ pub async fn execute(
 /// Cancel a reversible materialized effect. This is intentionally not a
 /// generic SQL delete: the cancelled state remains queryable and auditable.
 pub async fn undo(db: &D1Database, user_id: &str, command: &CommandRow) -> ApiResult<Value> {
-    let (table, provider) = match command.intent.as_str() {
-        "create_reminder" => ("reminders", "local.reminder"),
-        "create_draft" => ("drafts", "local.draft"),
+    let (table, default_provider, id_sql) = match command.intent.as_str() {
+        "create_reminder" => (
+            "reminders",
+            "local.reminder",
+            "SELECT id, status, provider FROM reminders WHERE user_id = ? AND command_id = ?",
+        ),
+        "create_draft" => (
+            "drafts",
+            "local.draft",
+            "SELECT id, status, NULL AS provider FROM drafts WHERE user_id = ? AND command_id = ?",
+        ),
         _ => return Err(ApiError::conflict("Command is not currently undoable")),
     };
 
     let now = db::now_iso();
-    let id_sql = format!("SELECT id, status FROM {table} WHERE user_id = ? AND command_id = ?");
-    let effect =
-        db::first::<EffectRow>(db, &id_sql, vec![db::text(user_id), db::text(&command.id)])
-            .await?
-            .ok_or_else(|| ApiError::not_found("Command effect was not found"))?;
+    let effect = db::first::<EffectRow>(db, id_sql, vec![db::text(user_id), db::text(&command.id)])
+        .await?
+        .ok_or_else(|| ApiError::not_found("Command effect was not found"))?;
+    let provider = effect
+        .provider
+        .as_deref()
+        .unwrap_or(default_provider)
+        .to_string();
+    if command.intent == "create_reminder" && provider != "local.reminder" {
+        return Err(ApiError::conflict(
+            "External reminder cancellation is not configured",
+        ));
+    }
     if effect.status == "cancelled" {
         return Ok(json!({
             "kind": "undo",
@@ -176,7 +197,7 @@ pub async fn undo(db: &D1Database, user_id: &str, command: &CommandRow) -> ApiRe
     let results = db.batch(statements).await?;
     if results.get(1).map(db::changes).unwrap_or(0) == 0 {
         let current =
-            db::first::<EffectRow>(db, &id_sql, vec![db::text(user_id), db::text(&command.id)])
+            db::first::<EffectRow>(db, id_sql, vec![db::text(user_id), db::text(&command.id)])
                 .await?;
         if current
             .as_ref()
@@ -196,6 +217,7 @@ pub async fn undo(db: &D1Database, user_id: &str, command: &CommandRow) -> ApiRe
 }
 
 async fn create_reminder(
+    env: &Env,
     db: &D1Database,
     user_id: &str,
     command: &CommandRow,
@@ -205,22 +227,50 @@ async fn create_reminder(
     if !provider_config.enabled("create_reminder") {
         return Err(providers::disabled("create_reminder"));
     }
-    if !provider_config.mode().local_effects_allowed() {
-        return Err(providers::unavailable(
-            provider_config.mode(),
-            "create_reminder",
-        ));
-    }
     let title = required_string(args, &["title", "text", "message"], MAX_TITLE, "title")?;
     let due_at = required_string(args, &["due_at", "time", "datetime"], 64, "due_at")?;
     if db::is_expired(due_at) {
         return Err(ApiError::validation("due_at must be in the future"));
     }
+    let external = provider_config.mode() == providers::ActionProviderMode::External;
+    let provider_response = if external {
+        Some(
+            providers::send(
+                env,
+                &provider_config,
+                "create_reminder",
+                &command.idempotency_key,
+                json!({
+                    "schema_version": 1,
+                    "kind": "reminder",
+                    "command_id": command.id,
+                    "user_id": user_id,
+                    "title": title,
+                    "due_at": due_at,
+                    "timezone": command.timezone,
+                }),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if !external && !provider_config.mode().local_effects_allowed() {
+        return Err(providers::unavailable(
+            provider_config.mode(),
+            "create_reminder",
+        ));
+    }
+    let provider = if external {
+        "external.reminder"
+    } else {
+        "local.reminder"
+    };
     let now = db::now_iso();
     let id = new_id("rem")?;
     db::run(
         db,
-        "INSERT OR IGNORE INTO reminders (id, user_id, command_id, session_id, title, due_at, timezone, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)",
+        "INSERT OR IGNORE INTO reminders (id, user_id, command_id, session_id, title, due_at, timezone, status, created_at, updated_at, provider, provider_reminder_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)",
         vec![
             db::text(&id),
             db::text(user_id),
@@ -231,12 +281,18 @@ async fn create_reminder(
             db::text(&command.timezone),
             db::text(&now),
             db::text(&now),
+            db::text(provider),
+            db::optional_text(
+                provider_response
+                    .as_ref()
+                    .and_then(|value| value.provider_id.as_deref()),
+            ),
         ],
     )
     .await?;
     let effect: EffectRow = db::first(
         db,
-        "SELECT id, status FROM reminders WHERE user_id = ? AND command_id = ?",
+        "SELECT id, status, provider FROM reminders WHERE user_id = ? AND command_id = ?",
         vec![db::text(user_id), db::text(&command.id)],
     )
     .await?
@@ -248,8 +304,11 @@ async fn create_reminder(
         "title": title,
         "due_at": due_at,
         "timezone": command.timezone,
+        "provider": provider,
+        "external_delivery": external.then_some("accepted"),
+        "provider_id": provider_response.as_ref().and_then(|value| value.provider_id.clone()),
     });
-    record_attempt(db, user_id, command, "local.reminder", &response).await
+    record_attempt(db, user_id, command, provider, &response).await
 }
 
 async fn create_draft(
@@ -297,6 +356,7 @@ async fn create_draft(
 }
 
 async fn queue_message(
+    env: &Env,
     db: &D1Database,
     user_id: &str,
     command: &CommandRow,
@@ -306,12 +366,6 @@ async fn queue_message(
     if !provider_config.enabled("send_message") {
         return Err(providers::disabled("send_message"));
     }
-    if !provider_config.mode().local_effects_allowed() {
-        return Err(providers::unavailable(
-            provider_config.mode(),
-            "send_message",
-        ));
-    }
     let body = required_string(args, &["body", "message", "text"], MAX_BODY, "body")?;
     let recipient = required_string(
         args,
@@ -319,11 +373,45 @@ async fn queue_message(
         MAX_RECIPIENT,
         "recipient",
     )?;
+    let external = provider_config.mode() == providers::ActionProviderMode::External;
+    let provider_response = if external {
+        Some(
+            providers::send(
+                env,
+                &provider_config,
+                "send_message",
+                &command.idempotency_key,
+                json!({
+                    "schema_version": 1,
+                    "kind": "message",
+                    "command_id": command.id,
+                    "user_id": user_id,
+                    "recipient": recipient,
+                    "body": body,
+                }),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if !external && !provider_config.mode().local_effects_allowed() {
+        return Err(providers::unavailable(
+            provider_config.mode(),
+            "send_message",
+        ));
+    }
     let now = db::now_iso();
     let id = new_id("msgout")?;
+    let provider = if external {
+        "external.message"
+    } else {
+        "internal.outbox"
+    };
+    let delivery_state = if external { "sent" } else { "queued" };
     db::run(
         db,
-        "INSERT OR IGNORE INTO outbound_messages (id, user_id, command_id, session_id, recipient, body, provider, delivery_state, provider_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'internal.outbox', 'queued', NULL, ?, ?)",
+        "INSERT OR IGNORE INTO outbound_messages (id, user_id, command_id, session_id, recipient, body, provider, delivery_state, provider_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         vec![
             db::text(&id),
             db::text(user_id),
@@ -331,6 +419,13 @@ async fn queue_message(
             db::optional_text(command.session_id.as_deref()),
             db::text(recipient),
             db::text(body),
+            db::text(provider),
+            db::text(delivery_state),
+            db::optional_text(
+                provider_response
+                    .as_ref()
+                    .and_then(|value| value.provider_id.as_deref()),
+            ),
             db::text(&now),
             db::text(&now),
         ],
@@ -338,7 +433,7 @@ async fn queue_message(
     .await?;
     let effect: EffectRow = db::first(
         db,
-        "SELECT id, delivery_state AS status FROM outbound_messages WHERE user_id = ? AND command_id = ?",
+        "SELECT id, delivery_state AS status, NULL AS provider FROM outbound_messages WHERE user_id = ? AND command_id = ?",
         vec![db::text(user_id), db::text(&command.id)],
     )
     .await?
@@ -347,10 +442,11 @@ async fn queue_message(
         "kind": "message",
         "message_id": effect.id,
         "delivery_state": effect.status,
-        "provider": "internal.outbox",
-        "external_delivery": "not_configured",
+        "provider": provider,
+        "external_delivery": if external { "accepted" } else { "not_configured" },
+        "provider_id": provider_response.as_ref().and_then(|value| value.provider_id.clone()),
     });
-    record_attempt(db, user_id, command, "internal.message", &response).await
+    record_attempt(db, user_id, command, provider, &response).await
 }
 
 async fn previous_attempt(

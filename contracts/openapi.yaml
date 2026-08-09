@@ -18,6 +18,18 @@ tags:
 security:
   - bearerAuth: []
 paths:
+  /health:
+    get:
+      tags: [Auth]
+      security: []
+      operationId: getWorkerHealth
+      responses:
+        '200':
+          description: Worker health and provider readiness.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
   /v1/health:
     get:
       tags: [Auth]
@@ -1293,6 +1305,14 @@ components:
         ok: { type: boolean }
         api: { type: string }
         runtime: { type: string }
+        version: { type: string }
+        push_mode: { type: string, enum: [dev, apns, both] }
+        apns_ready: { type: boolean }
+        apns_production: { type: boolean }
+        action_provider_mode: { type: string, enum: [internal, external, disabled] }
+        action_provider_ready: { type: boolean }
+        action_reminder_enabled: { type: boolean }
+        action_message_enabled: { type: boolean }
     ErrorResponse:
       type: object
       required: [error]

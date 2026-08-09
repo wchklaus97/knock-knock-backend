@@ -75,10 +75,21 @@ development inbox when appropriate instead of being reported as a false
 success.
 
 Local action execution uses `ACTION_PROVIDER_MODE=internal` and may enable the
-reminder/message flags for D1-only testing. Production defaults to
-`ACTION_PROVIDER_MODE=external` with those flags disabled until concrete
-provider adapters and their secrets are approved. A local queued message is
-never reported as externally delivered.
+reminder/message flags for D1-only testing. The Worker also supports a reviewed
+HTTPS webhook adapter in `ACTION_PROVIDER_MODE=external`: set
+`ACTION_REMINDER_URL`/`ACTION_MESSAGE_URL` and the matching secret-only
+`ACTION_REMINDER_TOKEN`/`ACTION_MESSAGE_TOKEN`. Every request carries the
+command idempotency key, and a provider timeout remains `unknown/retryable`.
+Production keeps both action flags disabled until the provider endpoint,
+idempotency behavior, cancellation policy, and credentials are approved. A
+local queued message is never reported as externally delivered.
+
+For a safe remote staging Worker, copy `wrangler.staging.toml.example`, create
+a separate D1 database and Supabase project, replace its explicit origin and
+release version, then apply migrations with that config. Staging intentionally
+uses `PUSH_MODE=dev` and `ACTION_PROVIDER_MODE=disabled`; it verifies auth,
+contract, sync, history, and UI behavior without sending real reminders or
+messages. It is not a production substitute.
 
 `PUSH_MODE=dev` is not APNs: it writes a push event to the D1-backed development
 inbox for polling. Production uses `PUSH_MODE=both` during rollout so the app

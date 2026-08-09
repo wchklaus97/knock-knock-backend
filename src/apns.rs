@@ -79,7 +79,7 @@ pub async fn send_alert(
     token: &str,
     title: &str,
     body: &str,
-    session_id: &str,
+    session_id: Option<&str>,
     voice_script: Option<&str>,
 ) -> ApiResult<()> {
     if !looks_like_token(token) {

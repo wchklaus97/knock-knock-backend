@@ -1,0 +1,41 @@
+# Safe staging template. Replace all REPLACE_* values and configure Supabase
+# publishable key as a Worker var/secret before deploying. This environment
+# intentionally disables external effects and uses the development push inbox;
+# it is for contract, migration, sync, and UI integration testing only.
+name = "knock-knock-backend-staging"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-04-16"
+workers_dev = true
+
+[triggers]
+crons = ["*/1 * * * *"]
+
+[build]
+command = "worker-build --release"
+
+[vars]
+NODE_ENV = "staging"
+AUTH_PROVIDER = "supabase"
+SUPABASE_URL = "REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL"
+PUSH_MODE = "dev"
+CORS_ORIGIN = "REPLACE_WITH_STAGING_ALLOWED_ORIGIN"
+SERVICE_VERSION = "REPLACE_WITH_STAGING_RELEASE_VERSION"
+ACTION_PROVIDER_MODE = "disabled"
+ACTION_REMINDER_ENABLED = "false"
+ACTION_MESSAGE_ENABLED = "false"
+VOICE_MODEL_ENABLED = "false"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[[d1_databases]]
+binding = "DB"
+database_name = "knock-knock-staging"
+database_id = "REPLACE_WITH_STAGING_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Required secret:
+# wrangler secret put SUPABASE_PUBLISHABLE_KEY --config wrangler.staging.toml
+# If AUTH_PROVIDER is changed to legacy for a temporary test, also set:
+# wrangler secret put JWT_SECRET --config wrangler.staging.toml

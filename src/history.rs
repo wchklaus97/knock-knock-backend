@@ -7,6 +7,8 @@ use crate::models::{RetrievalItemRow, SessionMessageRow, SessionRow};
 use crate::pagination;
 use crate::sessions;
 
+const RETENTION_SWEEP_BATCH: i64 = 500;
+
 pub async fn purge_expired(db: &D1Database, user_id: &str) -> ApiResult<()> {
     let now = db::now_iso();
     // Retrievals reference messages, so remove source metadata before the
@@ -25,6 +27,26 @@ pub async fn purge_expired(db: &D1Database, user_id: &str) -> ApiResult<()> {
     )
     .await?;
     Ok(())
+}
+
+/// Scheduled retention sweep for users who do not open the app frequently.
+/// Delete triggers emit tombstone/change records, so an offline device still
+/// converges instead of resurrecting expired messages or retrieval snapshots.
+pub async fn purge_expired_all(db: &D1Database) -> ApiResult<usize> {
+    let now = db::now_iso();
+    let retrievals = db::run(
+        db,
+        "DELETE FROM retrieval_items WHERE id IN (SELECT id FROM retrieval_items WHERE retention_expires_at IS NOT NULL AND retention_expires_at <= ? ORDER BY created_at ASC, id ASC LIMIT ?)",
+        vec![db::text(&now), db::number(RETENTION_SWEEP_BATCH)],
+    )
+    .await?;
+    let messages = db::run(
+        db,
+        "DELETE FROM session_messages WHERE id IN (SELECT id FROM session_messages WHERE retention_expires_at IS NOT NULL AND retention_expires_at <= ? ORDER BY created_at ASC, id ASC LIMIT ?)",
+        vec![db::text(&now), db::number(RETENTION_SWEEP_BATCH)],
+    )
+    .await?;
+    Ok(db::changes(&retrievals) + db::changes(&messages))
 }
 
 fn parse_json(raw: &str) -> Value {

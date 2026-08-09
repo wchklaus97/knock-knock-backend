@@ -6,6 +6,7 @@ CONTRACT="${ROOT_DIR}/contracts/openapi.yaml"
 
 test -s "${CONTRACT}"
 grep -q '^openapi: 3.1.0$' "${CONTRACT}"
+grep -q '^  /health:$' "${CONTRACT}"
 grep -q '^  /v1/phone/commands:$' "${CONTRACT}"
 grep -q '^  /v1/pairing/code/{code}:$' "${CONTRACT}"
 grep -q '^  /v1/phone/pushes/{push_id}/dismiss:$' "${CONTRACT}"

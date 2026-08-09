@@ -53,7 +53,7 @@ pub async fn drain(db: &D1Database, env: &worker::Env) -> ApiResult<usize> {
     for row in rows {
         if claim(db, &row).await? {
             processed += 1;
-            if let Err(error) = process_claimed(db, &row, provider_config).await {
+            if let Err(error) = process_claimed(db, env, &row, provider_config.clone()).await {
                 settle_processing_error(db, &row, &error).await?;
             }
         }
@@ -179,6 +179,7 @@ async fn claim(db: &D1Database, row: &OutboxEventRow) -> ApiResult<bool> {
 
 async fn process_claimed(
     db: &D1Database,
+    env: &worker::Env,
     row: &OutboxEventRow,
     provider_config: ActionProviderConfig,
 ) -> ApiResult<()> {
@@ -226,7 +227,7 @@ async fn process_claimed(
         .await?
         .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;
 
-    match execute_command(db, user_id, &current, provider_config).await {
+    match execute_command(env, db, user_id, &current, provider_config).await {
         Ok(result) => finish_success(db, row, user_id, &current, result).await,
         Err(failure) => finish_failure(db, row, user_id, &current, failure, "running").await,
     }
@@ -343,6 +344,7 @@ async fn settle_deleted_command(
 }
 
 async fn execute_command(
+    env: &worker::Env,
     db: &D1Database,
     user_id: &str,
     command: &CommandRow,
@@ -365,7 +367,7 @@ async fn execute_command(
                 .map_err(classify_error)
         }
         "create_draft" | "create_reminder" | "send_message" => {
-            action_effects::execute(db, user_id, command, &args, provider_config)
+            action_effects::execute(env, db, user_id, command, &args, provider_config)
                 .await
                 .map_err(classify_error)
         }

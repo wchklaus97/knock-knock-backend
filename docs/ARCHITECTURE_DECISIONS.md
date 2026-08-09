@@ -50,13 +50,11 @@ The current completion branch adds durable vertical-action effects, the model
 descriptor route, an iOS 15 push-to-talk/VAD controller, system on-device STT,
 a LiteRT-LM 0.12 C-framework Gemma adapter, signed model
 download/verification/rollback management, and a static release preflight.
-The remaining gaps are
-intentionally operational: the official WhisperKit package currently requires
-iOS 16, so it is not linked into the iOS 15 target; the signed Gemma artifact
-and iOS public key must be supplied by the release environment; external
-messaging/reminder providers are not configured; and deployed D1/E2E, golden
-voice, physical-device, security, and human release gates still require
-execution and approval.
+The remaining gaps are intentionally operational: the official WhisperKit
+package currently requires iOS 16, so it is not linked into the iOS 15 target;
+the signed Gemma artifact and iOS public key must be supplied by the release
+environment; and deployed D1/E2E, golden voice, physical-device, security,
+provider rollout, and human release gates still require execution and approval.
 
 ## Current backend follow-up status — 2026-08-10
 
@@ -70,19 +68,31 @@ safety gaps without changing the REST + SSE baseline:
   token to prevent same-timestamp double claims.
 - Reminder and message effects now pass through an explicit provider mode and
   feature flags. Local development may persist D1 effects/queues; external
-  provider mode fails closed until a real adapter is registered. A queued
-  message is never reported as externally sent.
+  mode uses a secret-authenticated HTTPS webhook with the command idempotency
+  key and fails closed when an endpoint is not configured. A queued message is
+  never reported as externally sent.
+- Local reminders have a leaseable due-time scanner, retry state, provider
+  identity, and deduplicated push key. External reminders are excluded from
+  that scanner so a provider-scheduled reminder is not delivered twice.
+- A staging Wrangler template uses a separate D1/Supabase project, explicit
+  origin/version checks, development push inbox, and disabled external effects.
+  The canonical OpenAPI contract now includes the actual `/health` route and
+  CI runs a compatibility baseline that rejects removed v1 operations or
+  required fields.
 - Outbox failures update provider attempt state, include 425 in retry handling,
   cap stale lease retries, and reconcile pre-execution failures. Undo updates
   the command version and audit/change records atomically and is idempotent.
 - Command arguments reject credential-shaped keys, while JWT and APNs signing
   material is read from Wrangler secrets rather than ordinary Worker vars.
 
-The remaining backend work is release evidence and external integration, not a
-new transport: deployed D1/E2E against the release binding, a concrete
-reminder/message provider and reminder due scanner, CI contract-diff/security
-review, production observability/APNs verification, and human approval of
-migration/deployment/secret rollout.
+The remaining backend work is release evidence and deployment configuration,
+not a new transport: create the independent staging D1/Worker, validate the
+chosen provider endpoints in their sandbox and configure their production
+secrets, run remote D1/E2E and GitHub CI, complete the formal security and
+observability reviews, verify APNs on a real device, and obtain human approval
+for migration/deployment/secret rollout. The generic provider adapter, local
+due scanner, contract-breaking gate, retention sweep, and local dynamic
+smokes are implemented and verified in this branch.
 
 ## Decision register
 

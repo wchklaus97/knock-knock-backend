@@ -2,6 +2,20 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The historical checks below intentionally keep their explicit migration
+# list. Inject the newest additive migration immediately before each final
+# SQL assertion so a fresh-D1 smoke cannot silently skip reminder delivery
+# state when another migration is added.
+sqlite3() {
+  local database="$1"
+  shift
+  local last="${!#}"
+  local count=$#
+  local args=("${@:1:$((count - 1))}" ".read ${ROOT_DIR}/migrations/0012_reminder_delivery_state.sql" "$last")
+  command sqlite3 "$database" "${args[@]}"
+}
+
 tables="$(sqlite3 :memory: ".read ${ROOT_DIR}/migrations/0001_initial.sql" ".read ${ROOT_DIR}/migrations/0002_supabase_auth.sql" ".read ${ROOT_DIR}/migrations/0003_architecture_foundation.sql" ".read ${ROOT_DIR}/migrations/0004_command_versions.sql" ".read ${ROOT_DIR}/migrations/0005_phone_change_triggers.sql" ".read ${ROOT_DIR}/migrations/0006_history_and_phone_idempotency.sql" ".read ${ROOT_DIR}/migrations/0007_rate_limits.sql" ".read ${ROOT_DIR}/migrations/0008_history_consistency.sql" ".read ${ROOT_DIR}/migrations/0009_phone_operation_claim_tokens.sql" ".read ${ROOT_DIR}/migrations/0010_vertical_action_effects.sql" ".read ${ROOT_DIR}/migrations/0011_command_pairing_action_descriptors.sql" "SELECT name FROM sqlite_master WHERE type='table';")"
 
 for table in commands confirmation_tokens session_messages retrieval_items phone_changes outbox_events action_attempts sync_tombstones phone_operations rate_limit_buckets reminders drafts outbound_messages; do
@@ -21,6 +35,14 @@ grep -q "|descriptor_json|" <<<"${action_columns}"
 push_columns="$(sqlite3 :memory: ".read ${ROOT_DIR}/migrations/0001_initial.sql" ".read ${ROOT_DIR}/migrations/0002_supabase_auth.sql" ".read ${ROOT_DIR}/migrations/0003_architecture_foundation.sql" ".read ${ROOT_DIR}/migrations/0004_command_versions.sql" ".read ${ROOT_DIR}/migrations/0005_phone_change_triggers.sql" ".read ${ROOT_DIR}/migrations/0006_history_and_phone_idempotency.sql" ".read ${ROOT_DIR}/migrations/0007_rate_limits.sql" ".read ${ROOT_DIR}/migrations/0008_history_consistency.sql" ".read ${ROOT_DIR}/migrations/0009_phone_operation_claim_tokens.sql" ".read ${ROOT_DIR}/migrations/0010_vertical_action_effects.sql" ".read ${ROOT_DIR}/migrations/0011_command_pairing_action_descriptors.sql" "PRAGMA table_info(pushes);")"
 grep -q "|version|" <<<"${push_columns}"
 grep -q "|updated_at|" <<<"${push_columns}"
+grep -q "|dedupe_key|" <<<"${push_columns}"
+
+reminder_columns="$(sqlite3 :memory: ".read ${ROOT_DIR}/migrations/0001_initial.sql" ".read ${ROOT_DIR}/migrations/0002_supabase_auth.sql" ".read ${ROOT_DIR}/migrations/0003_architecture_foundation.sql" ".read ${ROOT_DIR}/migrations/0004_command_versions.sql" ".read ${ROOT_DIR}/migrations/0005_phone_change_triggers.sql" ".read ${ROOT_DIR}/migrations/0006_history_and_phone_idempotency.sql" ".read ${ROOT_DIR}/migrations/0007_rate_limits.sql" ".read ${ROOT_DIR}/migrations/0008_history_consistency.sql" ".read ${ROOT_DIR}/migrations/0009_phone_operation_claim_tokens.sql" ".read ${ROOT_DIR}/migrations/0010_vertical_action_effects.sql" ".read ${ROOT_DIR}/migrations/0011_command_pairing_action_descriptors.sql" "PRAGMA table_info(reminders);")"
+grep -q "|notification_state|" <<<"${reminder_columns}"
+grep -q "|notification_attempts|" <<<"${reminder_columns}"
+grep -q "|notified_at|" <<<"${reminder_columns}"
+grep -q "|provider|" <<<"${reminder_columns}"
+grep -q "|provider_reminder_id|" <<<"${reminder_columns}"
 
 operation_columns="$(sqlite3 :memory: ".read ${ROOT_DIR}/migrations/0001_initial.sql" ".read ${ROOT_DIR}/migrations/0002_supabase_auth.sql" ".read ${ROOT_DIR}/migrations/0003_architecture_foundation.sql" ".read ${ROOT_DIR}/migrations/0004_command_versions.sql" ".read ${ROOT_DIR}/migrations/0005_phone_change_triggers.sql" ".read ${ROOT_DIR}/migrations/0006_history_and_phone_idempotency.sql" ".read ${ROOT_DIR}/migrations/0007_rate_limits.sql" ".read ${ROOT_DIR}/migrations/0008_history_consistency.sql" ".read ${ROOT_DIR}/migrations/0009_phone_operation_claim_tokens.sql" ".read ${ROOT_DIR}/migrations/0010_vertical_action_effects.sql" ".read ${ROOT_DIR}/migrations/0011_command_pairing_action_descriptors.sql" "PRAGMA table_info(phone_operations);")"
 grep -q "|claim_token|" <<<"${operation_columns}"

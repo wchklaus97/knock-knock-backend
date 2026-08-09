@@ -181,7 +181,7 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
         return Err(ApiError::new(
             500,
             "configuration_error",
-            "NODE_ENV must be development, test, or production",
+            "NODE_ENV must be development, test, staging, or production",
         ));
     }
     let auth_provider = config_value(env, "AUTH_PROVIDER", "legacy")
@@ -197,7 +197,40 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
     if auth_provider == "supabase" {
         validate_supabase_configuration(env)?;
     }
-    if node_env != "production" {
+    if matches!(node_env.as_str(), "development" | "test") {
+        return Ok(());
+    }
+
+    if node_env == "staging" {
+        let cors_origin = config_value(env, "CORS_ORIGIN", "");
+        if cors_origin.trim().is_empty()
+            || cors_origin.trim() == "*"
+            || cors_origin.trim().starts_with("REPLACE_")
+        {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "CORS_ORIGIN must be an explicit staging origin",
+            ));
+        }
+        let service_version = config_value(env, "SERVICE_VERSION", "");
+        if service_version.trim().is_empty() || service_version.trim().starts_with("REPLACE_") {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "SERVICE_VERSION must be supplied for staging",
+            ));
+        }
+        let push_mode = config_value(env, "PUSH_MODE", "")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(push_mode.as_str(), "dev" | "apns" | "both") {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "PUSH_MODE must be dev, apns, or both in staging",
+            ));
+        }
         return Ok(());
     }
 

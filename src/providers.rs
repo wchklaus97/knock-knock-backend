@@ -1,6 +1,7 @@
-use worker::Env;
+use serde_json::{json, Value};
+use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 
-use crate::auth::config_value;
+use crate::auth::{config_value, secret_value};
 use crate::error::{ApiError, ApiResult};
 
 /// Selects how a command effect is materialized.
@@ -18,25 +19,54 @@ pub enum ActionProviderMode {
     Disabled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionProviderConfig {
     mode: ActionProviderMode,
     reminder_enabled: bool,
     message_enabled: bool,
+    reminder_url: Option<String>,
+    message_url: Option<String>,
+    reminder_token: Option<String>,
+    message_token: Option<String>,
 }
 
 impl ActionProviderConfig {
-    pub fn mode(self) -> ActionProviderMode {
+    pub fn mode(&self) -> ActionProviderMode {
         self.mode
     }
 
-    pub fn enabled(self, intent: &str) -> bool {
+    pub fn enabled(&self, intent: &str) -> bool {
         match intent {
             "create_reminder" => self.reminder_enabled,
             "send_message" => self.message_enabled,
             "create_draft" => true,
             _ => false,
         }
+    }
+
+    pub fn endpoint(&self, intent: &str) -> Option<&str> {
+        match intent {
+            "create_reminder" => self.reminder_url.as_deref(),
+            "send_message" => self.message_url.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn token(&self, intent: &str) -> Option<&str> {
+        match intent {
+            "create_reminder" => self.reminder_token.as_deref(),
+            "send_message" => self.message_token.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn ready(&self) -> bool {
+        if self.mode != ActionProviderMode::External {
+            return self.mode == ActionProviderMode::Internal;
+        }
+        ["create_reminder", "send_message"]
+            .into_iter()
+            .all(|intent| self.endpoint(intent).is_some() && self.token(intent).is_some())
     }
 }
 
@@ -82,11 +112,78 @@ pub fn load(env: &Env) -> ApiResult<ActionProviderConfig> {
     } else {
         "true"
     };
+    let reminder_enabled = bool_value(env, "ACTION_REMINDER_ENABLED", enabled_default)?;
+    let message_enabled = bool_value(env, "ACTION_MESSAGE_ENABLED", enabled_default)?;
+    let reminder_url = optional_endpoint(env, "ACTION_REMINDER_URL", &node_env)?;
+    let message_url = optional_endpoint(env, "ACTION_MESSAGE_URL", &node_env)?;
+    let reminder_token = secret_value(env, "ACTION_REMINDER_TOKEN");
+    let message_token = secret_value(env, "ACTION_MESSAGE_TOKEN");
+
+    if mode == ActionProviderMode::External {
+        validate_external_action(
+            "create_reminder",
+            reminder_enabled,
+            reminder_url.as_deref(),
+            reminder_token.as_deref(),
+        )?;
+        validate_external_action(
+            "send_message",
+            message_enabled,
+            message_url.as_deref(),
+            message_token.as_deref(),
+        )?;
+    }
+
     Ok(ActionProviderConfig {
         mode,
-        reminder_enabled: bool_value(env, "ACTION_REMINDER_ENABLED", enabled_default)?,
-        message_enabled: bool_value(env, "ACTION_MESSAGE_ENABLED", enabled_default)?,
+        reminder_enabled,
+        message_enabled,
+        reminder_url,
+        message_url,
+        reminder_token,
+        message_token,
     })
+}
+
+fn optional_endpoint(env: &Env, name: &str, node_env: &str) -> ApiResult<Option<String>> {
+    let raw = config_value(env, name, "");
+    let value = raw.trim();
+    if value.is_empty() || value.starts_with("REPLACE_") {
+        return Ok(None);
+    }
+    let allowed_local = matches!(node_env, "development" | "test")
+        && (value.starts_with("http://127.0.0.1:")
+            || value.starts_with("http://localhost:")
+            || value.starts_with("http://[::1]:"));
+    if !value.starts_with("https://") && !allowed_local {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            format!("{name} must be an HTTPS URL (localhost is allowed only for local tests)"),
+        ));
+    }
+    Ok(Some(value.trim_end_matches('/').to_string()))
+}
+
+fn validate_external_action(
+    intent: &str,
+    enabled: bool,
+    endpoint: Option<&str>,
+    token: Option<&str>,
+) -> ApiResult<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if endpoint.is_none() || token.is_none_or(|value| value.trim().is_empty()) {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            format!(
+                "External {intent} requires its endpoint and secret token before it can be enabled"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn bool_value(env: &Env, name: &str, default: &str) -> ApiResult<bool> {
@@ -133,10 +230,84 @@ pub fn disabled(intent: &str) -> ApiError {
     )
 }
 
-pub fn ready(mode: ActionProviderMode) -> bool {
-    // The internal D1 effect is intentionally not represented as external
-    // delivery. A concrete external adapter must make this return true.
-    matches!(mode, ActionProviderMode::Internal)
+pub fn ready(config: &ActionProviderConfig) -> bool {
+    config.ready()
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderResponse {
+    pub provider_id: Option<String>,
+}
+
+/// Send a minimal, idempotent provider request. The provider is deliberately
+/// an HTTPS webhook boundary rather than a vendor SDK: the backend owns the
+/// command/idempotency contract while a deployment can select a reminder or
+/// messaging service independently. The bearer token is read only from the
+/// Wrangler secret store and never included in errors or response bodies.
+pub async fn send(
+    _env: &Env,
+    config: &ActionProviderConfig,
+    intent: &str,
+    idempotency_key: &str,
+    payload: Value,
+) -> ApiResult<ProviderResponse> {
+    if config.mode != ActionProviderMode::External {
+        return Err(unavailable(config.mode, intent));
+    }
+    let endpoint = config
+        .endpoint(intent)
+        .ok_or_else(|| unavailable(config.mode, intent))?;
+    let token = config
+        .token(intent)
+        .ok_or_else(|| unavailable(config.mode, intent))?;
+    let headers = Headers::new();
+    headers.set("accept", "application/json")?;
+    headers.set("content-type", "application/json")?;
+    headers.set("authorization", &format!("Bearer {token}"))?;
+    headers.set("x-idempotency-key", idempotency_key)?;
+    headers.set("x-knock-knock-intent", intent)?;
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post).with_headers(headers);
+    init.with_body(Some(worker::wasm_bindgen::JsValue::from_str(
+        &payload.to_string(),
+    )));
+    let request = Request::new_with_init(endpoint, &init).map_err(|_| {
+        ApiError::new(
+            503,
+            "provider_network_error",
+            "Provider request could not be created",
+        )
+    })?;
+    let mut response = Fetch::Request(request)
+        .send()
+        .await
+        .map_err(|_| ApiError::new(503, "provider_network_error", "Provider request failed"))?;
+    let status = response.status_code();
+    let raw = response.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        let mapped_status = if status == 429 {
+            429
+        } else if status == 408 || status == 425 || status >= 500 {
+            503
+        } else {
+            424
+        };
+        return Err(ApiError::new(
+            mapped_status,
+            "provider_rejected",
+            "The configured provider rejected the action",
+        ));
+    }
+    let body = if raw.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}))
+    };
+    let provider_id = ["provider_id", "id", "message_id", "reminder_id"]
+        .into_iter()
+        .find_map(|key| body.get(key).and_then(Value::as_str).map(str::to_string));
+    Ok(ProviderResponse { provider_id })
 }
 
 #[cfg(test)]
@@ -162,9 +333,36 @@ mod tests {
 
     #[test]
     fn external_provider_is_not_reported_ready() {
-        assert!(ready(ActionProviderMode::Internal));
-        assert!(!ready(ActionProviderMode::External));
-        assert!(!ready(ActionProviderMode::Disabled));
+        let internal = ActionProviderConfig {
+            mode: ActionProviderMode::Internal,
+            reminder_enabled: true,
+            message_enabled: true,
+            reminder_url: None,
+            message_url: None,
+            reminder_token: None,
+            message_token: None,
+        };
+        let external = ActionProviderConfig {
+            mode: ActionProviderMode::External,
+            reminder_enabled: true,
+            message_enabled: true,
+            reminder_url: None,
+            message_url: None,
+            reminder_token: None,
+            message_token: None,
+        };
+        let disabled = ActionProviderConfig {
+            mode: ActionProviderMode::Disabled,
+            reminder_enabled: true,
+            message_enabled: true,
+            reminder_url: None,
+            message_url: None,
+            reminder_token: None,
+            message_token: None,
+        };
+        assert!(ready(&internal));
+        assert!(!ready(&external));
+        assert!(!ready(&disabled));
     }
 
     #[test]
@@ -172,5 +370,21 @@ mod tests {
         let error = disabled("send_message");
         assert_eq!(error.status, 409);
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn external_action_requires_endpoint_and_secret() {
+        assert!(validate_external_action("send_message", false, None, None).is_ok());
+        assert!(validate_external_action("send_message", true, None, Some("token")).is_err());
+        assert!(
+            validate_external_action("send_message", true, Some("https://provider"), None).is_err()
+        );
+        assert!(validate_external_action(
+            "send_message",
+            true,
+            Some("https://provider"),
+            Some("token")
+        )
+        .is_ok());
     }
 }
