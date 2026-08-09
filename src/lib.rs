@@ -879,6 +879,13 @@ fn phone_change_value(row: &models::PhoneChangeRow) -> Value {
 
 fn sync_cursor(request: &Request) -> ApiResult<Option<i64>> {
     let raw = query_value(request, "after")?;
+    // Clients from the checkpoint release persisted the old composite cursor
+    // (`timestamp|session_id`). Treat it as a replay-from-zero marker during
+    // the compatibility window. The response always returns the canonical
+    // numeric cursor, so the client converges after one successful sync.
+    if raw.as_deref().is_some_and(|value| value.contains('|')) {
+        return Ok(Some(0));
+    }
     crate::realtime::parse_cursor(raw.as_deref())
         .map_err(|error| ApiError::validation(error.to_string()))
 }
@@ -929,6 +936,12 @@ struct SessionStreamState {
 fn parse_event_cursor(request: &Request) -> ApiResult<Option<i64>> {
     let header_cursor = request.headers().get("last-event-id")?;
     let raw = query_value(request, "since")?.or(header_cursor);
+    // The checkpoint client used a composite SSE id. It cannot be mapped to
+    // the phone_changes sequence, so request the initial invalidation and let
+    // REST reconciliation establish the canonical cursor.
+    if raw.as_deref().is_some_and(|value| value.contains('|')) {
+        return Ok(None);
+    }
     crate::realtime::parse_cursor(raw.as_deref())
         .map_err(|error| ApiError::validation(error.to_string()))
 }
