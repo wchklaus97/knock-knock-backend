@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use worker::{D1Database, Env, Request};
+use worker::{D1Database, Env, Fetch, Headers, Method, Request, RequestInit};
 
 use crate::db;
 use crate::error::{ApiError, ApiResult};
@@ -28,6 +28,27 @@ struct JwtHeader {
 struct IdRow {
     #[serde(rename = "id")]
     _id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupabaseUser {
+    pub id: String,
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupabaseSession {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<i64>,
+    pub user: Option<SupabaseUser>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UserIdentityRow {
+    id: String,
+    email: String,
+    supabase_user_id: Option<String>,
 }
 
 pub fn sha256_hex(value: &str) -> String {
@@ -102,6 +123,45 @@ pub fn config_value(env: &Env, name: &str, default: &str) -> String {
     env_value(env, name).unwrap_or_else(|| default.to_string())
 }
 
+pub fn supabase_auth_enabled(env: &Env) -> bool {
+    config_value(env, "AUTH_PROVIDER", "legacy")
+        .trim()
+        .eq_ignore_ascii_case("supabase")
+}
+
+fn supabase_url(env: &Env) -> ApiResult<String> {
+    let value = config_value(env, "SUPABASE_URL", "");
+    let value = value.trim().trim_end_matches('/').to_string();
+    if value.is_empty() || !value.starts_with("https://") {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "SUPABASE_URL must be an HTTPS URL",
+        ));
+    }
+    Ok(value)
+}
+
+fn supabase_api_key(env: &Env) -> ApiResult<String> {
+    let value = env_value(env, "SUPABASE_PUBLISHABLE_KEY")
+        .or_else(|| env_value(env, "SUPABASE_ANON_KEY"))
+        .unwrap_or_default();
+    if value.trim().is_empty() {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "SUPABASE_PUBLISHABLE_KEY must be configured",
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_supabase_configuration(env: &Env) -> ApiResult<()> {
+    let _ = supabase_url(env)?;
+    let _ = supabase_api_key(env)?;
+    Ok(())
+}
+
 /// Validate settings that are unsafe to infer in a production Worker.
 ///
 /// Local development deliberately uses permissive defaults. Production must
@@ -117,6 +177,19 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
             "configuration_error",
             "NODE_ENV must be development, test, or production",
         ));
+    }
+    let auth_provider = config_value(env, "AUTH_PROVIDER", "legacy")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(auth_provider.as_str(), "legacy" | "supabase") {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "AUTH_PROVIDER must be legacy or supabase",
+        ));
+    }
+    if auth_provider == "supabase" {
+        validate_supabase_configuration(env)?;
     }
     if node_env != "production" {
         return Ok(());
@@ -184,6 +257,281 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
     }
 
     Ok(())
+}
+
+fn supabase_error_message(raw: &str) -> String {
+    let value = serde_json::from_str::<Value>(raw).unwrap_or(Value::Null);
+    for key in ["message", "msg", "error_description", "error"] {
+        if let Some(message) = value.get(key).and_then(Value::as_str) {
+            if !message.trim().is_empty() {
+                return message.to_string();
+            }
+        }
+    }
+    if raw.trim().is_empty() {
+        "Supabase Auth request failed".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+async fn supabase_request(
+    env: &Env,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+    bearer_token: Option<&str>,
+) -> ApiResult<Value> {
+    let url = format!("{}{path}", supabase_url(env)?);
+    let headers = Headers::new();
+    headers.set("apikey", &supabase_api_key(env)?)?;
+    headers.set("accept", "application/json")?;
+    if body.is_some() {
+        headers.set("content-type", "application/json")?;
+    }
+    if let Some(token) = bearer_token {
+        headers.set("authorization", &format!("Bearer {token}"))?;
+    }
+
+    let mut init = RequestInit::new();
+    init.with_method(method).with_headers(headers);
+    if let Some(body) = body {
+        init.with_body(Some(worker::wasm_bindgen::JsValue::from_str(
+            &body.to_string(),
+        )));
+    }
+    let request = Request::new_with_init(&url, &init)?;
+    let mut response = Fetch::Request(request).send().await?;
+    let status = response.status_code();
+    let raw = response.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        let mapped_status = match status {
+            400 | 422 => 400,
+            401 | 403 => 401,
+            409 => 409,
+            status if status >= 500 => 502,
+            status => status,
+        };
+        return Err(ApiError::new(
+            mapped_status,
+            "supabase_auth_error",
+            supabase_error_message(&raw),
+        ));
+    }
+    if raw.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&raw).map_err(|error| {
+        ApiError::new(
+            502,
+            "supabase_auth_error",
+            format!("Supabase returned invalid JSON: {error}"),
+        )
+    })
+}
+
+fn parse_supabase_session(value: Value) -> ApiResult<SupabaseSession> {
+    serde_json::from_value(value).map_err(|error| {
+        ApiError::new(
+            502,
+            "supabase_auth_error",
+            format!("Supabase returned an invalid session: {error}"),
+        )
+    })
+}
+
+pub async fn supabase_sign_up(
+    env: &Env,
+    email: &str,
+    password: &str,
+) -> ApiResult<SupabaseSession> {
+    parse_supabase_session(
+        supabase_request(
+            env,
+            Method::Post,
+            "/auth/v1/signup",
+            Some(json!({ "email": email, "password": password })),
+            None,
+        )
+        .await?,
+    )
+}
+
+pub async fn supabase_sign_in(
+    env: &Env,
+    email: &str,
+    password: &str,
+) -> ApiResult<SupabaseSession> {
+    parse_supabase_session(
+        supabase_request(
+            env,
+            Method::Post,
+            "/auth/v1/token?grant_type=password",
+            Some(json!({ "email": email, "password": password })),
+            None,
+        )
+        .await?,
+    )
+}
+
+pub async fn supabase_refresh(env: &Env, refresh_token: &str) -> ApiResult<SupabaseSession> {
+    parse_supabase_session(
+        supabase_request(
+            env,
+            Method::Post,
+            "/auth/v1/token?grant_type=refresh_token",
+            Some(json!({ "refresh_token": refresh_token })),
+            None,
+        )
+        .await?,
+    )
+}
+
+pub async fn supabase_get_user(env: &Env, access_token: &str) -> ApiResult<SupabaseUser> {
+    serde_json::from_value(
+        supabase_request(env, Method::Get, "/auth/v1/user", None, Some(access_token)).await?,
+    )
+    .map_err(|error| {
+        ApiError::new(
+            502,
+            "supabase_auth_error",
+            format!("Supabase returned an invalid user: {error}"),
+        )
+    })
+}
+
+pub async fn supabase_logout(env: &Env, access_token: &str) -> ApiResult<()> {
+    let _ = supabase_request(
+        env,
+        Method::Post,
+        "/auth/v1/logout",
+        None,
+        Some(access_token),
+    )
+    .await?;
+    Ok(())
+}
+
+pub fn supabase_auth_response(user_id: &str, session: &SupabaseSession) -> ApiResult<Value> {
+    let token = session
+        .access_token
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                409,
+                "email_confirmation_required",
+                "Please confirm your email before signing in",
+            )
+        })?;
+    let refresh_token = session
+        .refresh_token
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                502,
+                "supabase_auth_error",
+                "Supabase did not return a refresh token",
+            )
+        })?;
+    Ok(json!({
+        "user_id": user_id,
+        "token": token,
+        "refresh_token": refresh_token,
+        "expires_in": session.expires_in.unwrap_or(3600),
+    }))
+}
+
+pub async fn ensure_supabase_user(
+    db: &D1Database,
+    supabase_user_id: &str,
+    email: &str,
+) -> ApiResult<UserPrincipal> {
+    let by_external_id: Option<UserIdentityRow> = db::first(
+        db,
+        "SELECT id, email, supabase_user_id FROM users WHERE supabase_user_id = ?",
+        vec![db::text(supabase_user_id)],
+    )
+    .await?;
+    if let Some(row) = by_external_id {
+        if row.email != email {
+            db::run(
+                db,
+                "UPDATE users SET email = ? WHERE id = ?",
+                vec![db::text(email), db::text(&row.id)],
+            )
+            .await?;
+        }
+        return Ok(UserPrincipal { user_id: row.id });
+    }
+
+    let by_email: Option<UserIdentityRow> = db::first(
+        db,
+        "SELECT id, email, supabase_user_id FROM users WHERE email = ?",
+        vec![db::text(email)],
+    )
+    .await?;
+    if let Some(row) = by_email {
+        if row
+            .supabase_user_id
+            .as_deref()
+            .is_some_and(|value| value != supabase_user_id)
+        {
+            return Err(ApiError::conflict(
+                "Email is already linked to another user",
+            ));
+        }
+        db::run(
+            db,
+            "UPDATE users SET supabase_user_id = ? WHERE id = ?",
+            vec![db::text(supabase_user_id), db::text(&row.id)],
+        )
+        .await?;
+        return Ok(UserPrincipal { user_id: row.id });
+    }
+
+    let user_id = new_id("usr")?;
+    db::run(
+        db,
+        "INSERT INTO users (id, email, password_hash, supabase_user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        vec![
+            db::text(&user_id),
+            db::text(email),
+            db::text("supabase-managed"),
+            db::text(supabase_user_id),
+            db::text(&db::now_iso()),
+        ],
+    )
+    .await?;
+    Ok(UserPrincipal { user_id })
+}
+
+pub fn bearer_token(request: &Request) -> ApiResult<Option<String>> {
+    let value = authorization_header(request)?;
+    Ok(value.and_then(|value| {
+        value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }))
+}
+
+async fn resolve_supabase_user(
+    request: &Request,
+    env: &Env,
+    db: &D1Database,
+) -> ApiResult<UserPrincipal> {
+    let token =
+        bearer_token(request)?.ok_or_else(|| ApiError::unauthorized("Missing Bearer token"))?;
+    let remote = supabase_get_user(env, &token).await?;
+    let email = remote
+        .email
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::unauthorized("Supabase user email is missing"))?;
+    ensure_supabase_user(db, &remote.id, &email).await
 }
 
 pub fn jwt_secret(env: &Env) -> ApiResult<String> {
@@ -295,6 +643,9 @@ pub async fn require_user(
     env: &Env,
     db: &D1Database,
 ) -> ApiResult<UserPrincipal> {
+    if supabase_auth_enabled(env) {
+        return resolve_supabase_user(request, env, db).await;
+    }
     let value = authorization_header(request)?
         .ok_or_else(|| ApiError::unauthorized("Missing Bearer token"))?;
     let token = value
@@ -337,7 +688,13 @@ pub async fn require_user_or_agent(
     env: &Env,
     db: &D1Database,
 ) -> ApiResult<(Option<UserPrincipal>, Option<AgentPrincipal>)> {
-    if let Some(value) = authorization_header(request)? {
+    if supabase_auth_enabled(env) {
+        if bearer_token(request)?.is_some() {
+            if let Ok(user) = resolve_supabase_user(request, env, db).await {
+                return Ok((Some(user), None));
+            }
+        }
+    } else if let Some(value) = authorization_header(request)? {
         if let Some(token) = value
             .strip_prefix("Bearer ")
             .or_else(|| value.strip_prefix("bearer "))

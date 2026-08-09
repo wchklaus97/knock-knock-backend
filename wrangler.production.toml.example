@@ -11,6 +11,8 @@ command = "worker-build --release"
 
 [vars]
 NODE_ENV = "production"
+AUTH_PROVIDER = "supabase"
+SUPABASE_URL = "REPLACE_WITH_SUPABASE_PROJECT_URL"
 PUSH_MODE = "both"
 CORS_ORIGIN = "REPLACE_WITH_ALLOWED_ORIGIN"
 SERVICE_VERSION = "REPLACE_WITH_RELEASE_VERSION"
@@ -29,6 +31,7 @@ migrations_dir = "migrations"
 
 # Secrets must be added separately:
 # wrangler secret put JWT_SECRET --config wrangler.production.toml
+# wrangler secret put SUPABASE_PUBLISHABLE_KEY --config wrangler.production.toml
 # wrangler secret put APNS_KEY --config wrangler.production.toml
 # wrangler secret put APNS_KEY_ID --config wrangler.production.toml
 # wrangler secret put APNS_TEAM_ID --config wrangler.production.toml
