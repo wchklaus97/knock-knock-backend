@@ -21,11 +21,12 @@ future change to an accepted decision requires an ADR update, a compatibility
 note, tests, and a human-approved PR. It must not be silently changed inside a
 feature PR.
 
-## Current implementation gap
+## Baseline implementation gap
 
-The checkpoint branches already contain authenticated Rust Worker APIs, D1
+This is the gap analysis captured before the staged implementation began. The
+checkpoint branches already contained authenticated Rust Worker APIs, D1
 sessions/actions/audit/push records, foreground iOS SSE, REST reconciliation,
-APNs integration, and a retry queue. The important gaps are:
+APNs integration, and a retry queue. The important gaps were:
 
 - iOS pending operations are still persisted in `UserDefaults`, not the iOS 15
   compatible SQLite store.
@@ -37,6 +38,11 @@ APNs integration, and a retry queue. The important gaps are:
   state are not yet one atomic unit.
 - The current `/reply` and `/confirm` routes predate the canonical command
   envelope and remain compatibility adapters during migration.
+
+The current implementation status and remaining release gates are tracked in
+`IMPLEMENTATION_ROADMAP.md`. The baseline gaps above remain useful because
+they explain why each migration and compatibility adapter exists; they are not
+permission to silently change an accepted decision inside a feature PR.
 
 ## Decision register
 
@@ -114,4 +120,3 @@ Every implementation PR must link the affected decision IDs, contract diff,
 tests, migration number, compatibility behavior, and rollback path. A change
 to D01–D40 needs a new ADR section or an explicit superseding decision; it may
 not silently edit the decision register.
-

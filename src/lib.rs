@@ -10,6 +10,7 @@ mod outbox;
 mod pagination;
 mod phone_operations;
 mod push;
+mod rate_limits;
 mod realtime;
 mod sessions;
 mod skills;
@@ -31,7 +32,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::models::{
     ActionResultRequest, AuthCredentials, CommandEnvelope, CreateAgentRequest, DeviceRequest,
     EventRequest, PairingClaimRequest, PairingCodeRequest, PhoneConfirmRequest, PhoneReplyRequest,
-    PhoneSessionUpdateRequest, ProgressRequest, RefreshRequest, SessionRequest, SkillDef,
+    PhoneSessionUpdateRequest, ProgressRequest, RefreshRequest, SessionRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -57,11 +58,22 @@ struct ConfirmationRequest {
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let origin = req.headers().get("origin").ok().flatten();
+    let request_id = request_id();
     let result = dispatch(req, env.clone()).await;
-    let response = match result {
+    let mut response = match result {
         Ok(response) => response,
-        Err(error) => error.response()?,
+        Err(error) => {
+            let retry_after = error.retry_after;
+            let mut response = error.with_request_id(&request_id).response()?;
+            if let Some(retry_after) = retry_after {
+                response
+                    .headers_mut()
+                    .set("Retry-After", &retry_after.to_string())?;
+            }
+            response
+        }
     };
+    response.headers_mut().set("X-Request-ID", &request_id)?;
     add_common_headers(response, &env, origin)
 }
 
@@ -107,6 +119,8 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
 
     let db = env.d1("DB")?;
     let segments = path_segments(&path);
+    let identity = rate_limit_identity(&req)?;
+    rate_limits::enforce(&db, &path, &identity).await?;
 
     match (method, segments.as_slice()) {
         (Method::Post, ["v1", "auth", "register"]) => auth_register(&mut req, &env, &db).await,
@@ -206,6 +220,35 @@ fn path_segments(path: &str) -> Vec<&str> {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect()
+}
+
+fn request_id() -> String {
+    let timestamp = worker::Date::now().as_millis();
+    let mut entropy = [0_u8; 8];
+    if getrandom::fill(&mut entropy).is_err() {
+        return format!("req_{timestamp:x}");
+    }
+    let suffix = entropy
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("req_{timestamp:x}_{suffix}")
+}
+
+fn rate_limit_identity(request: &Request) -> ApiResult<String> {
+    if let Some(value) = request.headers().get("cf-connecting-ip")? {
+        if !value.trim().is_empty() {
+            return Ok(format!("edge:{}", value.trim()));
+        }
+    }
+    if let Some(value) = request.headers().get("x-forwarded-for")? {
+        if let Some(first) = value.split(',').next().map(str::trim) {
+            if !first.is_empty() {
+                return Ok(format!("edge:{first}"));
+            }
+        }
+    }
+    Ok("edge:anonymous".into())
 }
 
 async fn read_json<T: DeserializeOwned>(request: &mut Request) -> ApiResult<T> {
@@ -756,15 +799,15 @@ async fn list_skills(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Res
 }
 
 async fn upsert_skill(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
-    let _ = require_user(req, env, db).await?;
-    let body: SkillDef = read_json(req).await?;
-    if body.skill_id.trim().is_empty() || body.template.trim().is_empty() {
-        return Err(ApiError::validation("skill_id and template are required"));
-    }
-    json_response(
-        json!({ "skill": skills::upsert_skill(db, &body).await? }),
-        201,
-    )
+    // The registry is global and determines action permissions/risk. Until an
+    // explicit admin-scoped registry exists, authenticated users and agents
+    // may read it but must not overwrite another tenant's policy.
+    let _ = require_user_or_agent(req, env, db).await?;
+    Err(ApiError::new(
+        403,
+        "skill_registry_read_only",
+        "The skill registry is managed by the backend release process",
+    ))
 }
 
 async fn create_session(req: &mut Request, _env: &Env, db: &D1Database) -> ApiResult<Response> {
@@ -784,6 +827,7 @@ async fn get_session(
 ) -> ApiResult<Response> {
     let row = sessions::get_session(db, session_id)
         .await?
+        .filter(|row| row.deleted_at.is_none())
         .ok_or_else(|| ApiError::not_found("Session not found"))?;
     if req.headers().get("x-agent-key")?.is_some() {
         let agent = require_agent(req, db).await?;
@@ -809,6 +853,7 @@ async fn update_session_progress(
     let row = sessions::get_session(db, session_id)
         .await?
         .filter(|row| row.agent_id == agent.agent_id)
+        .filter(|row| row.deleted_at.is_none())
         .ok_or_else(|| ApiError::not_found("Session not found"))?;
     let body: ProgressRequest = read_json(req).await?;
     json_response(sessions::update_progress(db, &row, &body).await?, 200)
@@ -824,6 +869,7 @@ async fn report_session_event(
     let row = sessions::get_session(db, session_id)
         .await?
         .filter(|row| row.agent_id == agent.agent_id)
+        .filter(|row| row.deleted_at.is_none())
         .ok_or_else(|| ApiError::not_found("Session not found"))?;
     let body: EventRequest = read_json(req).await?;
     json_response(sessions::report_event(db, env, &row, &body).await?, 200)
@@ -848,6 +894,7 @@ async fn list_session_pending(
     let row = sessions::get_session(db, session_id)
         .await?
         .filter(|row| row.agent_id == agent.agent_id)
+        .filter(|row| row.deleted_at.is_none())
         .ok_or_else(|| ApiError::not_found("Session not found"))?;
     json_response(
         json!({
@@ -1382,7 +1429,7 @@ async fn phone_reply(
         })
         .to_string(),
     );
-    if let Some(replayed) = phone_operations::begin(
+    let operation = phone_operations::begin(
         db,
         &user.user_id,
         "reply",
@@ -1391,8 +1438,8 @@ async fn phone_reply(
         session_id,
         None,
     )
-    .await?
-    {
+    .await?;
+    if let Some(replayed) = operation.replay {
         return json_response(replayed, 200);
     }
     let result = sessions::phone_reply(
@@ -1412,13 +1459,21 @@ async fn phone_reply(
                 idempotency_key,
                 &request_hash,
                 session_id,
+                operation.claim_token.as_deref(),
                 &value,
             )
             .await?;
             json_response(value, 200)
         }
         Err(error) => {
-            phone_operations::release(db, &user.user_id, "reply", idempotency_key).await;
+            phone_operations::release(
+                db,
+                &user.user_id,
+                "reply",
+                idempotency_key,
+                operation.claim_token.as_deref(),
+            )
+            .await;
             Err(error)
         }
     }
@@ -1444,7 +1499,7 @@ async fn phone_confirm(
         })
         .to_string(),
     );
-    if let Some(replayed) = phone_operations::begin(
+    let operation = phone_operations::begin(
         db,
         &user.user_id,
         "confirm",
@@ -1453,8 +1508,8 @@ async fn phone_confirm(
         session_id,
         Some(body.action_id.trim()),
     )
-    .await?
-    {
+    .await?;
+    if let Some(replayed) = operation.replay {
         return json_response(replayed, 200);
     }
     let result = sessions::phone_confirm(
@@ -1474,13 +1529,21 @@ async fn phone_confirm(
                 idempotency_key,
                 &request_hash,
                 session_id,
+                operation.claim_token.as_deref(),
                 &value,
             )
             .await?;
             json_response(value, 200)
         }
         Err(error) => {
-            phone_operations::release(db, &user.user_id, "confirm", idempotency_key).await;
+            phone_operations::release(
+                db,
+                &user.user_id,
+                "confirm",
+                idempotency_key,
+                operation.claim_token.as_deref(),
+            )
+            .await;
             Err(error)
         }
     }
@@ -1575,11 +1638,12 @@ fn add_common_headers(
     }
     response.headers_mut().set(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Agent-Key",
+        "Authorization, Content-Type, X-Agent-Key, X-Device-ID, X-Request-ID",
     )?;
-    response
-        .headers_mut()
-        .set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")?;
+    response.headers_mut().set(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PATCH, DELETE, OPTIONS",
+    )?;
     response
         .headers_mut()
         .set("Access-Control-Max-Age", "86400")?;
