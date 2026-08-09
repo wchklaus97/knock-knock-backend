@@ -413,6 +413,7 @@ pub async fn report_event(
         )?);
     }
     let action_keys: Vec<String> = resolved.iter().map(|action| action.id.clone()).collect();
+    let message_id = new_id("msg")?;
     for action in &resolved {
         let ttl = if action_needs_confirm(action) {
             skill.ttl.destructive_sec
@@ -451,6 +452,27 @@ pub async fn report_event(
                 db::text(&serde_json::to_string(&action_keys)?)
             },
             db::text(&now),
+            db::text(&current.id),
+        ],
+    )?);
+    statements.push(db::prepare(
+        db,
+        "INSERT INTO session_messages (id, user_id, session_id, role, content, metadata_json, command_id, sequence, retention_expires_at, created_at) SELECT ?, ?, ?, 'agent', ?, ?, NULL, COALESCE(MAX(sequence) + 1, 1), NULL, ? FROM session_messages WHERE user_id = ? AND session_id = ?",
+        vec![
+            db::text(&message_id),
+            db::text(&current.user_id),
+            db::text(&current.id),
+            db::text(&summary),
+            db::text(
+                &serde_json::json!({
+                    "event_id": event_id.clone(),
+                    "status": input.status.clone(),
+                    "actions": action_keys.clone(),
+                })
+                .to_string(),
+            ),
+            db::text(&now),
+            db::text(&current.user_id),
             db::text(&current.id),
         ],
     )?);
@@ -614,7 +636,7 @@ async fn active_actions(db: &D1Database, session_id: &str) -> ApiResult<Vec<Acti
     .await
 }
 
-async fn reconcile_waiting_session(db: &D1Database, row: SessionRow) -> ApiResult<SessionRow> {
+pub async fn reconcile_waiting_session(db: &D1Database, row: SessionRow) -> ApiResult<SessionRow> {
     expire_session_if_needed(db, &row).await?;
     let current = get_session(db, &row.id).await?.unwrap_or(row);
     if !["needs_user", "awaiting_confirm"].contains(&current.state.as_str()) {
@@ -664,6 +686,7 @@ async fn reconcile_waiting_session(db: &D1Database, row: SessionRow) -> ApiResul
     Ok(current)
 }
 
+#[allow(dead_code)]
 pub async fn list_phone_sessions(
     db: &D1Database,
     user_id: &str,
@@ -687,6 +710,7 @@ pub async fn phone_reply(
     user_id: &str,
     session_id: &str,
     action_key: &str,
+    utterance: Option<&str>,
 ) -> ApiResult<Value> {
     let session = get_session(db, session_id)
         .await?
@@ -740,6 +764,7 @@ pub async fn phone_reply(
     } else {
         "queued"
     };
+    let message_id = new_id("msg")?;
     let mut statements = vec![db::prepare(
         db,
         "UPDATE actions SET status = ?, updated_at = ? WHERE id = ? AND status = 'offered' AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND state IN ('needs_user', 'awaiting_confirm'))",
@@ -764,6 +789,27 @@ pub async fn phone_reply(
             db::text(next_session_state),
             db::number(if needs_confirm { 1 } else { 0 }),
             db::text(&now),
+            db::text(&current.id),
+        ],
+    )?);
+    statements.push(db::prepare(
+        db,
+        "INSERT INTO session_messages (id, user_id, session_id, role, content, metadata_json, command_id, sequence, retention_expires_at, created_at) SELECT ?, ?, ?, 'user', ?, ?, NULL, COALESCE(MAX(sequence) + 1, 1), NULL, ? FROM session_messages WHERE user_id = ? AND session_id = ?",
+        vec![
+            db::text(&message_id),
+            db::text(user_id),
+            db::text(&current.id),
+            db::text(utterance.unwrap_or(action_key)),
+            db::text(
+                &serde_json::json!({
+                    "action_id": fresh.id.clone(),
+                    "action_key": action_key,
+                    "needs_confirm": needs_confirm,
+                })
+                .to_string(),
+            ),
+            db::text(&now),
+            db::text(user_id),
             db::text(&current.id),
         ],
     )?);
@@ -881,6 +927,7 @@ pub async fn phone_confirm(
         "output": Value::Null,
     });
     let now = db::now_iso();
+    let message_id = new_id("msg")?;
     let mut statements = vec![db::prepare(
         db,
         "UPDATE actions SET status = ?, result_json = CASE WHEN ? = 1 THEN ? ELSE result_json END, updated_at = ? WHERE id = ? AND status IN ('pending_confirm', 'awaiting_confirm') AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND state = 'awaiting_confirm')",
@@ -923,6 +970,27 @@ pub async fn phone_confirm(
             db::optional_text(available_actions.as_deref()),
             db::optional_text(message),
             db::text(&now),
+            db::text(&current.id),
+        ],
+    )?);
+    statements.push(db::prepare(
+        db,
+        "INSERT INTO session_messages (id, user_id, session_id, role, content, metadata_json, command_id, sequence, retention_expires_at, created_at) SELECT ?, ?, ?, 'user', ?, ?, NULL, COALESCE(MAX(sequence) + 1, 1), NULL, ? FROM session_messages WHERE user_id = ? AND session_id = ?",
+        vec![
+            db::text(&message_id),
+            db::text(user_id),
+            db::text(&current.id),
+            db::text(if confirm { "confirm" } else { "cancel" }),
+            db::text(
+                &serde_json::json!({
+                    "action_id": fresh.id.clone(),
+                    "action_key": fresh.action_key.clone(),
+                    "confirm": confirm,
+                })
+                .to_string(),
+            ),
+            db::text(&now),
+            db::text(user_id),
             db::text(&current.id),
         ],
     )?);

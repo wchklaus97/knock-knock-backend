@@ -314,6 +314,8 @@ pub struct PushRow {
     pub body: String,
     pub voice_script: Option<String>,
     pub created_at: String,
+    pub read_at: Option<String>,
+    pub dismissed_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -417,10 +419,18 @@ pub struct DeviceRequest {
 pub struct PhoneReplyRequest {
     pub action_key: String,
     pub utterance: Option<String>,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PhoneConfirmRequest {
     pub action_id: String,
     pub confirm: bool,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PhoneSessionUpdateRequest {
+    pub title: Option<String>,
+    pub archived: Option<bool>,
 }
