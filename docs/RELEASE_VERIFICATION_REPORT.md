@@ -10,7 +10,7 @@ and Phase 0–3 integration baseline
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
 | Backend base | `agent/phase45-completion-backend` | `2977322` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | `61941c6` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
+| Backend follow-up | `agent/phase45-completion-backend` | `2dfa7b3` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
 The follow-up branch is based on merged PR #10. PR #11 is pushed and its
@@ -85,7 +85,9 @@ require human approval.
 - `scripts/production-config-smoke.sh` — passed, including the staging
   template and staging fail-closed checks
 - `scripts/phase45-release-gate.sh` — passed
-- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31337741292) — passed
+- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31337862970) — passed
+- Read-only production health probe — passed; deployed version was
+  `2026.08.08-build-25`, so this does not count as PR #11 deployment evidence.
 - `scripts/contract-smoke.sh` against an isolated local Worker + local D1 —
   passed, including command list, pairing status, push dismissal, and the
   existing multi-turn session/action loop.
