@@ -27,6 +27,9 @@ security review, the 20–100 example golden voice dataset with device
 performance evidence, breaking-contract diff review, and approval of merge,
 production migrations, APNs changes, and model rollout.
 
+The detailed evidence and rollback record is in
+`docs/RELEASE_VERIFICATION_REPORT.md`.
+
 ## Operating rules
 
 1. The existing iOS and backend checkpoint PRs are the baseline. Do not add
