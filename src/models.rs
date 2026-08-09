@@ -118,6 +118,15 @@ pub struct EventRow {
     pub voice_script: Option<String>,
 }
 
+/// Lightweight cursor row used by the phone SSE transport. The session table
+/// is the source of truth, so every agent progress update and phone action
+/// automatically becomes observable without duplicating business events.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionStreamRow {
+    pub id: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditRow {
     pub id: String,

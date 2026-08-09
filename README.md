@@ -81,6 +81,39 @@ can keep the inbox fallback while Apple delivery is verified; use
 build uses the sandbox APNs environment and must use a separate config with
 `APNS_PRODUCTION=false` if it is tested against APNs directly.
 
+## Supabase Auth
+
+Production authentication uses Supabase Auth while Knock Knock's agent,
+session, device and push records remain in D1. The Worker keeps the same
+`/v1/auth/*` contract for the iPhone: it forwards password registration/login
+and refresh requests to Supabase, then maps the Supabase user ID to a local D1
+user row. It never stores the user's password in D1.
+
+The production config sets `AUTH_PROVIDER=supabase` and `SUPABASE_URL`. Add the
+project's publishable key as a Worker secret; do not use the `service_role` key:
+
+```sh
+wrangler secret put SUPABASE_PUBLISHABLE_KEY --config wrangler.production.toml
+```
+
+Apply the D1 migration before deploying the Supabase-backed Worker:
+
+```sh
+wrangler d1 migrations apply knock-knock --remote --config wrangler.production.toml
+```
+
+For the first workflow test, create one user in Supabase Authentication →
+Users. The email/password screen in the iPhone continues to call the existing
+bridge API, so no password or Supabase key is bundled in the app.
+
+After deploying, run the repeatable auth UAT without printing tokens:
+
+```sh
+SMOKE_EMAIL='your-uat-email' \
+SMOKE_PASSWORD='your-uat-password' \
+./scripts/supabase-auth-smoke.sh
+```
+
 ## Operations
 
 Production Wrangler config enables Workers Observability. Run the repeatable

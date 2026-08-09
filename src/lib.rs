@@ -11,12 +11,15 @@ mod skills;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::{rc::Rc, time::Duration};
 use worker::*;
 
 use crate::auth::{
-    config_value, create_agent_for_user, hash_api_key, hash_password, issue_user_auth,
-    mint_api_key, mint_pairing_code, new_id, require_agent, require_user, require_user_or_agent,
-    runtime_configuration, sha256_hex, verify_password,
+    bearer_token, config_value, create_agent_for_user, ensure_supabase_user, hash_api_key,
+    hash_password, issue_user_auth, mint_api_key, mint_pairing_code, new_id, require_agent,
+    require_user, require_user_or_agent, runtime_configuration, sha256_hex, supabase_auth_enabled,
+    supabase_auth_response, supabase_get_user, supabase_logout, supabase_refresh, supabase_sign_in,
+    supabase_sign_up, verify_password,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::models::{
@@ -88,7 +91,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         (Method::Post, ["v1", "auth", "register"]) => auth_register(&mut req, &env, &db).await,
         (Method::Post, ["v1", "auth", "login"]) => auth_login(&mut req, &env, &db).await,
         (Method::Post, ["v1", "auth", "refresh"]) => auth_refresh(&mut req, &env, &db).await,
-        (Method::Post, ["v1", "auth", "logout"]) => auth_logout(&mut req, &db).await,
+        (Method::Post, ["v1", "auth", "logout"]) => auth_logout(&mut req, &env, &db).await,
 
         (Method::Get, ["v1", "agents"]) => list_agents(&req, &env, &db).await,
         (Method::Post, ["v1", "agents"]) => create_agent(&mut req, &env, &db).await,
@@ -123,6 +126,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         }
 
         (Method::Get, ["v1", "phone", "sessions"]) => phone_sessions(&req, &env, &db).await,
+        (Method::Get, ["v1", "phone", "events"]) => phone_events(&req, &env, db).await,
         (Method::Get, ["v1", "phone", "sessions", session_id, "history"]) => {
             phone_history(&req, &env, &db, session_id).await
         }
@@ -203,9 +207,59 @@ fn validate_credentials(input: &AuthCredentials) -> ApiResult<String> {
     Ok(email)
 }
 
+fn map_supabase_login_error(error: ApiError) -> ApiError {
+    if error.status >= 500 {
+        return error;
+    }
+    ApiError::unauthorized("Invalid credentials")
+}
+
+fn map_supabase_refresh_error(error: ApiError) -> ApiError {
+    if error.status >= 500 {
+        return error;
+    }
+    ApiError::unauthorized("Invalid or expired refresh token")
+}
+
+fn map_supabase_register_error(error: ApiError) -> ApiError {
+    if error.status >= 500 {
+        return error;
+    }
+    let message = error.message.to_ascii_lowercase();
+    if message.contains("already") || message.contains("registered") {
+        return ApiError::conflict("Email already registered");
+    }
+    ApiError::validation("Unable to create account")
+}
+
 async fn auth_register(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let body: AuthCredentials = read_json(req).await?;
     let email = validate_credentials(&body)?;
+    if supabase_auth_enabled(env) {
+        let session = supabase_sign_up(env, &email, &body.password)
+            .await
+            .map_err(map_supabase_register_error)?;
+        let remote = session.user.clone().ok_or_else(|| {
+            ApiError::new(
+                502,
+                "supabase_auth_error",
+                "Supabase did not return the new user",
+            )
+        })?;
+        let remote_email = remote.email.as_deref().unwrap_or(&email);
+        let user = ensure_supabase_user(db, &remote.id, remote_email).await?;
+        let auth = supabase_auth_response(&user.user_id, &session)?;
+        audit::record_audit(
+            db,
+            "auth.register",
+            Some(&user.user_id),
+            None,
+            None,
+            json!({ "email": remote_email, "provider": "supabase" }),
+        )
+        .await;
+        return json_response(auth, 201);
+    }
     if db::first::<IdOnly>(
         db,
         "SELECT id FROM users WHERE email = ?",
@@ -260,6 +314,31 @@ async fn auth_register(req: &mut Request, env: &Env, db: &D1Database) -> ApiResu
 async fn auth_login(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let body: AuthCredentials = read_json(req).await?;
     let email = validate_credentials(&body)?;
+    if supabase_auth_enabled(env) {
+        let session = supabase_sign_in(env, &email, &body.password)
+            .await
+            .map_err(map_supabase_login_error)?;
+        let remote = session.user.clone().ok_or_else(|| {
+            ApiError::new(
+                502,
+                "supabase_auth_error",
+                "Supabase did not return the authenticated user",
+            )
+        })?;
+        let remote_email = remote.email.as_deref().unwrap_or(&email);
+        let user = ensure_supabase_user(db, &remote.id, remote_email).await?;
+        let auth = supabase_auth_response(&user.user_id, &session)?;
+        audit::record_audit(
+            db,
+            "auth.login",
+            Some(&user.user_id),
+            None,
+            None,
+            json!({ "provider": "supabase" }),
+        )
+        .await;
+        return json_response(auth, 200);
+    }
     let user = db::first::<models::UserRow>(
         db,
         "SELECT id, email, password_hash FROM users WHERE email = ?",
@@ -284,8 +363,44 @@ async fn auth_login(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<
 
 async fn auth_refresh(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let body: RefreshRequest = read_json(req).await?;
-    if body.refresh_token.len() < 20 {
+    let invalid_refresh_token = if supabase_auth_enabled(env) {
+        body.refresh_token.trim().is_empty()
+    } else {
+        body.refresh_token.len() < 20
+    };
+    if invalid_refresh_token {
         return Err(ApiError::validation("refresh_token is invalid"));
+    }
+    if supabase_auth_enabled(env) {
+        let session = supabase_refresh(env, &body.refresh_token)
+            .await
+            .map_err(map_supabase_refresh_error)?;
+        let access_token = session.access_token.as_deref().ok_or_else(|| {
+            ApiError::new(
+                502,
+                "supabase_auth_error",
+                "Supabase did not return an access token",
+            )
+        })?;
+        let remote = match session.user.clone() {
+            Some(user) => user,
+            None => supabase_get_user(env, access_token).await?,
+        };
+        let remote_email = remote.email.as_deref().ok_or_else(|| {
+            ApiError::new(502, "supabase_auth_error", "Supabase user email is missing")
+        })?;
+        let user = ensure_supabase_user(db, &remote.id, remote_email).await?;
+        let auth = supabase_auth_response(&user.user_id, &session)?;
+        audit::record_audit(
+            db,
+            "auth.refresh",
+            Some(&user.user_id),
+            None,
+            None,
+            json!({ "provider": "supabase" }),
+        )
+        .await;
+        return json_response(auth, 200);
     }
     let row = db::first::<RefreshRow>(
         db,
@@ -329,10 +444,21 @@ async fn auth_refresh(req: &mut Request, env: &Env, db: &D1Database) -> ApiResul
     json_response(auth, 200)
 }
 
-async fn auth_logout(req: &mut Request, db: &D1Database) -> ApiResult<Response> {
+async fn auth_logout(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let body: RefreshRequest = read_json(req).await?;
-    if body.refresh_token.len() < 20 {
+    let invalid_refresh_token = if supabase_auth_enabled(env) {
+        body.refresh_token.trim().is_empty()
+    } else {
+        body.refresh_token.len() < 20
+    };
+    if invalid_refresh_token {
         return Err(ApiError::validation("refresh_token is invalid"));
+    }
+    if supabase_auth_enabled(env) {
+        if let Some(token) = bearer_token(req)? {
+            supabase_logout(env, &token).await?;
+        }
+        return json_response(json!({ "ok": true }), 200);
     }
     let now = db::now_iso();
     db::run(
@@ -701,6 +827,133 @@ async fn phone_sessions(req: &Request, env: &Env, db: &D1Database) -> ApiResult<
         }),
         200,
     )
+}
+
+#[derive(Debug)]
+struct SessionStreamState {
+    db: Rc<D1Database>,
+    user_id: String,
+    cursor_updated_at: String,
+    cursor_session_id: String,
+    initial_sync: bool,
+    poll_count: u8,
+    close_after_emit: bool,
+}
+
+fn stream_error(error: ApiError) -> worker::Error {
+    worker::Error::from(error.message)
+}
+
+fn parse_event_cursor(request: &Request) -> ApiResult<(String, String)> {
+    let header_cursor = request.headers().get("last-event-id")?;
+    let raw = query_value(request, "since")?.or(header_cursor);
+    let Some(raw) = raw else {
+        return Ok((String::new(), String::new()));
+    };
+    let Some((updated_at, session_id)) = raw.split_once('|') else {
+        return Ok((String::new(), String::new()));
+    };
+    if updated_at.is_empty() {
+        return Ok((String::new(), String::new()));
+    }
+    Ok((updated_at.to_string(), session_id.to_string()))
+}
+
+/// Opens a bounded SSE connection for the iOS foreground inbox.
+///
+/// The cursor is `(sessions.updated_at, sessions.id)`, so all meaningful
+/// session changes can be reconciled by the existing REST snapshot endpoint.
+/// The connection intentionally ends after a short window; iOS reconnects
+/// with the last event id. This keeps the first implementation stateless and
+/// makes the later Durable Object fan-out upgrade a transport-only change.
+async fn phone_events(req: &Request, env: &Env, db: D1Database) -> ApiResult<Response> {
+    let user = require_user(req, env, &db).await?;
+    let (mut cursor_updated_at, mut cursor_session_id) = parse_event_cursor(req)?;
+    let initial_sync = cursor_updated_at.is_empty();
+
+    if initial_sync {
+        if let Some(latest) = db::first::<models::SessionStreamRow>(
+            &db,
+            "SELECT id, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            vec![db::text(&user.user_id)],
+        )
+        .await?
+        {
+            cursor_updated_at = latest.updated_at;
+            cursor_session_id = latest.id;
+        }
+    }
+
+    let state = SessionStreamState {
+        db: Rc::new(db),
+        user_id: user.user_id,
+        cursor_updated_at,
+        cursor_session_id,
+        initial_sync,
+        poll_count: 0,
+        close_after_emit: false,
+    };
+
+    let stream = futures_util::stream::try_unfold(state, |mut state| async move {
+        if state.close_after_emit {
+            return Ok::<Option<(Vec<u8>, SessionStreamState)>, worker::Error>(None);
+        }
+        if state.initial_sync {
+            state.initial_sync = false;
+            let event_id = if state.cursor_updated_at.is_empty() {
+                "0|".to_string()
+            } else {
+                format!("{}|{}", state.cursor_updated_at, state.cursor_session_id)
+            };
+            let chunk = format!(
+                "id: {event_id}\nevent: sync.required\ndata: {{\"reason\":\"initial\"}}\n\n"
+            );
+            return Ok(Some((chunk.into_bytes(), state)));
+        }
+
+        Delay::from(Duration::from_secs(5)).await;
+        let rows: Vec<models::SessionStreamRow> = db::all(
+            &state.db,
+            "SELECT id, updated_at FROM sessions WHERE user_id = ? AND (updated_at > ? OR (updated_at = ? AND id > ?)) ORDER BY updated_at ASC, id ASC LIMIT 100",
+            vec![
+                db::text(&state.user_id),
+                db::text(&state.cursor_updated_at),
+                db::text(&state.cursor_updated_at),
+                db::text(&state.cursor_session_id),
+            ],
+        )
+        .await
+        .map_err(stream_error)?;
+
+        let mut chunk = String::new();
+        for row in rows {
+            state.cursor_updated_at = row.updated_at.clone();
+            state.cursor_session_id = row.id.clone();
+            let event_id = format!("{}|{}", row.updated_at, row.id);
+            let data = json!({
+                "session_id": row.id,
+                "updated_at": row.updated_at,
+            });
+            chunk.push_str(&format!(
+                "id: {event_id}\nevent: session.updated\ndata: {}\n\n",
+                data
+            ));
+        }
+        if chunk.is_empty() {
+            chunk.push_str(": keep-alive\n\n");
+        }
+
+        state.poll_count += 1;
+        state.close_after_emit = state.poll_count >= 6;
+        Ok(Some((chunk.into_bytes(), state)))
+    });
+
+    Ok(Response::builder()
+        .with_header("Content-Type", "text/event-stream; charset=utf-8")?
+        .with_header("Cache-Control", "no-cache, no-transform")?
+        .with_header("Connection", "keep-alive")?
+        .with_header("X-Accel-Buffering", "no")?
+        .from_stream(stream)?)
 }
 
 async fn phone_history(
