@@ -104,12 +104,12 @@ These are deliberately not marked as passed:
 - physical iPhone 13 audio, memory, thermal, and crash testing;
 - security review, formal breaking-contract diff, and production observability
   review;
-- human approval for merging stacked PRs, production migrations, APNs changes,
+- human approval for merging this follow-up PR, production migrations, APNs changes,
   and model rollout.
 
 ## Rollback
 
-Do not merge the completion PRs until the gates above are approved. Revert the
-completion commits or close the draft PRs; no production data or migration has
-been changed. Migration 0010 is additive and requires a separately approved
-rollback plan if it is ever applied.
+Do not merge the follow-up PR until the gates above are approved. Revert
+`e93a677` (and the documentation handoff commit) or close the draft PR; no
+production data or migration has been changed. Migrations 0010 and 0011 are
+additive and require a separately approved rollback plan if applied remotely.
