@@ -74,6 +74,12 @@ configured Apple `.p8` key; missing or failed APNs delivery falls back to the
 development inbox when appropriate instead of being reported as a false
 success.
 
+Local action execution uses `ACTION_PROVIDER_MODE=internal` and may enable the
+reminder/message flags for D1-only testing. Production defaults to
+`ACTION_PROVIDER_MODE=external` with those flags disabled until concrete
+provider adapters and their secrets are approved. A local queued message is
+never reported as externally delivered.
+
 `PUSH_MODE=dev` is not APNs: it writes a push event to the D1-backed development
 inbox for polling. Production uses `PUSH_MODE=both` during rollout so the app
 can keep the inbox fallback while Apple delivery is verified; use

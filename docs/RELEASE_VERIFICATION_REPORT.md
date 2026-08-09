@@ -1,6 +1,6 @@
 # Knock Knock Release Verification Report
 
-**Date:** 2026-08-09  
+**Date:** 2026-08-10
 **Scope:** current Phase 4/5 completion worktrees based on the merged checkpoint
 and Phase 0–3 integration baseline
 **Production changes:** none
@@ -21,13 +21,19 @@ approval.
 
 - Canonical D01–D40 architecture decisions with a Chinese summary.
 - OpenAPI 3.1 REST, SSE, error, pagination, and `CommandEnvelope v1` contract.
-- Backend migrations 0003–0010 for commands, confirmation, messages,
+- Backend migrations 0003–0011 for commands, confirmation, messages,
   retrievals, phone changes, outbox, retention/deletion metadata, rate limits,
   compatibility-operation claim fencing, and durable vertical-action effects.
 - Server-side command validation, action registry, idempotency, confirmation,
   undo/cancel routes, retryable unknown outcomes, and outbox execution boundary.
 - Durable local reminder and draft effects, an internal queued message effect,
   and provider-idempotency records for the three release vertical actions.
+- Additive command-list, pairing-status, push-dismiss, and rich action-descriptor
+  contracts; race-safe pairing claim tokens and command cursor pagination.
+- Explicit local/external/disabled provider modes, action feature flags,
+  provider-attempt failure states, bounded stale-lease recovery, credential-key
+  rejection in command arguments, and secret-only JWT/APNs signing material.
+- Versioned, atomic, idempotent command Undo for local reminder/draft effects.
 - Signed model descriptor endpoint and production fail-closed model
   configuration checks; the iOS target consumes the official LiteRT-LM 0.12
   C framework without the upstream unsafe SwiftPM linker flags.
@@ -46,13 +52,19 @@ approval.
 
 - `cargo fmt --all -- --check` — passed
 - `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test -q` — 26 passed
+- `cargo test -q` — 32 passed
 - `cargo check --target wasm32-unknown-unknown -q` — passed
 - `scripts/architecture-migration-smoke.sh` — passed
 - `scripts/adversarial-data-smoke.sh` — passed for cross-user isolation,
   deleted-resource write barriers, message/retrieval tombstones, lease fencing,
   event idempotency gates, outbox lease recovery, and cursor scope
 - `scripts/contract-schema-smoke.sh` — passed
+- `scripts/phase45-release-gate.sh` — passed
+- `scripts/contract-smoke.sh` against an isolated local Worker + local D1 —
+  passed, including command list, pairing status, push dismissal, and the
+  existing multi-turn session/action loop.
+- Local `/__scheduled` Outbox smoke — passed for reminder, draft, and message;
+  message result remained `queued` with `external_delivery: not_configured`.
 - guarded event/outbox/confirmation SQL was prepared and executed against
   SQLite — passed
 - `git diff --check` — passed
@@ -82,9 +94,10 @@ These are deliberately not marked as passed:
 
 - route-level D1/E2E smoke against deployed bindings;
 - backend GitHub CI, which was still pending at report time;
-- provider-backed executors for reminder delivery and external send-message
-  delivery (the current implementation safely persists/queues these effects
-  and reports external delivery as not configured);
+- concrete provider-backed executors for reminder delivery and external
+  send-message delivery, plus a reminder due-time scanner (the current
+  implementation safely persists/queues local effects and reports external
+  delivery as not configured);
 - 20–100 example golden voice dataset, ≥95% accuracy evidence, and zero
   high-risk false execution evidence;
 - physical iPhone 13 audio, memory, thermal, and crash testing;

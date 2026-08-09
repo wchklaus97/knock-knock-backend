@@ -129,6 +129,29 @@ pub async fn mark_all_read(db: &D1Database, user_id: &str) -> ApiResult<Value> {
     }))
 }
 
+pub async fn dismiss(db: &D1Database, user_id: &str, push_id: &str) -> ApiResult<Value> {
+    let now = db::now_iso();
+    db::run(
+        db,
+        "UPDATE pushes SET dismissed_at = COALESCE(dismissed_at, ?), updated_at = ? WHERE id = ? AND user_id = ?",
+        vec![
+            db::text(&now),
+            db::text(&now),
+            db::text(push_id),
+            db::text(user_id),
+        ],
+    )
+    .await?;
+    let row: Option<PushRow> = db::first(
+        db,
+        "SELECT id, session_id, title, body, voice_script, created_at, read_at, dismissed_at FROM pushes WHERE id = ? AND user_id = ?",
+        vec![db::text(push_id), db::text(user_id)],
+    )
+    .await?;
+    let row = row.ok_or_else(|| ApiError::not_found("Push not found"))?;
+    Ok(push_value(row))
+}
+
 fn push_value(row: PushRow) -> Value {
     serde_json::json!({
         "ok": true,

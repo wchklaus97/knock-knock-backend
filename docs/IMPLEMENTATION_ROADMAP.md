@@ -30,6 +30,25 @@ production migrations, APNs changes, and model rollout.
 The detailed evidence and rollback record is in
 `docs/RELEASE_VERIFICATION_REPORT.md`.
 
+### Backend follow-up checkpoint — 2026-08-10
+
+The next backend continuation closes four concrete API gaps in one additive
+checkpoint: command list pagination, push dismissal, pairing status, and rich
+action descriptors. It also adds the `0011_command_pairing_action_descriptors`
+migration, claim-token fencing, provider-mode/feature-flag configuration,
+provider attempt failure states, secret-shaped argument rejection, and
+idempotent versioned Undo.
+
+The current local worktree has passed the Rust/WASM/static gates and a real
+local Worker + local D1 contract smoke on an isolated port. It has also run the
+three local vertical effects through `/__scheduled`: reminder and draft become
+durable D1 effects, while message remains explicitly `queued` with
+`external_delivery: not_configured`.
+
+This checkpoint is not a production provider delivery. A concrete external
+reminder/message adapter, due-time scanner, deployed-binding E2E, CI security
+review, and human merge/deployment approval remain release work.
+
 ### Active Phase 4/5 completion branch
 
 The follow-up branch now extends the earlier staged work with:

@@ -44,14 +44,27 @@ device="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/devices" \
   -d '{"platform":"ios","locale":"zh-HK"}')"
 test "$(jq -r '.platform' <<<"$device")" = "ios"
 
+command="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/commands" \
+  -d "$(jq -nc --arg key "command-smoke-$(date +%s%N)" \
+    '{schema_version:1,command_id:("cmd-smoke-" + ($key | split("-") | last)),intent:"search_history",args:{q:"history"},risk_level:"low",needs_confirmation:false,idempotency_key:$key,confidence:0.95,locale:"zh-Hans-HK",timezone:"Asia/Hong_Kong"}')")"
+command_id="$(jq -r '.command_id' <<<"$command")"
+test -n "$command_id" && test "$command_id" != "null"
+test "$(jq -r '.state' <<<"$command")" = "queued"
+commands="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands?state=queued&limit=50")"
+test "$(jq -r --arg id "$command_id" '[.commands[] | select(.command_id == $id)] | length' <<<"$commands")" = "1"
+
 pairing="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/pairing/code" \
   -d '{"ttl_sec":600}')"
 pairing_code="$(jq -r '.code' <<<"$pairing")"
 test -n "$pairing_code" && test "$pairing_code" != "null"
+pairing_status="$(get "${user_auth[@]}" "$BASE_URL/v1/pairing/code/$pairing_code")"
+test "$(jq -r '.status' <<<"$pairing_status")" = "waiting"
 paired="$(json -X POST "$BASE_URL/v1/pairing/claim" \
   -d "$(jq -nc --arg code "$pairing_code" \
     '{code:$code,label:"paired-smoke",host_label:"local"}')")"
 test -n "$(jq -r '.api_key' <<<"$paired")"
+pairing_status_claimed="$(get "${user_auth[@]}" "$BASE_URL/v1/pairing/code/$pairing_code")"
+test "$(jq -r '.status' <<<"$pairing_status_claimed")" = "claimed"
 second_claim_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
   -H 'content-type: application/json' -X POST "$BASE_URL/v1/pairing/claim" \
   -d "$(jq -nc --arg code "$pairing_code" \
@@ -144,6 +157,10 @@ test "$(jq -r '.state' <<<"$final_session")" = "running"
 
 pushes="$(get "${user_auth[@]}" "$BASE_URL/v1/dev/pushes")"
 test "$(jq -r '.pushes | length' <<<"$pushes")" -ge 1
+push_id="$(jq -r '.pushes[0].push_id' <<<"$pushes")"
+dismissed="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/pushes/$push_id/dismiss")"
+test "$(jq -r '.push_id' <<<"$dismissed")" = "$push_id"
+test "$(jq -r '.dismissed_at != null' <<<"$dismissed")" = "true"
 
 history="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/sessions/$session_id/history")"
 test "$(jq -r '.entries | length' <<<"$history")" -ge 2
@@ -158,4 +175,4 @@ logout="$(json -X POST "$BASE_URL/v1/auth/logout" \
   -d "$(jq -nc --arg refresh "$rotated_refresh" '{refresh_token:$refresh}')")"
 test "$(jq -r '.ok' <<<"$logout")" = "true"
 
-printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/chat/multi-turn/phone/confirm/claim/result/push/refresh'
+printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/chat/multi-turn/phone/command/pairing/push/confirm/claim/result/refresh'

@@ -7,18 +7,24 @@ use p256::pkcs8::DecodePrivateKey;
 use serde_json::json;
 use worker::{Fetch, Headers, Method, Request, RequestInit};
 
-use crate::auth::config_value;
+use crate::auth::{config_value, secret_value};
 use crate::error::{ApiError, ApiResult};
 
 pub fn is_ready(env: &worker::Env) -> bool {
-    let key = config_value(env, "APNS_KEY", "");
+    let key = secret_value(env, "APNS_KEY").unwrap_or_default();
     let key_is_valid = decode_private_key(&key)
         .ok()
         .and_then(|der| SigningKey::from_pkcs8_der(&der).ok())
         .is_some();
     key_is_valid
-        && !config_value(env, "APNS_KEY_ID", "").trim().is_empty()
-        && !config_value(env, "APNS_TEAM_ID", "").trim().is_empty()
+        && !secret_value(env, "APNS_KEY_ID")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        && !secret_value(env, "APNS_TEAM_ID")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
         && !config_value(env, "APNS_BUNDLE_ID", "hk.knockknock.app")
             .trim()
             .is_empty()
@@ -40,7 +46,7 @@ fn decode_private_key(value: &str) -> ApiResult<Vec<u8>> {
 }
 
 fn signing_key(env: &worker::Env) -> ApiResult<SigningKey> {
-    let key = config_value(env, "APNS_KEY", "");
+    let key = secret_value(env, "APNS_KEY").unwrap_or_default();
     let der = decode_private_key(&key)?;
     SigningKey::from_pkcs8_der(&der)
         .map_err(|error| ApiError::new(500, "apns_configuration_error", error.to_string()))
@@ -48,14 +54,14 @@ fn signing_key(env: &worker::Env) -> ApiResult<SigningKey> {
 
 fn signed_token(env: &worker::Env) -> ApiResult<String> {
     let now = worker::Date::now().as_millis() as i64 / 1000;
-    let key_id = config_value(env, "APNS_KEY_ID", "");
+    let key_id = secret_value(env, "APNS_KEY_ID").unwrap_or_default();
     let header = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({ "alg": "ES256", "kid": key_id }))
             .map_err(|error| ApiError::new(500, "apns_configuration_error", error.to_string()))?,
     );
     let payload = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({
-            "iss": config_value(env, "APNS_TEAM_ID", ""),
+            "iss": secret_value(env, "APNS_TEAM_ID").unwrap_or_default(),
             "iat": now,
         }))
         .map_err(|error| ApiError::new(500, "apns_configuration_error", error.to_string()))?,

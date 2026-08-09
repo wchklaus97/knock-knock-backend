@@ -119,6 +119,12 @@ fn env_value(env: &Env, name: &str) -> Option<String> {
         .or_else(|| env.secret(name).ok().map(|value| value.to_string()))
 }
 
+/// Read a value only from Wrangler's secret store. Provider credentials and
+/// signing material must not silently fall back to public Worker vars.
+pub fn secret_value(env: &Env, name: &str) -> Option<String> {
+    env.secret(name).ok().map(|value| value.to_string())
+}
+
 pub fn config_value(env: &Env, name: &str, default: &str) -> String {
     env_value(env, name).unwrap_or_else(|| default.to_string())
 }
@@ -248,9 +254,18 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
     }
 
     for (name, value) in [
-        ("APNS_KEY", config_value(env, "APNS_KEY", "")),
-        ("APNS_KEY_ID", config_value(env, "APNS_KEY_ID", "")),
-        ("APNS_TEAM_ID", config_value(env, "APNS_TEAM_ID", "")),
+        (
+            "APNS_KEY",
+            secret_value(env, "APNS_KEY").unwrap_or_default(),
+        ),
+        (
+            "APNS_KEY_ID",
+            secret_value(env, "APNS_KEY_ID").unwrap_or_default(),
+        ),
+        (
+            "APNS_TEAM_ID",
+            secret_value(env, "APNS_TEAM_ID").unwrap_or_default(),
+        ),
         ("APNS_BUNDLE_ID", config_value(env, "APNS_BUNDLE_ID", "")),
     ] {
         if value.trim().is_empty() || value.trim().starts_with("REPLACE_") {
@@ -552,11 +567,13 @@ async fn resolve_supabase_user(
 }
 
 pub fn jwt_secret(env: &Env) -> ApiResult<String> {
-    let value = config_value(env, "JWT_SECRET", "dev-change-me");
     let node_env = config_value(env, "NODE_ENV", "development");
-    if node_env.trim().eq_ignore_ascii_case("production")
-        && (value == "dev-change-me" || value.len() < 32)
-    {
+    let value = if node_env.trim().eq_ignore_ascii_case("production") {
+        secret_value(env, "JWT_SECRET").unwrap_or_default()
+    } else {
+        config_value(env, "JWT_SECRET", "dev-change-me")
+    };
+    if node_env.trim().eq_ignore_ascii_case("production") && value.len() < 32 {
         return Err(ApiError::new(
             500,
             "configuration_error",

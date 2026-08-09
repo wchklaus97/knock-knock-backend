@@ -10,6 +10,7 @@ mod models;
 mod outbox;
 mod pagination;
 mod phone_operations;
+mod providers;
 mod push;
 mod rate_limits;
 mod realtime;
@@ -83,8 +84,11 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// adapters remain unknown/retryable instead of being reported as success.
 #[event(scheduled)]
 pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    if runtime_configuration(&env).is_err() {
+        return;
+    }
     if let Ok(db) = env.d1("DB") {
-        let _ = outbox::drain(&db).await;
+        let _ = outbox::drain(&db, &env).await;
     }
 }
 
@@ -92,6 +96,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
     let path = req.path();
     let method = req.method();
     runtime_configuration(&env)?;
+    let action_provider_config = providers::load(&env)?;
 
     if method == Method::Options {
         return Ok(Response::empty()?);
@@ -106,6 +111,10 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
                 "push_mode": config_value(&env, "PUSH_MODE", "dev"),
                 "apns_ready": crate::apns::is_ready(&env),
                 "apns_production": config_value(&env, "APNS_PRODUCTION", "false") == "true",
+                "action_provider_mode": action_provider_config.mode().as_str(),
+                "action_provider_ready": providers::ready(action_provider_config.mode()),
+                "action_reminder_enabled": action_provider_config.enabled("create_reminder"),
+                "action_message_enabled": action_provider_config.enabled("send_message"),
             }),
             200,
         );
@@ -139,6 +148,9 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         }
 
         (Method::Post, ["v1", "pairing", "code"]) => create_pairing_code(&mut req, &env, &db).await,
+        (Method::Get, ["v1", "pairing", "code", code]) => {
+            pairing_status(&req, &env, &db, code).await
+        }
         (Method::Post, ["v1", "pairing", "claim"]) => pairing_claim(&mut req, &env, &db).await,
 
         (Method::Get, ["v1", "skills"]) => list_skills(&req, &env, &db).await,
@@ -192,6 +204,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         (Method::Post, ["v1", "phone", "commands"]) => {
             phone_create_command(&mut req, &env, &db).await
         }
+        (Method::Get, ["v1", "phone", "commands"]) => phone_list_commands(&req, &env, &db).await,
         (Method::Get, ["v1", "phone", "commands", command_id]) => {
             phone_get_command(&req, &env, &db, command_id).await
         }
@@ -210,6 +223,9 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         (Method::Get, ["v1", "phone", "search"]) => phone_search(&req, &env, &db).await,
         (Method::Post, ["v1", "phone", "pushes", push_id, "read"]) => {
             phone_mark_push_read(&req, &env, &db, push_id).await
+        }
+        (Method::Post, ["v1", "phone", "pushes", push_id, "dismiss"]) => {
+            phone_dismiss_push(&req, &env, &db, push_id).await
         }
         (Method::Post, ["v1", "phone", "pushes", "read-all"]) => {
             phone_mark_all_pushes_read(&req, &env, &db).await
@@ -695,7 +711,7 @@ async fn create_pairing_code(req: &mut Request, env: &Env, db: &D1Database) -> A
     let expires_at = db::add_seconds_iso(ttl);
     db::run(
         db,
-        "INSERT INTO pairing_codes (code, user_id, expires_at, claimed_at, created_at) VALUES (?, ?, ?, NULL, ?)",
+        "INSERT INTO pairing_codes (code, user_id, expires_at, claimed_at, claim_token, created_at) VALUES (?, ?, ?, NULL, NULL, ?)",
         vec![
             db::text(&code),
             db::text(&user.user_id),
@@ -716,6 +732,42 @@ async fn create_pairing_code(req: &mut Request, env: &Env, db: &D1Database) -> A
     json_response(json!({ "code": code, "expires_at": expires_at }), 201)
 }
 
+async fn pairing_status(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    code: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let code = code.trim();
+    if code.len() < 4 || code.len() > 12 {
+        return Err(ApiError::validation("Invalid pairing code"));
+    }
+    let row = db::first::<models::PairingRow>(
+        db,
+        "SELECT user_id, expires_at, claimed_at FROM pairing_codes WHERE code = ? AND user_id = ?",
+        vec![db::text(code), db::text(&user.user_id)],
+    )
+    .await?
+    .ok_or_else(|| ApiError::not_found("Pairing code not found"))?;
+    let status = if row.claimed_at.is_some() {
+        "claimed"
+    } else if db::is_expired(&row.expires_at) {
+        "expired"
+    } else {
+        "waiting"
+    };
+    json_response(
+        json!({
+            "code": code,
+            "status": status,
+            "expires_at": row.expires_at,
+            "claimed_at": row.claimed_at,
+        }),
+        200,
+    )
+}
+
 async fn pairing_claim(req: &mut Request, _env: &Env, db: &D1Database) -> ApiResult<Response> {
     let body: PairingClaimRequest = read_json(req).await?;
     let code = body.code.trim();
@@ -726,14 +778,20 @@ async fn pairing_claim(req: &mut Request, _env: &Env, db: &D1Database) -> ApiRes
     let now = db::now_iso();
     let agent_id = new_id("agt")?;
     let api_key = mint_api_key()?;
+    let claim_token = new_id("claim")?;
     let update = db::prepare(
         db,
-        "UPDATE pairing_codes SET claimed_at = ? WHERE code = ? AND claimed_at IS NULL AND expires_at > ?",
-        vec![db::text(&now), db::text(code), db::text(&now)],
+        "UPDATE pairing_codes SET claimed_at = ?, claim_token = ? WHERE code = ? AND claimed_at IS NULL AND expires_at > ?",
+        vec![
+            db::text(&now),
+            db::text(&claim_token),
+            db::text(code),
+            db::text(&now),
+        ],
     )?;
     let insert = db::prepare(
         db,
-        "INSERT INTO agents (id, user_id, label, host_label, api_key_hash, created_at) SELECT ?, user_id, ?, ?, ?, ? FROM pairing_codes WHERE code = ? AND claimed_at = ?",
+        "INSERT INTO agents (id, user_id, label, host_label, api_key_hash, created_at) SELECT ?, user_id, ?, ?, ?, ? FROM pairing_codes WHERE code = ? AND claim_token = ? AND claimed_at = ?",
         vec![
             db::text(&agent_id),
             db::text(label),
@@ -741,6 +799,7 @@ async fn pairing_claim(req: &mut Request, _env: &Env, db: &D1Database) -> ApiRes
             db::text(&hash_api_key(&api_key)),
             db::text(&now),
             db::text(code),
+            db::text(&claim_token),
             db::text(&now),
         ],
     )?;
@@ -1187,6 +1246,16 @@ async fn phone_mark_push_read(
     json_response(push::mark_read(db, &user.user_id, push_id).await?, 200)
 }
 
+async fn phone_dismiss_push(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    push_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    json_response(push::dismiss(db, &user.user_id, push_id).await?, 200)
+}
+
 async fn phone_mark_all_pushes_read(
     req: &Request,
     env: &Env,
@@ -1394,11 +1463,16 @@ async fn phone_history(
     if !exists {
         return Err(ApiError::not_found("Session not found"));
     }
-    let entries =
-        audit::list_audit_for_session(db, &user.user_id, session_id, query_limit(req, 100)?)
-            .await?;
+    let before = query_value(req, "before")?;
     json_response(
-        json!({ "entries": entries, "next_cursor": Value::Null, "has_more": false }),
+        audit::list_audit_for_session(
+            db,
+            &user.user_id,
+            session_id,
+            before.as_deref(),
+            query_limit(req, 100)?,
+        )
+        .await?,
         200,
     )
 }
@@ -1634,6 +1708,25 @@ async fn phone_get_command(
         .await?
         .ok_or_else(|| ApiError::not_found("Command not found"))?;
     json_response(crate::commands::response(&command, None), 200)
+}
+
+async fn phone_list_commands(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let before = query_value(req, "before")?;
+    let state = query_value(req, "state")?;
+    let session_id = query_value(req, "session_id")?;
+    json_response(
+        crate::commands::list_for_user(
+            db,
+            &user.user_id,
+            before.as_deref(),
+            state.as_deref(),
+            session_id.as_deref(),
+            query_limit(req, 50)?,
+        )
+        .await?,
+        200,
+    )
 }
 
 async fn phone_confirm_command(

@@ -63,6 +63,11 @@ fn retrieval_value(row: RetrievalItemRow) -> Value {
 
 pub fn session_summary(row: &SessionRow) -> Value {
     let available_actions = db::parse_json_array(row.available_actions_json.as_deref());
+    let available_action_descriptors = row
+        .available_action_descriptors_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap_or_else(|| Value::Array(Vec::new()));
     serde_json::json!({
         "session_id": row.id,
         "agent_id": row.agent_id,
@@ -75,6 +80,7 @@ pub fn session_summary(row: &SessionRow) -> Value {
         "chat_id": row.chat_id,
         "summary_text": row.summary_text,
         "available_actions": available_actions,
+        "available_action_descriptors": available_action_descriptors,
         "expires_at": row.expires_at,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -95,7 +101,7 @@ pub async fn list_sessions(
     let rows: Vec<SessionRow> = if let Some(cursor) = before {
         db::all(
             db,
-            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (updated_at < ? OR (updated_at = ? AND id < ?)) ORDER BY updated_at DESC, id DESC LIMIT ?",
+            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, available_action_descriptors_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (updated_at < ? OR (updated_at = ? AND id < ?)) ORDER BY updated_at DESC, id DESC LIMIT ?",
             vec![
                 db::text(user_id),
                 db::text(&cursor.sort_key),
@@ -108,7 +114,7 @@ pub async fn list_sessions(
     } else {
         db::all(
             db,
-            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC, id DESC LIMIT ?",
+            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, available_action_descriptors_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC, id DESC LIMIT ?",
             vec![db::text(user_id), db::number(safe_limit + 1)],
         )
         .await?
@@ -218,7 +224,7 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
     let needle = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
     let sessions: Vec<SessionRow> = db::all(
         db,
-        "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (title LIKE ? ESCAPE '\\' OR summary_text LIKE ? ESCAPE '\\' OR facts_json LIKE ? ESCAPE '\\') ORDER BY updated_at DESC, id DESC LIMIT ?",
+        "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, available_action_descriptors_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (title LIKE ? ESCAPE '\\' OR summary_text LIKE ? ESCAPE '\\' OR facts_json LIKE ? ESCAPE '\\') ORDER BY updated_at DESC, id DESC LIMIT ?",
         vec![
             db::text(user_id),
             db::text(&needle),

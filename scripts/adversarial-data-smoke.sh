@@ -15,7 +15,8 @@ sqlite3 "${DB_FILE}" \
   ".read ${ROOT_DIR}/migrations/0007_rate_limits.sql" \
   ".read ${ROOT_DIR}/migrations/0008_history_consistency.sql" \
   ".read ${ROOT_DIR}/migrations/0009_phone_operation_claim_tokens.sql" \
-  ".read ${ROOT_DIR}/migrations/0010_vertical_action_effects.sql"
+  ".read ${ROOT_DIR}/migrations/0010_vertical_action_effects.sql" \
+  ".read ${ROOT_DIR}/migrations/0011_command_pairing_action_descriptors.sql"
 
 sqlite3 "${DB_FILE}" <<'SQL'
 INSERT INTO users (id, email, password_hash, created_at) VALUES

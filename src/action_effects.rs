@@ -6,6 +6,7 @@ use crate::auth::new_id;
 use crate::db;
 use crate::error::{ApiError, ApiResult};
 use crate::models::CommandRow;
+use crate::providers::{self, ActionProviderConfig};
 
 const MAX_TITLE: usize = 200;
 const MAX_RECIPIENT: usize = 320;
@@ -13,6 +14,7 @@ const MAX_BODY: usize = 8_000;
 
 #[derive(Debug, Clone, Deserialize)]
 struct EffectAttemptRow {
+    provider: String,
     state: String,
     response_json: Option<String>,
 }
@@ -33,23 +35,31 @@ pub async fn execute(
     user_id: &str,
     command: &CommandRow,
     args: &Map<String, Value>,
+    provider_config: ActionProviderConfig,
 ) -> ApiResult<Value> {
     if let Some(previous) = previous_attempt(db, command).await? {
-        return match previous.state.as_str() {
-            "succeeded" => parse_response(previous.response_json.as_deref()),
-            "running" | "unknown" | "retrying" => Err(ApiError::new(
-                503,
-                "effect_in_progress",
-                "The provider effect is still being reconciled",
-            )),
-            _ => Ok(Value::Null),
-        };
+        match previous.state.as_str() {
+            "succeeded" => return parse_response(previous.response_json.as_deref()),
+            "running" | "unknown" | "retrying"
+                if !provider_config.mode().local_effects_allowed() =>
+            {
+                return Err(ApiError::new(
+                    503,
+                    "effect_in_progress",
+                    format!(
+                        "The provider effect is still being reconciled by {}",
+                        previous.provider
+                    ),
+                ));
+            }
+            _ => {}
+        }
     }
 
     match command.intent.as_str() {
-        "create_reminder" => create_reminder(db, user_id, command, args).await,
+        "create_reminder" => create_reminder(db, user_id, command, args, provider_config).await,
         "create_draft" => create_draft(db, user_id, command, args).await,
-        "send_message" => queue_message(db, user_id, command, args).await,
+        "send_message" => queue_message(db, user_id, command, args, provider_config).await,
         _ => Err(ApiError::new(
             422,
             "unsupported_intent",
@@ -71,23 +81,21 @@ pub async fn undo(db: &D1Database, user_id: &str, command: &CommandRow) -> ApiRe
     };
 
     let now = db::now_iso();
-    let sql = format!(
-        "UPDATE {table} SET status = 'cancelled', updated_at = ? WHERE user_id = ? AND command_id = ? AND status IN ('scheduled', 'draft')"
-    );
-    let result = db::run(
-        db,
-        &sql,
-        vec![db::text(&now), db::text(user_id), db::text(&command.id)],
-    )
-    .await?;
-
-    let changed = db::changes(&result);
     let id_sql = format!("SELECT id, status FROM {table} WHERE user_id = ? AND command_id = ?");
     let effect =
         db::first::<EffectRow>(db, &id_sql, vec![db::text(user_id), db::text(&command.id)])
             .await?
             .ok_or_else(|| ApiError::not_found("Command effect was not found"))?;
-    if effect.status != "cancelled" {
+    if effect.status == "cancelled" {
+        return Ok(json!({
+            "kind": "undo",
+            "provider": provider,
+            "effect_id": effect.id,
+            "status": "cancelled",
+            "already_cancelled": true,
+        }));
+    }
+    if !matches!(effect.status.as_str(), "scheduled" | "draft") {
         return Err(ApiError::conflict("Command effect is no longer undoable"));
     }
 
@@ -96,33 +104,94 @@ pub async fn undo(db: &D1Database, user_id: &str, command: &CommandRow) -> ApiRe
         "provider": provider,
         "effect_id": effect.id,
         "status": "cancelled",
-        "already_cancelled": changed == 0,
+        "already_cancelled": false,
     });
+    let mut command_result = command
+        .result_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = command_result.as_object_mut() {
+        object.insert("undo".to_string(), result.clone());
+    } else {
+        command_result = json!({"value": command_result, "undo": result});
+    }
+    let next_version = command.version + 1;
     let statements = vec![
         db::prepare(
             db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) VALUES (?, ?, ?, 'command.undo', ?, ?)",
+            &format!(
+                "UPDATE {table} SET status = 'cancelled', updated_at = ? WHERE user_id = ? AND command_id = ? AND status IN ('scheduled', 'draft') AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)"
+            ),
+            vec![
+                db::text(&now),
+                db::text(user_id),
+                db::text(&command.id),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(command.version),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "UPDATE commands SET result_json = ?, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?",
+            vec![
+                db::text(&command_result.to_string()),
+                db::number(next_version),
+                db::text(&now),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(command.version),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.undo', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
             vec![
                 db::text(&new_id("aud")?),
                 db::text(user_id),
                 db::optional_text(command.session_id.as_deref()),
-                db::text(&json!({"command_id": command.id, "effect_id": effect.id}).to_string()),
+                db::text(&json!({"command_id": command.id, "effect_id": effect.id, "version": next_version}).to_string()),
                 db::text(&now),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(next_version),
             ],
         )?,
         db::prepare(
             db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) VALUES (?, 'command', ?, ?, ?, ?)",
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
             vec![
                 db::text(user_id),
                 db::text(&command.id),
                 db::optional_text(command.session_id.as_deref()),
-                db::number(command.version + 1),
+                db::number(next_version),
                 db::text(&now),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(next_version),
             ],
         )?,
     ];
-    db.batch(statements).await?;
+    let results = db.batch(statements).await?;
+    if results.get(1).map(db::changes).unwrap_or(0) == 0 {
+        let current =
+            db::first::<EffectRow>(db, &id_sql, vec![db::text(user_id), db::text(&command.id)])
+                .await?;
+        if current
+            .as_ref()
+            .is_some_and(|row| row.status == "cancelled")
+        {
+            return Ok(json!({
+                "kind": "undo",
+                "provider": provider,
+                "effect_id": effect.id,
+                "status": "cancelled",
+                "already_cancelled": true,
+            }));
+        }
+        return Err(ApiError::conflict("Command was already undone or changed"));
+    }
     Ok(result)
 }
 
@@ -131,7 +200,17 @@ async fn create_reminder(
     user_id: &str,
     command: &CommandRow,
     args: &Map<String, Value>,
+    provider_config: ActionProviderConfig,
 ) -> ApiResult<Value> {
+    if !provider_config.enabled("create_reminder") {
+        return Err(providers::disabled("create_reminder"));
+    }
+    if !provider_config.mode().local_effects_allowed() {
+        return Err(providers::unavailable(
+            provider_config.mode(),
+            "create_reminder",
+        ));
+    }
     let title = required_string(args, &["title", "text", "message"], MAX_TITLE, "title")?;
     let due_at = required_string(args, &["due_at", "time", "datetime"], 64, "due_at")?;
     if db::is_expired(due_at) {
@@ -222,7 +301,17 @@ async fn queue_message(
     user_id: &str,
     command: &CommandRow,
     args: &Map<String, Value>,
+    provider_config: ActionProviderConfig,
 ) -> ApiResult<Value> {
+    if !provider_config.enabled("send_message") {
+        return Err(providers::disabled("send_message"));
+    }
+    if !provider_config.mode().local_effects_allowed() {
+        return Err(providers::unavailable(
+            provider_config.mode(),
+            "send_message",
+        ));
+    }
     let body = required_string(args, &["body", "message", "text"], MAX_BODY, "body")?;
     let recipient = required_string(
         args,
@@ -270,7 +359,7 @@ async fn previous_attempt(
 ) -> ApiResult<Option<EffectAttemptRow>> {
     db::first(
         db,
-        "SELECT state, response_json FROM action_attempts WHERE command_id = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT provider, state, response_json FROM action_attempts WHERE command_id = ? ORDER BY created_at DESC LIMIT 1",
         vec![db::text(&command.id)],
     )
     .await

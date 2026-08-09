@@ -58,6 +58,32 @@ messaging/reminder providers are not configured; and deployed D1/E2E, golden
 voice, physical-device, security, and human release gates still require
 execution and approval.
 
+## Current backend follow-up status — 2026-08-10
+
+The current backend completion work has closed the following contract and
+safety gaps without changing the REST + SSE baseline:
+
+- `GET /v1/phone/commands` now provides user-scoped, cursor-paginated command
+  summaries without confirmation tokens or full argument payloads.
+- Pairing status, push dismissal, and persisted action descriptors are now
+  available through additive routes/fields; pairing claims use a unique claim
+  token to prevent same-timestamp double claims.
+- Reminder and message effects now pass through an explicit provider mode and
+  feature flags. Local development may persist D1 effects/queues; external
+  provider mode fails closed until a real adapter is registered. A queued
+  message is never reported as externally sent.
+- Outbox failures update provider attempt state, include 425 in retry handling,
+  cap stale lease retries, and reconcile pre-execution failures. Undo updates
+  the command version and audit/change records atomically and is idempotent.
+- Command arguments reject credential-shaped keys, while JWT and APNs signing
+  material is read from Wrangler secrets rather than ordinary Worker vars.
+
+The remaining backend work is release evidence and external integration, not a
+new transport: deployed D1/E2E against the release binding, a concrete
+reminder/message provider and reminder due scanner, CI contract-diff/security
+review, production observability/APNs verification, and human approval of
+migration/deployment/secret rollout.
+
 ## Decision register
 
 Each decision includes the approved behavior, why it matters, how it is tested,
