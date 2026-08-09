@@ -32,7 +32,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::models::{
     ActionResultRequest, AuthCredentials, CommandEnvelope, CreateAgentRequest, DeviceRequest,
     EventRequest, PairingClaimRequest, PairingCodeRequest, PhoneConfirmRequest, PhoneReplyRequest,
-    PhoneSessionUpdateRequest, ProgressRequest, RefreshRequest, SessionRequest, SkillDef,
+    PhoneSessionUpdateRequest, ProgressRequest, RefreshRequest, SessionRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -799,15 +799,15 @@ async fn list_skills(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Res
 }
 
 async fn upsert_skill(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
-    let _ = require_user(req, env, db).await?;
-    let body: SkillDef = read_json(req).await?;
-    if body.skill_id.trim().is_empty() || body.template.trim().is_empty() {
-        return Err(ApiError::validation("skill_id and template are required"));
-    }
-    json_response(
-        json!({ "skill": skills::upsert_skill(db, &body).await? }),
-        201,
-    )
+    // The registry is global and determines action permissions/risk. Until an
+    // explicit admin-scoped registry exists, authenticated users and agents
+    // may read it but must not overwrite another tenant's policy.
+    let _ = require_user_or_agent(req, env, db).await?;
+    Err(ApiError::new(
+        403,
+        "skill_registry_read_only",
+        "The skill registry is managed by the backend release process",
+    ))
 }
 
 async fn create_session(req: &mut Request, _env: &Env, db: &D1Database) -> ApiResult<Response> {

@@ -11,6 +11,7 @@ use crate::models::{CommandRow, OutboxEventRow};
 
 const BATCH_SIZE: i64 = 20;
 const MAX_ATTEMPTS: i32 = 3;
+const LEASE_SECONDS: i64 = 300;
 
 #[derive(Debug, Deserialize)]
 struct CommandPayload {
@@ -36,6 +37,7 @@ impl ExecutionFailure {
 }
 
 pub async fn drain(db: &D1Database) -> ApiResult<usize> {
+    recover_stale_claims(db).await?;
     let now = db::now_iso();
     let rows: Vec<OutboxEventRow> = db::all(
         db,
@@ -57,6 +59,94 @@ pub async fn drain(db: &D1Database) -> ApiResult<usize> {
         }
     }
     Ok(processed)
+}
+
+/// A Worker can terminate after claiming an outbox row but before it settles
+/// the command. Move leases older than the bounded execution window to the
+/// explicit unknown/retryable state and increment the command version. The
+/// version fence prevents the old invocation from reporting a late success.
+async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
+    let cutoff = db::add_seconds_iso(-LEASE_SECONDS);
+    let rows: Vec<OutboxEventRow> = db::all(
+        db,
+        "SELECT id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, next_attempt_at, last_error, created_at, updated_at FROM outbox_events WHERE state = 'running' AND updated_at <= ? ORDER BY updated_at ASC LIMIT ?",
+        vec![db::text(&cutoff), db::number(BATCH_SIZE)],
+    )
+    .await?;
+
+    for row in rows {
+        let Some(user_id) = row.user_id.as_deref() else {
+            settle_orphan(db, &row, "missing_user_scope").await?;
+            continue;
+        };
+        let Some(command) = commands::get_for_user(db, user_id, &row.aggregate_id).await? else {
+            settle_orphan(db, &row, "command_not_found").await?;
+            continue;
+        };
+        if command.state != "running" {
+            settle_orphan(db, &row, "command_claim_not_running").await?;
+            continue;
+        }
+
+        let now = db::now_iso();
+        let next_version = command.version + 1;
+        let statements = vec![
+            db::prepare(
+                db,
+                "UPDATE commands SET state = 'unknown', error_code = 'worker_lease_expired', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'running' AND version = ? AND updated_at <= ?",
+                vec![
+                    db::number(next_version),
+                    db::text(&now),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::number(command.version),
+                    db::text(&cutoff),
+                ],
+            )?,
+            db::prepare(
+                db,
+                "UPDATE outbox_events SET state = 'retrying', next_attempt_at = ?, last_error = 'worker_lease_expired', updated_at = ? WHERE id = ? AND state = 'running' AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'unknown' AND version = ?)",
+                vec![
+                    db::text(&now),
+                    db::text(&now),
+                    db::text(&row.id),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::number(next_version),
+                ],
+            )?,
+            db::prepare(
+                db,
+                "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.unknown', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'unknown' AND version = ?)",
+                vec![
+                    db::text(&new_id("aud")?),
+                    db::text(user_id),
+                    db::optional_text(command.session_id.as_deref()),
+                    db::text(&json!({"command_id": command.id, "reason": "worker_lease_expired"}).to_string()),
+                    db::text(&now),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::number(next_version),
+                ],
+            )?,
+            db::prepare(
+                db,
+                "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'unknown' AND version = ?)",
+                vec![
+                    db::text(user_id),
+                    db::text(&command.id),
+                    db::optional_text(command.session_id.as_deref()),
+                    db::number(next_version),
+                    db::text(&now),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::number(next_version),
+                ],
+            )?,
+        ];
+        db.batch(statements).await?;
+    }
+    Ok(())
 }
 
 async fn claim(db: &D1Database, row: &OutboxEventRow) -> ApiResult<bool> {
@@ -83,6 +173,16 @@ async fn process_claimed(db: &D1Database, row: &OutboxEventRow) -> ApiResult<()>
     let command = commands::get_for_user(db, user_id, &payload.command_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Command for outbox event was not found"))?;
+
+    if let Some(session_id) = command.session_id.as_deref() {
+        match commands::ensure_session_live(db, user_id, session_id).await {
+            Ok(()) => {}
+            Err(error) if error.status == 404 => {
+                return settle_deleted_command(db, row, user_id, &command).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 
     if matches!(
         command.state.as_str(),
@@ -117,13 +217,14 @@ async fn start_command(db: &D1Database, user_id: &str, command: &CommandRow) -> 
     let statements = vec![
         db::prepare(
             db,
-            "UPDATE commands SET state = 'running', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'unknown') AND version = ?",
+            "UPDATE commands SET state = 'running', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'unknown') AND version = ? AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL))",
             vec![
                 db::number(next_version),
                 db::text(&now),
                 db::text(&command.id),
                 db::text(user_id),
                 db::number(command.version),
+                db::text(user_id),
             ],
         )?,
         db::prepare(
@@ -159,6 +260,64 @@ async fn start_command(db: &D1Database, user_id: &str, command: &CommandRow) -> 
     if result.first().map(db::changes).unwrap_or(0) == 0 {
         return Err(ApiError::conflict("Command is no longer executable"));
     }
+    Ok(())
+}
+
+async fn settle_deleted_command(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    user_id: &str,
+    command: &CommandRow,
+) -> ApiResult<()> {
+    let now = db::now_iso();
+    let next_version = command.version + 1;
+    let statements = vec![
+        db::prepare(
+            db,
+            "UPDATE commands SET state = 'cancelled', error_code = 'session_deleted', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'unknown') AND version = ?",
+            vec![
+                db::number(next_version),
+                db::text(&now),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(command.version),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "UPDATE outbox_events SET state = 'failed', next_attempt_at = NULL, last_error = 'session_deleted', updated_at = ? WHERE id = ? AND state = 'running'",
+            vec![db::text(&now), db::text(&row.id)],
+        )?,
+        db::prepare(
+            db,
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.cancelled', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'cancelled' AND version = ?)",
+            vec![
+                db::text(&new_id("aud")?),
+                db::text(user_id),
+                db::optional_text(command.session_id.as_deref()),
+                db::text(&json!({"command_id": command.id, "reason": "session_deleted"}).to_string()),
+                db::text(&now),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(next_version),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'cancelled' AND version = ?)",
+            vec![
+                db::text(user_id),
+                db::text(&command.id),
+                db::optional_text(command.session_id.as_deref()),
+                db::number(next_version),
+                db::text(&now),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(next_version),
+            ],
+        )?,
+    ];
+    db.batch(statements).await?;
     Ok(())
 }
 

@@ -44,9 +44,10 @@ requires human review.
 - `scripts/architecture-migration-smoke.sh` — passed
 - `scripts/adversarial-data-smoke.sh` — passed for cross-user isolation,
   deleted-resource write barriers, message/retrieval tombstones, lease fencing,
-  and cursor scope
+  event idempotency gates, outbox lease recovery, and cursor scope
 - `scripts/contract-schema-smoke.sh` — passed
-- guarded Outbox SQL was prepared and executed against SQLite — passed
+- guarded event/outbox/confirmation SQL was prepared and executed against
+  SQLite — passed
 - `git diff --check` — passed
 
 ### iOS
@@ -59,9 +60,11 @@ requires human review.
 
 The adversarial review identified and the integrated branches addressed the
 following high-risk issues: sibling migration drift, incomplete deleted-session
-write barriers, un-fenced compatibility-operation lease takeover, unverified
-rate-limit identity, discarded structured retry metadata, incomplete local
-tombstone cleanup, and non-additive checkpoint response requirements.
+write barriers for sessions and commands, non-atomic event idempotency claims,
+un-fenced compatibility-operation lease takeover, permanently stuck Outbox
+leases, unverified rate-limit identity, discarded structured retry metadata,
+incomplete local tombstone cleanup, a globally writable skill registry, an iOS
+permanent-error retry loop, and non-additive checkpoint response requirements.
 
 ## Remaining release gates
 

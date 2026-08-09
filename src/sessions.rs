@@ -391,7 +391,11 @@ pub async fn report_event(
     };
     let event_id = new_id("evt")?;
     let now = db::now_iso();
-    let insert_result = db::run(
+    // The event insert is the idempotency claim. Every later statement in the
+    // same D1 batch is gated on this newly generated event ID. If another
+    // request already owns the (session, idempotency_key) pair, its event ID
+    // differs and no business mutation can run a second time.
+    let mut statements: Vec<D1PreparedStatement> = vec![db::prepare(
         db,
         "INSERT INTO events (id, session_id, status, idempotency_key, payload_json, pushed, summary_text, voice_script, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL) ON CONFLICT(session_id, idempotency_key) DO NOTHING",
         vec![
@@ -407,29 +411,19 @@ pub async fn report_event(
             db::text(&current.id),
             db::text(&current.user_id),
         ],
-    )
-    .await?;
-    if db::changes(&insert_result) == 0 {
-        let previous: EventRow = db::first(
-            db,
-            "SELECT id, pushed, summary_text, voice_script FROM events WHERE session_id = ? AND idempotency_key = ?",
-            vec![db::text(&current.id), db::text(&input.idempotency_key)],
-        )
-        .await?
-        .ok_or_else(|| ApiError::conflict("Event idempotency conflict"))?;
-        return Ok(event_result(previous, session_api(db, current).await?));
-    }
-
-    let mut statements: Vec<D1PreparedStatement> = Vec::new();
+    )?];
     if !resolved.is_empty() {
         statements.push(db::prepare(
             db,
-            "UPDATE actions SET status = 'cancelled', updated_at = ? WHERE session_id = ? AND status IN ('offered', 'pending_confirm', 'awaiting_confirm') AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL)",
+            "UPDATE actions SET status = 'cancelled', updated_at = ? WHERE session_id = ? AND status IN ('offered', 'pending_confirm', 'awaiting_confirm') AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL) AND EXISTS (SELECT 1 FROM events WHERE id = ? AND session_id = ? AND idempotency_key = ?)",
             vec![
                 db::text(&now),
                 db::text(&current.id),
                 db::text(&current.id),
                 db::text(&current.user_id),
+                db::text(&event_id),
+                db::text(&current.id),
+                db::text(&input.idempotency_key),
             ],
         )?);
     }
@@ -448,7 +442,7 @@ pub async fn report_event(
         let action_id = new_id("act")?;
         statements.push(db::prepare(
             db,
-            "INSERT INTO actions (id, session_id, agent_id, action_key, title, risk, confirm_required, status, result_json, claimed_at, expires_at, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, 'offered', NULL, NULL, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL)",
+            "INSERT INTO actions (id, session_id, agent_id, action_key, title, risk, confirm_required, status, result_json, claimed_at, expires_at, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, 'offered', NULL, NULL, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL) AND EXISTS (SELECT 1 FROM events WHERE id = ? AND session_id = ? AND idempotency_key = ?)",
             vec![
                 db::text(&action_id),
                 db::text(&current.id),
@@ -462,12 +456,15 @@ pub async fn report_event(
                 db::text(&now),
                 db::text(&current.id),
                 db::text(&current.user_id),
+                db::text(&event_id),
+                db::text(&current.id),
+                db::text(&input.idempotency_key),
             ],
         )?);
     }
     statements.push(db::prepare(
         db,
-        "UPDATE sessions SET state = ?, summary_text = ?, voice_script = ?, facts_json = ?, available_actions_json = ?, retention_expires_at = COALESCE(retention_expires_at, ?), updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+        "UPDATE sessions SET state = ?, summary_text = ?, voice_script = ?, facts_json = ?, available_actions_json = ?, retention_expires_at = COALESCE(retention_expires_at, ?), updated_at = ? WHERE id = ? AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM events WHERE id = ? AND session_id = ? AND idempotency_key = ?)",
         vec![
             db::text(next_state),
             db::text(&summary),
@@ -481,11 +478,14 @@ pub async fn report_event(
             db::text(&message_retention),
             db::text(&now),
             db::text(&current.id),
+            db::text(&event_id),
+            db::text(&current.id),
+            db::text(&input.idempotency_key),
         ],
     )?);
     statements.push(db::prepare(
         db,
-        "INSERT INTO session_messages (id, user_id, session_id, role, content, metadata_json, command_id, sequence, retention_expires_at, created_at) SELECT ?, ?, ?, 'agent', ?, ?, NULL, COALESCE((SELECT MAX(sequence) + 1 FROM session_messages WHERE user_id = ? AND session_id = ?), 1), ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL)",
+        "INSERT INTO session_messages (id, user_id, session_id, role, content, metadata_json, command_id, sequence, retention_expires_at, created_at) SELECT ?, ?, ?, 'agent', ?, ?, NULL, COALESCE((SELECT MAX(sequence) + 1 FROM session_messages WHERE user_id = ? AND session_id = ?), 1), ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL) AND EXISTS (SELECT 1 FROM events WHERE id = ? AND session_id = ? AND idempotency_key = ?)",
         vec![
             db::text(&message_id),
             db::text(&current.user_id),
@@ -505,6 +505,9 @@ pub async fn report_event(
             db::text(&now),
             db::text(&current.id),
             db::text(&current.user_id),
+            db::text(&event_id),
+            db::text(&current.id),
+            db::text(&input.idempotency_key),
         ],
     )?);
     for retrieval in input.retrievals.as_deref().unwrap_or_default() {
@@ -525,7 +528,7 @@ pub async fn report_event(
         let retrieval_id = new_id("ret")?;
         statements.push(db::prepare(
             db,
-            "INSERT OR IGNORE INTO retrieval_items (id, user_id, session_id, message_id, title, url, snippet, score, content_hash, r2_key, retention_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO retrieval_items (id, user_id, session_id, message_id, title, url, snippet, score, content_hash, r2_key, retention_expires_at, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM events WHERE id = ? AND session_id = ? AND idempotency_key = ?)",
             vec![
                 db::text(&retrieval_id),
                 db::text(&current.user_id),
@@ -539,20 +542,39 @@ pub async fn report_event(
                 db::optional_text(retrieval.r2_key.as_deref()),
                 db::text(&db::add_seconds_iso(RETRIEVAL_RETENTION_SECONDS)),
                 db::text(&now),
+                db::text(&event_id),
+                db::text(&current.id),
+                db::text(&input.idempotency_key),
             ],
         )?);
     }
-    db.batch(statements).await?;
-
-    record_audit(
+    statements.push(db::prepare(
         db,
-        &format!("session.event.{}", input.status),
-        Some(&current.user_id),
-        Some(&current.agent_id),
-        Some(&current.id),
-        serde_json::json!({"event_id": event_id, "actions": action_keys, "retrieval_count": input.retrievals.as_ref().map_or(0, Vec::len), "pushed": pushed}),
-    )
-    .await;
+        "INSERT INTO audit_logs (id, user_id, agent_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM events WHERE id = ? AND session_id = ? AND idempotency_key = ?)",
+        vec![
+            db::text(&new_id("aud")?),
+            db::text(&current.user_id),
+            db::text(&current.agent_id),
+            db::text(&current.id),
+            db::text(&format!("session.event.{}", input.status)),
+            db::text(&serde_json::json!({"event_id": event_id, "actions": action_keys, "retrieval_count": input.retrievals.as_ref().map_or(0, Vec::len), "pushed": pushed}).to_string()),
+            db::text(&now),
+            db::text(&event_id),
+            db::text(&current.id),
+            db::text(&input.idempotency_key),
+        ],
+    )?);
+    let results = db.batch(statements).await?;
+    if results.first().map(db::changes).unwrap_or(0) == 0 {
+        let previous: EventRow = db::first(
+            db,
+            "SELECT id, pushed, summary_text, voice_script FROM events WHERE session_id = ? AND idempotency_key = ?",
+            vec![db::text(&current.id), db::text(&input.idempotency_key)],
+        )
+        .await?
+        .ok_or_else(|| ApiError::conflict("Event idempotency conflict"))?;
+        return Ok(event_result(previous, session_api(db, current).await?));
+    }
     if pushed {
         if let Ok(delivery) = crate::push::notify_user(
             db,
@@ -729,7 +751,7 @@ pub async fn reconcile_waiting_session(db: &D1Database, row: SessionRow) -> ApiR
     if active_keys.is_empty() {
         db::run(
             db,
-            "UPDATE sessions SET state = 'running', available_actions_json = NULL, progress_message = ?, updated_at = ? WHERE id = ? AND state IN ('needs_user', 'awaiting_confirm') AND NOT EXISTS (SELECT 1 FROM actions WHERE session_id = sessions.id AND status IN ('offered', 'pending_confirm', 'awaiting_confirm'))",
+            "UPDATE sessions SET state = 'running', available_actions_json = NULL, progress_message = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND state IN ('needs_user', 'awaiting_confirm') AND NOT EXISTS (SELECT 1 FROM actions WHERE session_id = sessions.id AND status IN ('offered', 'pending_confirm', 'awaiting_confirm'))",
             vec![
                 db::text("No actionable phone decision remains; the agent must emit a new decision."),
                 db::text(&db::now_iso()),
@@ -742,7 +764,7 @@ pub async fn reconcile_waiting_session(db: &D1Database, row: SessionRow) -> ApiR
     if active_keys != stored_keys {
         db::run(
             db,
-            "UPDATE sessions SET available_actions_json = ?, updated_at = ? WHERE id = ?",
+            "UPDATE sessions SET available_actions_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
             vec![
                 db::text(&serde_json::to_string(&active_keys)?),
                 db::text(&db::now_iso()),

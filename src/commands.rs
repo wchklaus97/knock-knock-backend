@@ -280,16 +280,7 @@ async fn validate_scope(
     envelope: &CommandEnvelope,
 ) -> ApiResult<()> {
     if let Some(session_id) = envelope.session_id.as_deref() {
-        if db::first::<crate::models::SessionRow>(
-            db,
-            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-            vec![db::text(session_id), db::text(user_id)],
-        )
-        .await?
-        .is_none()
-        {
-            return Err(ApiError::not_found("Session not found"));
-        }
+        ensure_session_live(db, user_id, session_id).await?;
     }
     if let Some(device_id) = envelope.device_id.as_deref() {
         if db::first::<IdOnly>(
@@ -302,6 +293,24 @@ async fn validate_scope(
         {
             return Err(ApiError::not_found("Device not found"));
         }
+    }
+    Ok(())
+}
+
+pub async fn ensure_session_live(
+    db: &D1Database,
+    user_id: &str,
+    session_id: &str,
+) -> ApiResult<()> {
+    if db::first::<IdOnly>(
+        db,
+        "SELECT id FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+        vec![db::text(session_id), db::text(user_id)],
+    )
+    .await?
+    .is_none()
+    {
+        return Err(ApiError::not_found("Session not found"));
     }
     Ok(())
 }
@@ -478,6 +487,9 @@ pub async fn confirm(
     let command = get_for_user(db, user_id, command_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Command not found"))?;
+    if let Some(session_id) = command.session_id.as_deref() {
+        ensure_session_live(db, user_id, session_id).await?;
+    }
     if command.state != "awaiting_confirmation" {
         return Err(ApiError::conflict("Command is not awaiting confirmation"));
     }
@@ -509,39 +521,46 @@ pub async fn confirm(
     let mut statements = vec![
         db::prepare(
             db,
-            "UPDATE confirmation_tokens SET used_at = ? WHERE id = ? AND user_id = ? AND command_hash = ? AND used_at IS NULL AND expires_at > ?",
+            "UPDATE confirmation_tokens SET used_at = ? WHERE id = ? AND user_id = ? AND command_hash = ? AND used_at IS NULL AND expires_at > ? AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL)))",
             vec![
                 db::text(&now),
                 db::text(&token_row.id),
                 db::text(user_id),
                 db::text(&command.command_hash),
                 db::text(&now),
+                db::text(command_id),
+                db::text(user_id),
+                db::text(user_id),
             ],
         )?,
         db::prepare(
             db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) VALUES (?, ?, ?, 'command.confirm', ?, ?)",
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.confirm', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL)))",
             vec![
                 db::text(&new_id("aud")?),
                 db::text(user_id),
                 db::optional_text(command.session_id.as_deref()),
                 db::text(&json!({"command_id": command_id}).to_string()),
                 db::text(&now),
-            ],
-        )?,
-        db::prepare(
-            db,
-            "UPDATE commands SET state = 'queued', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation'",
-            vec![
-                db::number(next_version),
-                db::text(&now),
                 db::text(command_id),
+                db::text(user_id),
                 db::text(user_id),
             ],
         )?,
         db::prepare(
             db,
-            "INSERT INTO outbox_events (id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, created_at, updated_at) VALUES (?, ?, 'command.execute', ?, ?, ?, 'queued', ?, ?)",
+            "UPDATE commands SET state = 'queued', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL))",
+            vec![
+                db::number(next_version),
+                db::text(&now),
+                db::text(command_id),
+                db::text(user_id),
+                db::text(user_id),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "INSERT INTO outbox_events (id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, created_at, updated_at) SELECT ?, ?, 'command.execute', ?, ?, ?, 'queued', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'queued' AND version = ?)",
             vec![
                 db::text(&outbox_id),
                 db::text(user_id),
@@ -550,17 +569,23 @@ pub async fn confirm(
                 db::text(&format!("confirm:{command_id}")),
                 db::text(&now),
                 db::text(&now),
+                db::text(command_id),
+                db::text(user_id),
+                db::number(next_version),
             ],
         )?,
         db::prepare(
             db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) VALUES (?, 'command', ?, ?, ?, ?)",
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'queued' AND version = ?)",
             vec![
                 db::text(user_id),
                 db::text(command_id),
                 db::optional_text(command.session_id.as_deref()),
                 db::number(next_version),
                 db::text(&now),
+                db::text(command_id),
+                db::text(user_id),
+                db::number(next_version),
             ],
         )?,
     ];
@@ -581,6 +606,9 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
     let command = get_for_user(db, user_id, command_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Command not found"))?;
+    if let Some(session_id) = command.session_id.as_deref() {
+        ensure_session_live(db, user_id, session_id).await?;
+    }
     if !matches!(
         command.state.as_str(),
         "pending" | "validated" | "awaiting_confirmation" | "queued"
@@ -643,6 +671,9 @@ pub async fn undo(db: &D1Database, user_id: &str, command_id: &str) -> ApiResult
     let command = get_for_user(db, user_id, command_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Command not found"))?;
+    if let Some(session_id) = command.session_id.as_deref() {
+        ensure_session_live(db, user_id, session_id).await?;
+    }
     if command.state != "succeeded"
         || !matches!(command.intent.as_str(), "create_reminder" | "create_draft")
     {
