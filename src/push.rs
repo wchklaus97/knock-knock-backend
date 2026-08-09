@@ -70,7 +70,7 @@ pub async fn enqueue_push(
 pub async fn list_pushes(db: &D1Database, user_id: &str, limit: i32) -> ApiResult<Vec<Value>> {
     let rows: Vec<PushRow> = db::all(
         db,
-        "SELECT id, session_id, title, body, voice_script, created_at FROM pushes WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+        "SELECT id, session_id, title, body, voice_script, created_at, read_at, dismissed_at FROM pushes WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
         vec![db::text(user_id), db::number(limit.clamp(1, 200) as i64)],
     )
     .await?;
@@ -84,9 +84,61 @@ pub async fn list_pushes(db: &D1Database, user_id: &str, limit: i32) -> ApiResul
                 "body": row.body,
                 "voice_script": row.voice_script,
                 "created_at": row.created_at,
+                "read_at": row.read_at,
+                "dismissed_at": row.dismissed_at,
             })
         })
         .collect())
+}
+
+pub async fn mark_read(db: &D1Database, user_id: &str, push_id: &str) -> ApiResult<Value> {
+    let now = db::now_iso();
+    db::run(
+        db,
+        "UPDATE pushes SET read_at = COALESCE(read_at, ?), updated_at = ? WHERE id = ? AND user_id = ?",
+        vec![
+            db::text(&now),
+            db::text(&now),
+            db::text(push_id),
+            db::text(user_id),
+        ],
+    )
+    .await?;
+    let row: Option<PushRow> = db::first(
+        db,
+        "SELECT id, session_id, title, body, voice_script, created_at, read_at, dismissed_at FROM pushes WHERE id = ? AND user_id = ?",
+        vec![db::text(push_id), db::text(user_id)],
+    )
+    .await?;
+    let row = row.ok_or_else(|| ApiError::not_found("Push not found"))?;
+    Ok(push_value(row))
+}
+
+pub async fn mark_all_read(db: &D1Database, user_id: &str) -> ApiResult<Value> {
+    let now = db::now_iso();
+    let result = db::run(
+        db,
+        "UPDATE pushes SET read_at = COALESCE(read_at, ?), updated_at = ? WHERE user_id = ? AND read_at IS NULL",
+        vec![db::text(&now), db::text(&now), db::text(user_id)],
+    )
+    .await?;
+    Ok(serde_json::json!({
+        "updated": db::changes(&result),
+        "read_at": now,
+    }))
+}
+
+fn push_value(row: PushRow) -> Value {
+    serde_json::json!({
+        "push_id": row.id,
+        "session_id": row.session_id,
+        "title": row.title,
+        "body": row.body,
+        "voice_script": row.voice_script,
+        "created_at": row.created_at,
+        "read_at": row.read_at,
+        "dismissed_at": row.dismissed_at,
+    })
 }
 
 async fn user_apns_tokens(db: &D1Database, user_id: &str) -> ApiResult<Vec<String>> {

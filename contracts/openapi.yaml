@@ -372,6 +372,25 @@ paths:
                 $ref: '#/components/schemas/SessionDetail'
         default:
           $ref: '#/components/responses/Error'
+    delete:
+      tags: [Phone]
+      operationId: deletePhoneSession
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Session soft-deleted and tombstoned for sync.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, session_id, deleted_at]
+                properties:
+                  ok: { type: boolean, const: true }
+                  session_id: { type: string }
+                  deleted_at: { type: string, format: date-time }
+        default:
+          $ref: '#/components/responses/Error'
   /v1/phone/sessions/{session_id}/history:
     get:
       tags: [Compatibility]
@@ -404,6 +423,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MessagePage'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/sessions/{session_id}/export:
+    get:
+      tags: [Phone]
+      operationId: exportPhoneSession
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Exported session snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, exported_at, session, messages, retrieval_items]
+                properties:
+                  schema_version: { type: integer, const: 1 }
+                  exported_at: { type: string, format: date-time }
+                  session: { $ref: '#/components/schemas/SessionDetail' }
+                  messages:
+                    type: array
+                    items: { $ref: '#/components/schemas/Message' }
+                  retrieval_items:
+                    type: array
+                    items: { $ref: '#/components/schemas/RetrievalItem' }
         default:
           $ref: '#/components/responses/Error'
   /v1/phone/sessions/{session_id}/reply:
@@ -568,7 +613,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/OkResponse'
+                $ref: '#/components/schemas/Push'
         default:
           $ref: '#/components/responses/Error'
   /v1/phone/pushes/read-all:
@@ -581,7 +626,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/OkResponse'
+                type: object
+                required: [updated, read_at]
+                properties:
+                  updated: { type: integer, minimum: 0 }
+                  read_at: { type: string, format: date-time }
         default:
           $ref: '#/components/responses/Error'
   /v1/dev/pushes:
@@ -785,12 +834,14 @@ components:
       properties:
         action_key: { type: string }
         utterance: { type: [string, 'null'] }
+        idempotency_key: { type: [string, 'null'], minLength: 1, maxLength: 200 }
     CompatibilityConfirmRequest:
       type: object
       required: [action_id, confirm]
       properties:
         action_id: { type: string }
         confirm: { type: boolean }
+        idempotency_key: { type: [string, 'null'], minLength: 1, maxLength: 200 }
     Action:
       type: object
       required: [action_id, session_id, action_key, status, risk]
@@ -843,6 +894,9 @@ components:
               type: object
               additionalProperties: true
             voice_script: { type: [string, 'null'] }
+            retrieval_items:
+              type: array
+              items: { $ref: '#/components/schemas/RetrievalItem' }
             expires_at: { type: [string, 'null'], format: date-time }
             archived_at: { type: [string, 'null'], format: date-time }
             deleted_at: { type: [string, 'null'], format: date-time }
@@ -884,12 +938,13 @@ components:
         created_at: { type: string, format: date-time }
     MessagePage:
       type: object
-      required: [items, next_cursor]
+      required: [messages, next_cursor, has_more]
       properties:
-        items:
+        messages:
           type: array
           items: { $ref: '#/components/schemas/Message' }
         next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
     HistoryPage:
       type: object
       required: [entries, next_cursor]
@@ -902,22 +957,27 @@ components:
         next_cursor: { type: [string, 'null'] }
     SessionPage:
       type: object
-      required: [sessions, next_cursor]
+      required: [sessions, next_cursor, has_more]
       properties:
         sessions:
           type: array
           items: { $ref: '#/components/schemas/SessionSummary' }
         next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
     SearchPage:
       type: object
-      required: [items, next_cursor]
+      required: [query, sessions, messages, retrieval_items]
       properties:
-        items:
+        query: { type: string }
+        sessions:
           type: array
-          items:
-            type: object
-            additionalProperties: true
-        next_cursor: { type: [string, 'null'] }
+          items: { $ref: '#/components/schemas/SessionSummary' }
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        retrieval_items:
+          type: array
+          items: { $ref: '#/components/schemas/RetrievalItem' }
     SyncResponse:
       type: object
       required: [cursor, changes, has_more]

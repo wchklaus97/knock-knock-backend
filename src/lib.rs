@@ -4,7 +4,10 @@ mod auth;
 mod commands;
 mod db;
 mod error;
+mod history;
 mod models;
+mod pagination;
+mod phone_operations;
 mod push;
 mod realtime;
 mod sessions;
@@ -27,7 +30,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::models::{
     ActionResultRequest, AuthCredentials, CommandEnvelope, CreateAgentRequest, DeviceRequest,
     EventRequest, PairingClaimRequest, PairingCodeRequest, PhoneConfirmRequest, PhoneReplyRequest,
-    ProgressRequest, RefreshRequest, SessionRequest, SkillDef,
+    PhoneSessionUpdateRequest, ProgressRequest, RefreshRequest, SessionRequest, SkillDef,
 };
 
 #[derive(Debug, Deserialize)]
@@ -135,8 +138,23 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         (Method::Get, ["v1", "phone", "sessions"]) => phone_sessions(&req, &env, &db).await,
         (Method::Get, ["v1", "phone", "sync"]) => phone_sync(&req, &env, &db).await,
         (Method::Get, ["v1", "phone", "events"]) => phone_events(&req, &env, db).await,
+        (Method::Get, ["v1", "phone", "sessions", session_id]) => {
+            phone_session_detail(&req, &env, &db, session_id).await
+        }
+        (Method::Patch, ["v1", "phone", "sessions", session_id]) => {
+            phone_update_session(&mut req, &env, &db, session_id).await
+        }
+        (Method::Delete, ["v1", "phone", "sessions", session_id]) => {
+            phone_delete_session(&req, &env, &db, session_id).await
+        }
         (Method::Get, ["v1", "phone", "sessions", session_id, "history"]) => {
             phone_history(&req, &env, &db, session_id).await
+        }
+        (Method::Get, ["v1", "phone", "sessions", session_id, "messages"]) => {
+            phone_messages(&req, &env, &db, session_id).await
+        }
+        (Method::Get, ["v1", "phone", "sessions", session_id, "export"]) => {
+            phone_export(&req, &env, &db, session_id).await
         }
         (Method::Post, ["v1", "phone", "devices"]) => register_device(&mut req, &env, &db).await,
         (Method::Post, ["v1", "phone", "sessions", session_id, "reply"]) => {
@@ -159,6 +177,13 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         }
         (Method::Post, ["v1", "phone", "commands", command_id, "undo"]) => {
             phone_undo_command(&req, &env, &db, command_id).await
+        }
+        (Method::Get, ["v1", "phone", "search"]) => phone_search(&req, &env, &db).await,
+        (Method::Post, ["v1", "phone", "pushes", push_id, "read"]) => {
+            phone_mark_push_read(&req, &env, &db, push_id).await
+        }
+        (Method::Post, ["v1", "phone", "pushes", "read-all"]) => {
+            phone_mark_all_pushes_read(&req, &env, &db).await
         }
         (Method::Get, ["v1", "dev", "pushes"]) => dev_pushes(&req, &env, &db).await,
         _ => Err(ApiError::not_found("Route not found")),
@@ -844,12 +869,213 @@ async fn submit_action_result(
 
 async fn phone_sessions(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
+    let before = query_value(req, "before")?;
     json_response(
-        json!({
-            "sessions": sessions::list_phone_sessions(db, &user.user_id, query_limit(req, 100)?).await?,
-        }),
+        history::list_sessions(db, &user.user_id, before.as_deref(), query_limit(req, 50)?).await?,
         200,
     )
+}
+
+async fn phone_session_for_user(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    session_id: &str,
+) -> ApiResult<models::SessionRow> {
+    let user = require_user(req, env, db).await?;
+    sessions::get_session(db, session_id)
+        .await?
+        .filter(|row| row.user_id == user.user_id)
+        .ok_or_else(|| ApiError::not_found("Session not found"))
+}
+
+async fn phone_session_detail(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    session_id: &str,
+) -> ApiResult<Response> {
+    let row = phone_session_for_user(req, env, db, session_id).await?;
+    let row = sessions::reconcile_waiting_session(db, row).await?;
+    let retrieval_items = history::list_retrieval(db, &row.user_id, &row.id, 100).await?;
+    let mut detail = sessions::session_api(db, row).await?;
+    if let Value::Object(ref mut object) = detail {
+        object.insert("retrieval_items".into(), Value::Array(retrieval_items));
+    }
+    json_response(detail, 200)
+}
+
+async fn phone_update_session(
+    req: &mut Request,
+    env: &Env,
+    db: &D1Database,
+    session_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let body: PhoneSessionUpdateRequest = read_json(req).await?;
+    if let Some(title) = body.title.as_deref() {
+        if title.trim().len() > 200 {
+            return Err(ApiError::validation("Session title is too long"));
+        }
+    }
+    let existing = sessions::get_session(db, session_id)
+        .await?
+        .filter(|row| row.user_id == user.user_id)
+        .ok_or_else(|| ApiError::not_found("Session not found"))?;
+    let now = db::now_iso();
+    if body.title.is_some() {
+        db::run(
+            db,
+            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+            vec![
+                db::optional_text(body.title.as_deref().map(str::trim)),
+                db::text(&now),
+                db::text(session_id),
+                db::text(&user.user_id),
+            ],
+        )
+        .await?;
+    }
+    if let Some(archived) = body.archived {
+        db::run(
+            db,
+            "UPDATE sessions SET archived_at = ?, updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+            vec![
+                if archived {
+                    db::text(&now)
+                } else {
+                    db::optional_text(None)
+                },
+                db::text(&now),
+                db::text(session_id),
+                db::text(&user.user_id),
+            ],
+        )
+        .await?;
+    }
+    audit::record_audit(
+        db,
+        "phone.session.update",
+        Some(&user.user_id),
+        Some(&existing.agent_id),
+        Some(session_id),
+        json!({"title_changed": body.title.is_some(), "archived": body.archived}),
+    )
+    .await;
+    phone_session_detail(req, env, db, session_id).await
+}
+
+async fn phone_delete_session(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    session_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let existing = sessions::get_session(db, session_id)
+        .await?
+        .filter(|row| row.user_id == user.user_id)
+        .ok_or_else(|| ApiError::not_found("Session not found"))?;
+    let now = db::now_iso();
+    let result = db::run(
+        db,
+        "UPDATE sessions SET deleted_at = ?, archived_at = COALESCE(archived_at, ?), updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+        vec![
+            db::text(&now),
+            db::text(&now),
+            db::text(&now),
+            db::text(session_id),
+            db::text(&user.user_id),
+        ],
+    )
+    .await?;
+    if db::changes(&result) == 0 {
+        return Err(ApiError::conflict("Session is already deleted"));
+    }
+    let tombstone_id = new_id("tombstone")?;
+    db::run(
+        db,
+        "INSERT OR IGNORE INTO sync_tombstones (id, user_id, entity_type, entity_id, deleted_at) VALUES (?, ?, 'session', ?, ?)",
+        vec![
+            db::text(&tombstone_id),
+            db::text(&user.user_id),
+            db::text(session_id),
+            db::text(&now),
+        ],
+    )
+    .await?;
+    audit::record_audit(
+        db,
+        "phone.session.delete",
+        Some(&user.user_id),
+        Some(&existing.agent_id),
+        Some(session_id),
+        json!({"deleted_at": now}),
+    )
+    .await;
+    json_response(
+        json!({"ok": true, "session_id": session_id, "deleted_at": now}),
+        200,
+    )
+}
+
+async fn phone_messages(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    session_id: &str,
+) -> ApiResult<Response> {
+    let row = phone_session_for_user(req, env, db, session_id).await?;
+    let before = query_value(req, "before")?;
+    json_response(
+        history::list_messages(
+            db,
+            &row.user_id,
+            &row.id,
+            before.as_deref(),
+            query_limit(req, 50)?,
+        )
+        .await?,
+        200,
+    )
+}
+
+async fn phone_export(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    session_id: &str,
+) -> ApiResult<Response> {
+    let row = phone_session_for_user(req, env, db, session_id).await?;
+    json_response(history::export_session(db, &row.user_id, &row).await?, 200)
+}
+
+async fn phone_search(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let query = query_value(req, "q")?.unwrap_or_default();
+    json_response(
+        history::search(db, &user.user_id, &query, query_limit(req, 50)?).await?,
+        200,
+    )
+}
+
+async fn phone_mark_push_read(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    push_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    json_response(push::mark_read(db, &user.user_id, push_id).await?, 200)
+}
+
+async fn phone_mark_all_pushes_read(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    json_response(push::mark_all_read(db, &user.user_id).await?, 200)
 }
 
 fn stream_error(error: ApiError) -> worker::Error {
@@ -1049,20 +1275,31 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
     if body.platform.trim().is_empty() {
         return Err(ApiError::validation("platform is required"));
     }
-    let existing = db::first::<IdOnly>(
-        db,
-        "SELECT id FROM devices WHERE user_id = ? AND platform = ? ORDER BY updated_at DESC LIMIT 1",
-        vec![db::text(&user.user_id), db::text(&body.platform)],
-    )
-    .await?;
+    let existing = if let Some(device_id) = body.device_id.as_deref() {
+        db::first::<IdOnly>(
+            db,
+            "SELECT id FROM devices WHERE user_id = ? AND device_id = ? ORDER BY updated_at DESC LIMIT 1",
+            vec![db::text(&user.user_id), db::text(device_id)],
+        )
+        .await?
+    } else {
+        db::first::<IdOnly>(
+            db,
+            "SELECT id FROM devices WHERE user_id = ? AND platform = ? ORDER BY updated_at DESC LIMIT 1",
+            vec![db::text(&user.user_id), db::text(&body.platform)],
+        )
+        .await?
+    };
     let now = db::now_iso();
     let device_id = if let Some(existing) = existing {
         db::run(
             db,
-            "UPDATE devices SET push_token = ?, locale = ?, updated_at = ? WHERE id = ?",
+            "UPDATE devices SET device_id = COALESCE(?, device_id), push_token = ?, locale = ?, timezone = ?, updated_at = ? WHERE id = ?",
             vec![
+                db::optional_text(body.device_id.as_deref()),
                 db::optional_text(body.push_token.as_deref()),
                 db::optional_text(body.locale.as_deref()),
+                db::optional_text(body.timezone.as_deref()),
                 db::text(&now),
                 db::text(&existing._id),
             ],
@@ -1073,13 +1310,15 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
         let id = new_id("dev")?;
         db::run(
             db,
-            "INSERT INTO devices (id, user_id, platform, push_token, locale, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO devices (id, user_id, platform, device_id, push_token, locale, timezone, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 db::text(&id),
                 db::text(&user.user_id),
                 db::text(&body.platform),
+                db::optional_text(body.device_id.as_deref()),
                 db::optional_text(body.push_token.as_deref()),
                 db::optional_text(body.locale.as_deref()),
+                db::optional_text(body.timezone.as_deref()),
                 db::text(&now),
                 db::text(&now),
             ],
@@ -1091,8 +1330,10 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
         json!({
             "device_id": device_id,
             "platform": body.platform,
+            "device_id": body.device_id,
             "push_token": body.push_token,
             "locale": body.locale,
+            "timezone": body.timezone,
         }),
         200,
     )
@@ -1110,10 +1351,30 @@ async fn phone_reply(
         return Err(ApiError::validation("action_key is required"));
     }
     let _ = body.utterance;
-    json_response(
-        sessions::phone_reply(db, &user.user_id, session_id, body.action_key.trim()).await?,
-        200,
+    let idempotency_key = body.idempotency_key.as_deref();
+    if let Some(replayed) =
+        phone_operations::begin(db, &user.user_id, "reply", idempotency_key).await?
+    {
+        return json_response(replayed, 200);
+    }
+    let result = sessions::phone_reply(
+        db,
+        &user.user_id,
+        session_id,
+        body.action_key.trim(),
+        body.utterance.as_deref(),
     )
+    .await;
+    match result {
+        Ok(value) => {
+            phone_operations::complete(db, &user.user_id, "reply", idempotency_key, &value).await?;
+            json_response(value, 200)
+        }
+        Err(error) => {
+            phone_operations::release(db, &user.user_id, "reply", idempotency_key).await;
+            Err(error)
+        }
+    }
 }
 
 async fn phone_confirm(
@@ -1127,17 +1388,31 @@ async fn phone_confirm(
     if body.action_id.trim().is_empty() {
         return Err(ApiError::validation("action_id is required"));
     }
-    json_response(
-        sessions::phone_confirm(
-            db,
-            &user.user_id,
-            session_id,
-            body.action_id.trim(),
-            body.confirm,
-        )
-        .await?,
-        200,
+    let idempotency_key = body.idempotency_key.as_deref();
+    if let Some(replayed) =
+        phone_operations::begin(db, &user.user_id, "confirm", idempotency_key).await?
+    {
+        return json_response(replayed, 200);
+    }
+    let result = sessions::phone_confirm(
+        db,
+        &user.user_id,
+        session_id,
+        body.action_id.trim(),
+        body.confirm,
     )
+    .await;
+    match result {
+        Ok(value) => {
+            phone_operations::complete(db, &user.user_id, "confirm", idempotency_key, &value)
+                .await?;
+            json_response(value, 200)
+        }
+        Err(error) => {
+            phone_operations::release(db, &user.user_id, "confirm", idempotency_key).await;
+            Err(error)
+        }
+    }
 }
 
 async fn phone_create_command(
