@@ -6,6 +6,7 @@ mod db;
 mod error;
 mod history;
 mod models;
+mod outbox;
 mod pagination;
 mod phone_operations;
 mod push;
@@ -65,6 +66,16 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     };
     response.headers_mut().set("X-Request-ID", &request_id)?;
     add_common_headers(response, &env, origin)
+}
+
+/// Runs the durable Outbox worker. The handler only marks a command successful
+/// after the domain/provider adapter returns a result; unavailable external
+/// adapters remain unknown/retryable instead of being reported as success.
+#[event(scheduled)]
+pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    if let Ok(db) = env.d1("DB") {
+        let _ = outbox::drain(&db).await;
+    }
 }
 
 async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
