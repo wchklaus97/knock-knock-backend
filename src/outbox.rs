@@ -556,7 +556,7 @@ async fn finish_failure(
                 db::text(user_id),
                 db::text(&command.id),
                 db::text(provider),
-                db::text(&command.id),
+                db::text(&command.idempotency_key),
                 db::text(if retry { "retrying" } else { "failed" }),
                 db::text(&command.command_hash),
                 db::number(attempt as i64),

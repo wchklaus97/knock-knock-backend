@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BASE_URL="${BASE_URL:-http://127.0.0.1:8787}"
+BASE_URL="${BASE_URL%/}"
+BUCKET="${R2_SMOKE_BUCKET:-knock-knock-local}"
+PERSIST_TO="${R2_SMOKE_PERSIST_TO:-.wrangler/state}"
+PASSWORD="${SMOKE_PASSWORD:-password123}"
+EMAIL="${SMOKE_EMAIL:-r2-download-$(date +%s)-$$@local.test}"
+FIXTURE="${ROOT_DIR}/scripts/fixtures/retrieval-download.txt"
+KEY="retrievals/r2-smoke-${RANDOM}-$$.txt"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+json() {
+  curl --fail-with-body --silent --show-error \
+    -H 'content-type: application/json' "$@"
+}
+
+wrangler r2 object put "${BUCKET}/${KEY}" \
+  --config "${ROOT_DIR}/wrangler.toml" \
+  --local \
+  --persist-to "${PERSIST_TO}" \
+  --file "${FIXTURE}" \
+  --content-type text/plain \
+  --force >/dev/null
+
+auth="$(json -X POST "${BASE_URL}/v1/auth/register" \
+  -d "$(jq -nc --arg email "${EMAIL}" --arg password "${PASSWORD}" \
+    '{email:$email,password:$password}')")"
+token="$(jq -r '.token' <<<"${auth}")"
+user_auth=(-H "authorization: Bearer ${token}")
+agent="$(json "${user_auth[@]}" -X POST "${BASE_URL}/v1/agents" \
+  -d '{"label":"r2-download-smoke"}')"
+agent_key="$(jq -r '.api_key' <<<"${agent}")"
+
+session="$(json -H "x-agent-key: ${agent_key}" -X POST \
+  "${BASE_URL}/v1/sessions" -d '{"skill_id":"deploy.result","title":"R2 download smoke"}')"
+session_id="$(jq -r '.session_id' <<<"${session}")"
+event="$(json -H "x-agent-key: ${agent_key}" -X POST \
+  "${BASE_URL}/v1/sessions/${session_id}/events" \
+  -d "$(jq -nc --arg key "r2-download-event-$(date +%s%N)" --arg r2_key "${KEY}" \
+    '{status:"info",idempotency_key:$key,retrievals:[{title:"R2 smoke source",url:"https://example.com/r2-smoke",snippet:"private fixture",content_hash:$key,r2_key:$r2_key}]}')")"
+
+detail="$(curl --fail-with-body --silent --show-error "${user_auth[@]}" \
+  "${BASE_URL}/v1/phone/sessions/${session_id}")"
+retrieval_id="$(jq -r '.retrieval_items[0].retrieval_id' <<<"${detail}")"
+download_path="$(jq -r '.retrieval_items[0].download_path' <<<"${detail}")"
+test "${download_path}" = "/v1/phone/retrievals/${retrieval_id}/download"
+test "$(jq -r '.retrieval_items[0] | has("r2_key")' <<<"${detail}")" = "false"
+
+curl --fail-with-body --silent --show-error "${user_auth[@]}" \
+  -D "${TMP_DIR}/headers" -o "${TMP_DIR}/body" \
+  "${BASE_URL}${download_path}"
+cmp "${FIXTURE}" "${TMP_DIR}/body"
+grep -qi '^cache-control: private, no-store' "${TMP_DIR}/headers"
+grep -qi '^content-disposition: attachment; filename="retrieval.bin"' "${TMP_DIR}/headers"
+grep -qi '^x-content-type-options: nosniff' "${TMP_DIR}/headers"
+
+other_email="r2-download-other-$(date +%s)-$$@local.test"
+other_auth="$(json -X POST "${BASE_URL}/v1/auth/register" \
+  -d "$(jq -nc --arg email "${other_email}" --arg password "${PASSWORD}" \
+    '{email:$email,password:$password}')")"
+other_token="$(jq -r '.token' <<<"${other_auth}")"
+other_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
+  -H "authorization: Bearer ${other_token}" "${BASE_URL}${download_path}")"
+test "${other_status}" = "404"
+
+wrangler d1 execute DB \
+  --config "${ROOT_DIR}/wrangler.toml" \
+  --local \
+  --persist-to "${PERSIST_TO}" \
+  --command "UPDATE retrieval_items SET retention_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = '${retrieval_id}'" \
+  >/dev/null
+curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+expired_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
+  "${user_auth[@]}" "${BASE_URL}${download_path}")"
+test "${expired_status}" = "404"
+if wrangler r2 object get "${BUCKET}/${KEY}" \
+  --config "${ROOT_DIR}/wrangler.toml" \
+  --local \
+  --persist-to "${PERSIST_TO}" \
+  --file "${TMP_DIR}/deleted" >/dev/null 2>&1; then
+  echo 'expired R2 retrieval object was not deleted' >&2
+  exit 1
+fi
+
+printf '%s\n' 'r2 download smoke passed: R2 stream, metadata, no key disclosure, retention scope, and cross-user isolation'

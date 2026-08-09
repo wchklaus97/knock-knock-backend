@@ -26,6 +26,8 @@ fn category(path: &str) -> (&'static str, i64) {
         ("device", 60)
     } else if path.starts_with("/v1/phone/models") || path.starts_with("/v1/phone/model-fallback") {
         ("model", 30)
+    } else if path.starts_with("/v1/phone/retrievals/") {
+        ("download", 60)
     } else if path.starts_with("/v1/sessions/") || path.starts_with("/v1/actions/") {
         ("agent_event", 120)
     } else {
@@ -104,6 +106,10 @@ mod tests {
         assert_eq!(category("/v1/phone/events"), ("sse", 30));
         assert_eq!(category("/v1/phone/devices"), ("device", 60));
         assert_eq!(category("/v1/phone/models/gemma"), ("model", 30));
+        assert_eq!(
+            category("/v1/phone/retrievals/ret_1/download"),
+            ("download", 60)
+        );
         assert_eq!(
             category("/v1/actions/action_1/result"),
             ("agent_event", 120)

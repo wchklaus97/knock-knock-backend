@@ -48,11 +48,16 @@ durable D1 effects, while message remains explicitly `queued` with
 This checkpoint now includes a generic secret-authenticated HTTPS provider
 adapter for reminder/message delivery, a local reminder due-time scanner with
 deduplicated pushes, a scheduled retention sweep, a staging configuration
-template, and a formal contract-breaking compatibility smoke. The adapter was
-verified against a local mock provider for reminder and confirmed message
-delivery. Provider vendor selection, sandbox evidence, production credentials,
-remote staging D1/Worker E2E, formal security/observability review, and human
-merge/deployment approval remain release work.
+template, and a formal contract-breaking compatibility smoke. The adapter now
+requires delivery/status lifecycle endpoints for enabled production actions;
+external reminder Undo calls the provider cancellation endpoint, and timeout
+results are reconciled through provider status. It was verified against a
+local mock provider for delivery, cancellation, timeout, and status recovery.
+The R2 retrieval download route is also implemented and verified with a local
+R2 object plus cross-user isolation. Provider vendor selection, sandbox
+evidence, production credentials, remote staging D1/Worker/R2 E2E, formal
+security/observability review, and human merge/deployment approval remain
+release work.
 
 ### Active Phase 4/5 completion branch
 
@@ -71,8 +76,15 @@ The follow-up branch now extends the earlier staged work with:
 - `migrations/0012_reminder_delivery_state.sql`, a leaseable local reminder
   notifier, a deduplicated push path, and a scheduled message/retrieval
   retention sweep;
+- an authenticated `GET /v1/phone/retrievals/{retrieval_id}/download` R2
+  stream with retention/ownership checks, no internal-key disclosure, and a
+  dedicated download rate-limit category;
+- provider delivery/status/cancel endpoints with timeout reconciliation and
+  local dynamic smoke scripts in `scripts/r2-download-smoke.sh` and
+  `scripts/provider-lifecycle-smoke.sh`;
 - `wrangler.staging.toml.example`, with staging fail-closed validation and
-  external action flags disabled by default.
+  external action flags disabled by default, plus explicit R2 and provider
+  lifecycle placeholders.
 
 This does not close release by itself. The official WhisperKit package is not
 linked while the app deployment floor remains iOS 15; a signed model artifact,

@@ -26,3 +26,7 @@ binding = "DB"
 database_name = "knock-knock"
 database_id = "REPLACE_WITH_D1_DATABASE_ID"
 migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "REPLACE_WITH_R2_BUCKET_NAME"

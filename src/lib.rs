@@ -91,7 +91,7 @@ pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: Schedu
     if let Ok(db) = env.d1("DB") {
         let _ = outbox::drain(&db, &env).await;
         let _ = reminders::drain_due(&db, &env).await;
-        let _ = history::purge_expired_all(&db).await;
+        let _ = history::purge_expired_all(&db, &env).await;
     }
 }
 
@@ -222,6 +222,9 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         }
         (Method::Get, ["v1", "phone", "models", model_id]) => {
             phone_model_descriptor(&req, &env, &db, model_id).await
+        }
+        (Method::Get, ["v1", "phone", "retrievals", retrieval_id, "download"]) => {
+            phone_retrieval_download(&req, &env, &db, retrieval_id).await
         }
         (Method::Get, ["v1", "phone", "search"]) => phone_search(&req, &env, &db).await,
         (Method::Post, ["v1", "phone", "pushes", push_id, "read"]) => {
@@ -993,7 +996,7 @@ async fn submit_action_result(
 
 async fn phone_sessions(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
-    history::purge_expired(db, &user.user_id).await?;
+    history::purge_expired(db, env, &user.user_id).await?;
     let before = query_value(req, "before")?;
     json_response(
         history::list_sessions(db, &user.user_id, before.as_deref(), query_limit(req, 50)?).await?,
@@ -1143,7 +1146,7 @@ async fn phone_messages(
     session_id: &str,
 ) -> ApiResult<Response> {
     let row = phone_session_for_user(req, env, db, session_id).await?;
-    history::purge_expired(db, &row.user_id).await?;
+    history::purge_expired(db, env, &row.user_id).await?;
     let before = query_value(req, "before")?;
     json_response(
         history::list_messages(
@@ -1165,13 +1168,89 @@ async fn phone_export(
     session_id: &str,
 ) -> ApiResult<Response> {
     let row = phone_session_for_user(req, env, db, session_id).await?;
-    history::purge_expired(db, &row.user_id).await?;
+    history::purge_expired(db, env, &row.user_id).await?;
     json_response(history::export_session(db, &row.user_id, &row).await?, 200)
+}
+
+/// Stream a retrieval payload through an authenticated Worker request. The R2
+/// key never crosses the API boundary and is only resolved after checking the
+/// authenticated user, live session, and retention window in D1.
+async fn phone_retrieval_download(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    retrieval_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let retrieval = history::get_retrieval(db, &user.user_id, retrieval_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Retrieval asset not found"))?;
+    let key = retrieval
+        .r2_key
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::not_found("Retrieval asset is not stored"))?;
+    let bucket = env.bucket("R2").map_err(|_| {
+        ApiError::new(
+            503,
+            "retrieval_storage_unavailable",
+            "Retrieval storage is not configured for this environment",
+        )
+    })?;
+    let object = bucket
+        .get(key)
+        .execute()
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                502,
+                "retrieval_storage_error",
+                "Retrieval storage could not be read",
+            )
+        })?
+        .ok_or_else(|| ApiError::not_found("Retrieval asset not found"))?;
+    let body = object
+        .body()
+        .ok_or_else(|| {
+            ApiError::new(
+                502,
+                "retrieval_storage_error",
+                "Retrieval asset has no body",
+            )
+        })?
+        .response_body()
+        .map_err(|_| {
+            ApiError::new(
+                502,
+                "retrieval_storage_error",
+                "Retrieval asset could not be streamed",
+            )
+        })?;
+
+    let headers = Headers::new();
+    object.write_http_metadata(headers.clone()).map_err(|_| {
+        ApiError::new(
+            502,
+            "retrieval_storage_error",
+            "Retrieval metadata could not be read",
+        )
+    })?;
+    if headers.get("content-type")?.is_none() {
+        headers.set("content-type", "application/octet-stream")?;
+    }
+    // Retrievals can contain sensitive source material. Do not allow a shared
+    // browser/proxy cache to outlive the authenticated request.
+    headers.set("cache-control", "private, no-store")?;
+    headers.set(
+        "content-disposition",
+        "attachment; filename=\"retrieval.bin\"",
+    )?;
+    headers.set("x-content-type-options", "nosniff")?;
+    Ok(Response::from_body(body)?.with_headers(headers))
 }
 
 async fn phone_search(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
-    history::purge_expired(db, &user.user_id).await?;
+    history::purge_expired(db, env, &user.user_id).await?;
     let query = query_value(req, "q")?.unwrap_or_default();
     json_response(
         history::search(db, &user.user_id, &query, query_limit(req, 50)?).await?,
@@ -1309,7 +1388,7 @@ fn sync_cursor(request: &Request) -> ApiResult<Option<i64>> {
 
 async fn phone_sync(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
-    history::purge_expired(db, &user.user_id).await?;
+    history::purge_expired(db, env, &user.user_id).await?;
     let after = sync_cursor(req)?.unwrap_or(0);
     let limit = crate::realtime::normalize_limit(
         query_value(req, "limit")?.and_then(|value| value.parse::<i64>().ok()),
@@ -1767,7 +1846,7 @@ async fn phone_undo_command(
 ) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
     json_response(
-        crate::commands::undo(db, &user.user_id, command_id).await?,
+        crate::commands::undo(env, db, &user.user_id, command_id, providers::load(env)?).await?,
         202,
     )
 }

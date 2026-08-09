@@ -10,7 +10,7 @@ and Phase 0–3 integration baseline
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
 | Backend base | `agent/phase45-completion-backend` | `2977322` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | `f488bff` | local checkpoint; PR not pushed |
+| Backend follow-up | `agent/phase45-completion-backend` | current local checkpoint | not pushed; PR not opened |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
 The branches are intentionally based on the merged Phase 0–3 integration
@@ -37,6 +37,12 @@ approval.
 - Secret-authenticated HTTPS provider webhook adapter for reminders and
   messages, reminder due-time leases/retries, deduplicated reminder pushes,
   and scheduled message/retrieval retention sweep.
+- Authenticated retrieval download streaming from R2 with user/session/expiry
+  checks, private no-store response headers, no `r2_key` disclosure, and
+  retention cleanup that removes R2 objects before deleting D1 metadata.
+- Provider lifecycle operations for external reminders/messages: delivery,
+  status lookup, reminder cancellation for Undo, timeout-to-unknown handling,
+  and idempotent status reconciliation without a duplicate provider delivery.
 - Safe staging Wrangler template with explicit origin/version validation and
   disabled external effects.
 - OpenAPI compatibility baseline and breaking-change smoke for retained v1
@@ -60,8 +66,9 @@ approval.
 
 - `cargo fmt --all -- --check` — passed
 - `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test -q` — 34 passed
+- `cargo test -q` — 35 passed
 - `cargo check --target wasm32-unknown-unknown -q` — passed
+- `worker-build --release` — passed; optimized Worker bundle generated
 - `scripts/architecture-migration-smoke.sh` — passed
 - `scripts/adversarial-data-smoke.sh` — passed for cross-user isolation,
   deleted-resource write barriers, message/retrieval tombstones, lease fencing,
@@ -69,6 +76,12 @@ approval.
 - `scripts/contract-schema-smoke.sh` — passed
 - `scripts/contract-breaking-smoke.sh` — passed
 - `scripts/provider-safety-smoke.sh` — passed
+- `scripts/r2-download-smoke.sh` against an isolated local Worker + local D1/R2
+  — passed for authorized streaming, metadata headers, no key disclosure,
+  retention cleanup, and cross-user isolation.
+- `scripts/provider-lifecycle-smoke.sh` against an isolated local Worker and
+  mock provider — passed for delivery, provider cancellation, timeout,
+  status reconciliation, and idempotent completion.
 - `scripts/production-config-smoke.sh` — passed, including the staging
   template and staging fail-closed checks
 - `scripts/phase45-release-gate.sh` — passed
@@ -110,11 +123,13 @@ permanent-error retry loop, and non-additive checkpoint response requirements.
 These are deliberately not marked as passed:
 
 - independent staging Worker + D1 creation and route-level D1/E2E smoke
-  against that deployed binding;
+  plus R2 bucket creation and route-level D1/R2/E2E smoke against those
+  deployed bindings;
 - the GitHub CI run and paired PR review for this follow-up branch;
 - production provider selection, provider sandbox/contract evidence, real
-  provider credentials, external reminder cancellation/reconciliation policy,
-  and production rollout approval (the generic adapter is implemented);
+  provider credentials, vendor-specific cancellation/reconciliation policy,
+  and production rollout approval (the generic lifecycle adapter is
+  implemented and locally verified);
 - 20–100 example golden voice dataset, ≥95% accuracy evidence, and zero
   high-risk false execution evidence;
 - physical iPhone 13 audio, memory, thermal, crash, and real APNs testing;

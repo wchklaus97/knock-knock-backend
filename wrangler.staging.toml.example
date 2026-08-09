@@ -35,6 +35,10 @@ database_name = "knock-knock-staging"
 database_id = "REPLACE_WITH_STAGING_D1_DATABASE_ID"
 migrations_dir = "migrations"
 
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "REPLACE_WITH_STAGING_R2_BUCKET_NAME"
+
 # Required secret:
 # wrangler secret put SUPABASE_PUBLISHABLE_KEY --config wrangler.staging.toml
 # If AUTH_PROVIDER is changed to legacy for a temporary test, also set:

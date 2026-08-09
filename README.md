@@ -76,12 +76,15 @@ success.
 
 Local action execution uses `ACTION_PROVIDER_MODE=internal` and may enable the
 reminder/message flags for D1-only testing. The Worker also supports a reviewed
-HTTPS webhook adapter in `ACTION_PROVIDER_MODE=external`: set
-`ACTION_REMINDER_URL`/`ACTION_MESSAGE_URL` and the matching secret-only
-`ACTION_REMINDER_TOKEN`/`ACTION_MESSAGE_TOKEN`. Every request carries the
-command idempotency key, and a provider timeout remains `unknown/retryable`.
-Production keeps both action flags disabled until the provider endpoint,
-idempotency behavior, cancellation policy, and credentials are approved. A
+HTTPS webhook adapter in `ACTION_PROVIDER_MODE=external`: set delivery,
+status, and (for reminders) cancellation endpoints, plus the matching
+secret-only `ACTION_REMINDER_TOKEN`/`ACTION_MESSAGE_TOKEN`. Every request
+carries the command idempotency key. A provider timeout becomes
+`unknown/retryable`; the scheduled worker queries the configured status
+endpoint before materializing a success, and local Undo calls the reviewed
+reminder cancellation endpoint before changing D1 state.
+Production keeps both action flags disabled until the provider delivery/status
+endpoints, idempotency behavior, cancellation policy, and credentials are approved. A
 local queued message is never reported as externally delivered.
 
 For a safe remote staging Worker, copy `wrangler.staging.toml.example`, create
@@ -90,6 +93,12 @@ release version, then apply migrations with that config. Staging intentionally
 uses `PUSH_MODE=dev` and `ACTION_PROVIDER_MODE=disabled`; it verifies auth,
 contract, sync, history, and UI behavior without sending real reminders or
 messages. It is not a production substitute.
+
+Retrieval payloads use the `R2` binding. The API returns a user-scoped
+`download_path` and streams the object through
+`GET /v1/phone/retrievals/{retrieval_id}/download`; it never returns the
+internal `r2_key`, uses `private, no-store`, and rejects expired, deleted, or
+cross-user retrievals.
 
 `PUSH_MODE=dev` is not APNs: it writes a push event to the D1-backed development
 inbox for polling. Production uses `PUSH_MODE=both` during rollout so the app

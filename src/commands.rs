@@ -1,13 +1,14 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use worker::D1Database;
+use worker::{D1Database, Env};
 
 use crate::auth::{new_id, sha256_hex};
 use crate::db;
 use crate::error::{ApiError, ApiResult};
 use crate::models::{CommandEnvelope, CommandRow};
 use crate::pagination;
+use crate::providers::ActionProviderConfig;
 
 #[derive(Debug, Deserialize)]
 struct IdOnly {
@@ -786,7 +787,13 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
     Ok(response(&updated, None))
 }
 
-pub async fn undo(db: &D1Database, user_id: &str, command_id: &str) -> ApiResult<Value> {
+pub async fn undo(
+    env: &Env,
+    db: &D1Database,
+    user_id: &str,
+    command_id: &str,
+    provider_config: ActionProviderConfig,
+) -> ApiResult<Value> {
     let command = get_for_user(db, user_id, command_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Command not found"))?;
@@ -798,7 +805,7 @@ pub async fn undo(db: &D1Database, user_id: &str, command_id: &str) -> ApiResult
     {
         return Err(ApiError::conflict("Command is not currently undoable"));
     }
-    let undo = crate::action_effects::undo(db, user_id, &command).await?;
+    let undo = crate::action_effects::undo(env, db, user_id, &command, provider_config).await?;
     let updated = get_for_user(db, user_id, command_id)
         .await?
         .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;

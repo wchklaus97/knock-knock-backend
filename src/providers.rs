@@ -26,6 +26,9 @@ pub struct ActionProviderConfig {
     message_enabled: bool,
     reminder_url: Option<String>,
     message_url: Option<String>,
+    reminder_cancel_url: Option<String>,
+    reminder_status_url: Option<String>,
+    message_status_url: Option<String>,
     reminder_token: Option<String>,
     message_token: Option<String>,
 }
@@ -52,6 +55,21 @@ impl ActionProviderConfig {
         }
     }
 
+    pub fn cancel_endpoint(&self, intent: &str) -> Option<&str> {
+        match intent {
+            "create_reminder" => self.reminder_cancel_url.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn status_endpoint(&self, intent: &str) -> Option<&str> {
+        match intent {
+            "create_reminder" => self.reminder_status_url.as_deref(),
+            "send_message" => self.message_status_url.as_deref(),
+            _ => None,
+        }
+    }
+
     fn token(&self, intent: &str) -> Option<&str> {
         match intent {
             "create_reminder" => self.reminder_token.as_deref(),
@@ -66,7 +84,13 @@ impl ActionProviderConfig {
         }
         ["create_reminder", "send_message"]
             .into_iter()
-            .all(|intent| self.endpoint(intent).is_some() && self.token(intent).is_some())
+            .filter(|intent| self.enabled(intent))
+            .all(|intent| {
+                self.endpoint(intent).is_some()
+                    && self.status_endpoint(intent).is_some()
+                    && self.token(intent).is_some()
+                    && (intent != "create_reminder" || self.cancel_endpoint(intent).is_some())
+            })
     }
 }
 
@@ -116,6 +140,9 @@ pub fn load(env: &Env) -> ApiResult<ActionProviderConfig> {
     let message_enabled = bool_value(env, "ACTION_MESSAGE_ENABLED", enabled_default)?;
     let reminder_url = optional_endpoint(env, "ACTION_REMINDER_URL", &node_env)?;
     let message_url = optional_endpoint(env, "ACTION_MESSAGE_URL", &node_env)?;
+    let reminder_cancel_url = optional_endpoint(env, "ACTION_REMINDER_CANCEL_URL", &node_env)?;
+    let reminder_status_url = optional_endpoint(env, "ACTION_REMINDER_STATUS_URL", &node_env)?;
+    let message_status_url = optional_endpoint(env, "ACTION_MESSAGE_STATUS_URL", &node_env)?;
     let reminder_token = secret_value(env, "ACTION_REMINDER_TOKEN");
     let message_token = secret_value(env, "ACTION_MESSAGE_TOKEN");
 
@@ -124,12 +151,16 @@ pub fn load(env: &Env) -> ApiResult<ActionProviderConfig> {
             "create_reminder",
             reminder_enabled,
             reminder_url.as_deref(),
+            reminder_cancel_url.as_deref(),
+            reminder_status_url.as_deref(),
             reminder_token.as_deref(),
         )?;
         validate_external_action(
             "send_message",
             message_enabled,
             message_url.as_deref(),
+            None,
+            message_status_url.as_deref(),
             message_token.as_deref(),
         )?;
     }
@@ -140,6 +171,9 @@ pub fn load(env: &Env) -> ApiResult<ActionProviderConfig> {
         message_enabled,
         reminder_url,
         message_url,
+        reminder_cancel_url,
+        reminder_status_url,
+        message_status_url,
         reminder_token,
         message_token,
     })
@@ -169,17 +203,23 @@ fn validate_external_action(
     intent: &str,
     enabled: bool,
     endpoint: Option<&str>,
+    cancel_endpoint: Option<&str>,
+    status_endpoint: Option<&str>,
     token: Option<&str>,
 ) -> ApiResult<()> {
     if !enabled {
         return Ok(());
     }
-    if endpoint.is_none() || token.is_none_or(|value| value.trim().is_empty()) {
+    if endpoint.is_none()
+        || status_endpoint.is_none()
+        || (intent == "create_reminder" && cancel_endpoint.is_none())
+        || token.is_none_or(|value| value.trim().is_empty())
+    {
         return Err(ApiError::new(
             500,
             "configuration_error",
             format!(
-                "External {intent} requires its endpoint and secret token before it can be enabled"
+                "External {intent} requires delivery, status, and secret configuration before it can be enabled"
             ),
         ));
     }
@@ -239,6 +279,20 @@ pub struct ProviderResponse {
     pub provider_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDeliveryState {
+    Succeeded,
+    Pending,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderStatus {
+    pub state: ProviderDeliveryState,
+    pub provider_id: Option<String>,
+}
+
 /// Send a minimal, idempotent provider request. The provider is deliberately
 /// an HTTPS webhook boundary rather than a vendor SDK: the backend owns the
 /// command/idempotency contract while a deployment can select a reminder or
@@ -260,6 +314,93 @@ pub async fn send(
     let token = config
         .token(intent)
         .ok_or_else(|| unavailable(config.mode, intent))?;
+    let body = post_json(endpoint, token, intent, idempotency_key, payload).await?;
+    let provider_id = ["provider_id", "id", "message_id", "reminder_id"]
+        .into_iter()
+        .find_map(|key| body.get(key).and_then(Value::as_str).map(str::to_string));
+    Ok(ProviderResponse { provider_id })
+}
+
+/// Ask a provider for the authoritative state of a request whose network
+/// result was unknown. A status endpoint is required for enabled production
+/// actions so a Worker restart cannot silently re-run an external side effect.
+pub async fn status(
+    _env: &Env,
+    config: &ActionProviderConfig,
+    intent: &str,
+    idempotency_key: &str,
+    payload: Value,
+) -> ApiResult<ProviderStatus> {
+    if config.mode != ActionProviderMode::External {
+        return Err(unavailable(config.mode, intent));
+    }
+    let endpoint = config
+        .status_endpoint(intent)
+        .ok_or_else(|| unavailable(config.mode, intent))?;
+    let token = config
+        .token(intent)
+        .ok_or_else(|| unavailable(config.mode, intent))?;
+    let body = post_json(endpoint, token, intent, idempotency_key, payload).await?;
+    let state = body
+        .get("state")
+        .or_else(|| body.get("status"))
+        .or_else(|| body.get("delivery_state"))
+        .and_then(Value::as_str)
+        .map(parse_delivery_state)
+        .unwrap_or(ProviderDeliveryState::Unknown);
+    let provider_id = ["provider_id", "id", "message_id", "reminder_id"]
+        .into_iter()
+        .find_map(|key| body.get(key).and_then(Value::as_str).map(str::to_string));
+    Ok(ProviderStatus { state, provider_id })
+}
+
+/// Cancel a provider-side reversible effect. Local state is changed only
+/// after this operation receives a successful provider response.
+pub async fn cancel(
+    _env: &Env,
+    config: &ActionProviderConfig,
+    intent: &str,
+    idempotency_key: &str,
+    payload: Value,
+) -> ApiResult<ProviderResponse> {
+    if config.mode != ActionProviderMode::External {
+        return Err(unavailable(config.mode, intent));
+    }
+    let endpoint = config
+        .cancel_endpoint(intent)
+        .ok_or_else(|| unavailable(config.mode, intent))?;
+    let token = config
+        .token(intent)
+        .ok_or_else(|| unavailable(config.mode, intent))?;
+    let body = post_json(endpoint, token, intent, idempotency_key, payload).await?;
+    let provider_id = ["provider_id", "id", "reminder_id"]
+        .into_iter()
+        .find_map(|key| body.get(key).and_then(Value::as_str).map(str::to_string));
+    Ok(ProviderResponse { provider_id })
+}
+
+fn parse_delivery_state(raw: &str) -> ProviderDeliveryState {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "succeeded" | "success" | "sent" | "delivered" | "accepted" | "complete" | "completed" => {
+            ProviderDeliveryState::Succeeded
+        }
+        "pending" | "queued" | "processing" | "running" | "scheduled" => {
+            ProviderDeliveryState::Pending
+        }
+        "failed" | "failure" | "rejected" | "cancelled" | "canceled" | "expired" => {
+            ProviderDeliveryState::Failed
+        }
+        _ => ProviderDeliveryState::Unknown,
+    }
+}
+
+async fn post_json(
+    endpoint: &str,
+    token: &str,
+    intent: &str,
+    idempotency_key: &str,
+    payload: Value,
+) -> ApiResult<Value> {
     let headers = Headers::new();
     headers.set("accept", "application/json")?;
     headers.set("content-type", "application/json")?;
@@ -296,18 +437,14 @@ pub async fn send(
         return Err(ApiError::new(
             mapped_status,
             "provider_rejected",
-            "The configured provider rejected the action",
+            "The configured provider rejected the request",
         ));
     }
-    let body = if raw.trim().is_empty() {
+    Ok(if raw.trim().is_empty() {
         json!({})
     } else {
         serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}))
-    };
-    let provider_id = ["provider_id", "id", "message_id", "reminder_id"]
-        .into_iter()
-        .find_map(|key| body.get(key).and_then(Value::as_str).map(str::to_string));
-    Ok(ProviderResponse { provider_id })
+    })
 }
 
 #[cfg(test)]
@@ -339,6 +476,9 @@ mod tests {
             message_enabled: true,
             reminder_url: None,
             message_url: None,
+            reminder_cancel_url: None,
+            reminder_status_url: None,
+            message_status_url: None,
             reminder_token: None,
             message_token: None,
         };
@@ -348,6 +488,9 @@ mod tests {
             message_enabled: true,
             reminder_url: None,
             message_url: None,
+            reminder_cancel_url: None,
+            reminder_status_url: None,
+            message_status_url: None,
             reminder_token: None,
             message_token: None,
         };
@@ -357,6 +500,9 @@ mod tests {
             message_enabled: true,
             reminder_url: None,
             message_url: None,
+            reminder_cancel_url: None,
+            reminder_status_url: None,
+            message_status_url: None,
             reminder_token: None,
             message_token: None,
         };
@@ -374,17 +520,62 @@ mod tests {
 
     #[test]
     fn external_action_requires_endpoint_and_secret() {
-        assert!(validate_external_action("send_message", false, None, None).is_ok());
-        assert!(validate_external_action("send_message", true, None, Some("token")).is_err());
-        assert!(
-            validate_external_action("send_message", true, Some("https://provider"), None).is_err()
-        );
+        assert!(validate_external_action("send_message", false, None, None, None, None).is_ok());
+        assert!(validate_external_action(
+            "send_message",
+            true,
+            None,
+            None,
+            Some("https://status"),
+            Some("token")
+        )
+        .is_err());
         assert!(validate_external_action(
             "send_message",
             true,
             Some("https://provider"),
+            None,
+            Some("https://status"),
+            None
+        )
+        .is_err());
+        assert!(validate_external_action(
+            "send_message",
+            true,
+            Some("https://provider"),
+            None,
+            Some("https://status"),
             Some("token")
         )
         .is_ok());
+        assert!(validate_external_action(
+            "create_reminder",
+            true,
+            Some("https://provider"),
+            Some("https://cancel"),
+            Some("https://status"),
+            Some("token")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn provider_status_values_are_conservative() {
+        assert_eq!(
+            parse_delivery_state("delivered"),
+            ProviderDeliveryState::Succeeded
+        );
+        assert_eq!(
+            parse_delivery_state("processing"),
+            ProviderDeliveryState::Pending
+        );
+        assert_eq!(
+            parse_delivery_state("cancelled"),
+            ProviderDeliveryState::Failed
+        );
+        assert_eq!(
+            parse_delivery_state("vendor-specific"),
+            ProviderDeliveryState::Unknown
+        );
     }
 }

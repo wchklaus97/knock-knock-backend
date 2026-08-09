@@ -25,6 +25,8 @@ struct EffectRow {
     status: String,
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    provider_reminder_id: Option<String>,
 }
 
 /// Execute an action whose effect is fully represented in D1.
@@ -40,9 +42,54 @@ pub async fn execute(
     args: &Map<String, Value>,
     provider_config: ActionProviderConfig,
 ) -> ApiResult<Value> {
+    let mut reconciled_provider_response = None;
     if let Some(previous) = previous_attempt(db, command).await? {
         match previous.state.as_str() {
             "succeeded" => return parse_response(previous.response_json.as_deref()),
+            "running" | "unknown" | "retrying"
+                if provider_config.mode() == providers::ActionProviderMode::External =>
+            {
+                let status = providers::status(
+                    env,
+                    &provider_config,
+                    &command.intent,
+                    &command.idempotency_key,
+                    json!({
+                        "schema_version": 1,
+                        "command_id": command.id,
+                        "idempotency_key": command.idempotency_key,
+                    }),
+                )
+                .await?;
+                match status.state {
+                    providers::ProviderDeliveryState::Succeeded => {
+                        reconciled_provider_response = Some(providers::ProviderResponse {
+                            provider_id: status.provider_id,
+                        });
+                    }
+                    providers::ProviderDeliveryState::Pending => {
+                        return Err(ApiError::new(
+                            503,
+                            "provider_pending",
+                            "The provider has not finished processing this request",
+                        ));
+                    }
+                    providers::ProviderDeliveryState::Failed => {
+                        return Err(ApiError::new(
+                            424,
+                            "provider_failed",
+                            "The provider reported that this request failed",
+                        ));
+                    }
+                    providers::ProviderDeliveryState::Unknown => {
+                        return Err(ApiError::new(
+                            503,
+                            "provider_unknown",
+                            "The provider returned an unknown delivery state",
+                        ));
+                    }
+                }
+            }
             "running" | "unknown" | "retrying"
                 if !provider_config.mode().local_effects_allowed() =>
             {
@@ -61,10 +108,30 @@ pub async fn execute(
 
     match command.intent.as_str() {
         "create_reminder" => {
-            create_reminder(env, db, user_id, command, args, provider_config).await
+            create_reminder(
+                env,
+                db,
+                user_id,
+                command,
+                args,
+                provider_config,
+                reconciled_provider_response,
+            )
+            .await
         }
         "create_draft" => create_draft(db, user_id, command, args).await,
-        "send_message" => queue_message(env, db, user_id, command, args, provider_config).await,
+        "send_message" => {
+            queue_message(
+                env,
+                db,
+                user_id,
+                command,
+                args,
+                provider_config,
+                reconciled_provider_response,
+            )
+            .await
+        }
         _ => Err(ApiError::new(
             422,
             "unsupported_intent",
@@ -78,17 +145,23 @@ pub async fn execute(
 
 /// Cancel a reversible materialized effect. This is intentionally not a
 /// generic SQL delete: the cancelled state remains queryable and auditable.
-pub async fn undo(db: &D1Database, user_id: &str, command: &CommandRow) -> ApiResult<Value> {
+pub async fn undo(
+    env: &Env,
+    db: &D1Database,
+    user_id: &str,
+    command: &CommandRow,
+    provider_config: ActionProviderConfig,
+) -> ApiResult<Value> {
     let (table, default_provider, id_sql) = match command.intent.as_str() {
         "create_reminder" => (
             "reminders",
             "local.reminder",
-            "SELECT id, status, provider FROM reminders WHERE user_id = ? AND command_id = ?",
+            "SELECT id, status, provider, provider_reminder_id FROM reminders WHERE user_id = ? AND command_id = ?",
         ),
         "create_draft" => (
             "drafts",
             "local.draft",
-            "SELECT id, status, NULL AS provider FROM drafts WHERE user_id = ? AND command_id = ?",
+            "SELECT id, status, NULL AS provider, NULL AS provider_reminder_id FROM drafts WHERE user_id = ? AND command_id = ?",
         ),
         _ => return Err(ApiError::conflict("Command is not currently undoable")),
     };
@@ -102,11 +175,6 @@ pub async fn undo(db: &D1Database, user_id: &str, command: &CommandRow) -> ApiRe
         .as_deref()
         .unwrap_or(default_provider)
         .to_string();
-    if command.intent == "create_reminder" && provider != "local.reminder" {
-        return Err(ApiError::conflict(
-            "External reminder cancellation is not configured",
-        ));
-    }
     if effect.status == "cancelled" {
         return Ok(json!({
             "kind": "undo",
@@ -118,6 +186,26 @@ pub async fn undo(db: &D1Database, user_id: &str, command: &CommandRow) -> ApiRe
     }
     if !matches!(effect.status.as_str(), "scheduled" | "draft") {
         return Err(ApiError::conflict("Command effect is no longer undoable"));
+    }
+
+    if command.intent == "create_reminder" && provider != "local.reminder" {
+        let provider_id = effect.provider_reminder_id.as_deref().ok_or_else(|| {
+            ApiError::conflict("External reminder has no provider identifier to cancel")
+        })?;
+        providers::cancel(
+            env,
+            &provider_config,
+            "create_reminder",
+            &format!("{}:cancel", command.idempotency_key),
+            json!({
+                "schema_version": 1,
+                "kind": "reminder",
+                "operation": "cancel",
+                "command_id": command.id,
+                "provider_id": provider_id,
+            }),
+        )
+        .await?;
     }
 
     let result = json!({
@@ -223,6 +311,7 @@ async fn create_reminder(
     command: &CommandRow,
     args: &Map<String, Value>,
     provider_config: ActionProviderConfig,
+    reconciled_provider_response: Option<providers::ProviderResponse>,
 ) -> ApiResult<Value> {
     if !provider_config.enabled("create_reminder") {
         return Err(providers::disabled("create_reminder"));
@@ -234,24 +323,28 @@ async fn create_reminder(
     }
     let external = provider_config.mode() == providers::ActionProviderMode::External;
     let provider_response = if external {
-        Some(
-            providers::send(
-                env,
-                &provider_config,
-                "create_reminder",
-                &command.idempotency_key,
-                json!({
-                    "schema_version": 1,
-                    "kind": "reminder",
-                    "command_id": command.id,
-                    "user_id": user_id,
-                    "title": title,
-                    "due_at": due_at,
-                    "timezone": command.timezone,
-                }),
+        if let Some(response) = reconciled_provider_response {
+            Some(response)
+        } else {
+            Some(
+                providers::send(
+                    env,
+                    &provider_config,
+                    "create_reminder",
+                    &command.idempotency_key,
+                    json!({
+                        "schema_version": 1,
+                        "kind": "reminder",
+                        "command_id": command.id,
+                        "user_id": user_id,
+                        "title": title,
+                        "due_at": due_at,
+                        "timezone": command.timezone,
+                    }),
+                )
+                .await?,
             )
-            .await?,
-        )
+        }
     } else {
         None
     };
@@ -362,6 +455,7 @@ async fn queue_message(
     command: &CommandRow,
     args: &Map<String, Value>,
     provider_config: ActionProviderConfig,
+    reconciled_provider_response: Option<providers::ProviderResponse>,
 ) -> ApiResult<Value> {
     if !provider_config.enabled("send_message") {
         return Err(providers::disabled("send_message"));
@@ -375,23 +469,27 @@ async fn queue_message(
     )?;
     let external = provider_config.mode() == providers::ActionProviderMode::External;
     let provider_response = if external {
-        Some(
-            providers::send(
-                env,
-                &provider_config,
-                "send_message",
-                &command.idempotency_key,
-                json!({
-                    "schema_version": 1,
-                    "kind": "message",
-                    "command_id": command.id,
-                    "user_id": user_id,
-                    "recipient": recipient,
-                    "body": body,
-                }),
+        if let Some(response) = reconciled_provider_response {
+            Some(response)
+        } else {
+            Some(
+                providers::send(
+                    env,
+                    &provider_config,
+                    "send_message",
+                    &command.idempotency_key,
+                    json!({
+                        "schema_version": 1,
+                        "kind": "message",
+                        "command_id": command.id,
+                        "user_id": user_id,
+                        "recipient": recipient,
+                        "body": body,
+                    }),
+                )
+                .await?,
             )
-            .await?,
-        )
+        }
     } else {
         None
     };
@@ -470,13 +568,13 @@ async fn record_attempt(
 ) -> ApiResult<Value> {
     db::run(
         db,
-        "INSERT OR IGNORE INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, 'succeeded', ?, ?, 1, NULL, NULL, ?, ?)",
+        "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, 'succeeded', ?, ?, 1, NULL, NULL, ?, ?) ON CONFLICT(provider, provider_idempotency_key) DO UPDATE SET state = 'succeeded', response_json = excluded.response_json, attempts = MAX(action_attempts.attempts, excluded.attempts), next_attempt_at = NULL, last_error = NULL, updated_at = excluded.updated_at",
         vec![
             db::text(&new_id("attempt")?),
             db::text(user_id),
             db::text(&command.id),
             db::text(provider),
-            db::text(&command.id),
+            db::text(&command.idempotency_key),
             db::text(&command.command_hash),
             db::text(&response.to_string()),
             db::text(&command.created_at),

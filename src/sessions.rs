@@ -569,6 +569,14 @@ pub async fn report_event(
         if content_hash.is_empty() || content_hash.len() > 256 {
             return Err(ApiError::validation("retrieval content_hash is required"));
         }
+        if retrieval.r2_key.as_deref().is_some_and(|key| {
+            let trimmed = key.trim();
+            trimmed.is_empty() || trimmed.len() > 1_024 || trimmed.chars().any(char::is_control)
+        }) {
+            return Err(ApiError::validation(
+                "retrieval r2_key must be a non-empty path of at most 1024 characters",
+            ));
+        }
         let retrieval_id = new_id("ret")?;
         statements.push(db::prepare(
             db,

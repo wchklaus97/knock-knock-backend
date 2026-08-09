@@ -532,6 +532,29 @@ paths:
                     items: { $ref: '#/components/schemas/RetrievalItem' }
         default:
           $ref: '#/components/responses/Error'
+  /v1/phone/retrievals/{retrieval_id}/download:
+    get:
+      tags: [Phone]
+      operationId: downloadPhoneRetrieval
+      description: Streams an authorized R2 retrieval payload. The internal R2 key is never returned.
+      parameters:
+        - name: retrieval_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Retrieval payload streamed from the configured R2 bucket.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+            Content-Disposition:
+              schema: { type: string }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        default:
+          $ref: '#/components/responses/Error'
   /v1/phone/sessions/{session_id}/reply:
     post:
       tags: [Compatibility]
@@ -1186,7 +1209,7 @@ components:
         snippet: { type: [string, 'null'] }
         score: { type: [number, 'null'] }
         content_hash: { type: string }
-        r2_key: { type: [string, 'null'] }
+        download_path: { type: string }
         expires_at: { type: [string, 'null'], format: date-time }
     Push:
       type: object

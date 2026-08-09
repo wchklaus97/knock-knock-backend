@@ -26,3 +26,8 @@ database_name = "knock-knock"
 # Replace with the UUID returned by `wrangler d1 create knock-knock` before deploy.
 database_id = "local"
 migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "knock-knock-local"
+preview_bucket_name = "knock-knock-local"
