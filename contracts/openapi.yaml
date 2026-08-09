@@ -1,0 +1,1118 @@
+openapi: 3.1.0
+info:
+  title: Knock Knock API
+  version: 1.0.0
+  description: |
+    Canonical REST and SSE contract for the Rust Cloudflare Worker and iOS app.
+    Existing phone reply/confirm routes remain compatibility adapters while the
+    CommandEnvelope v1 endpoints are introduced.
+servers:
+  - url: https://api.example.invalid
+    description: Replace with the deployed Worker URL.
+tags:
+  - name: Auth
+  - name: Agent
+  - name: Phone
+  - name: Realtime
+  - name: Compatibility
+security:
+  - bearerAuth: []
+paths:
+  /v1/health:
+    get:
+      tags: [Auth]
+      security: []
+      operationId: getHealth
+      responses:
+        '200':
+          description: Worker health.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /v1/auth/register:
+    post:
+      tags: [Auth]
+      security: []
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthCredentials'
+      responses:
+        '200':
+          description: Authenticated session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthCredentials'
+      responses:
+        '200':
+          description: Authenticated session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      operationId: refresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+                  minLength: 1
+      responses:
+        '200':
+          description: Rotated auth session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      responses:
+        '200':
+          description: Logout accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/agents:
+    get:
+      tags: [Agent]
+      operationId: listAgents
+      responses:
+        '200':
+          description: Agents belonging to the authenticated user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agents]
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Agent'
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      tags: [Agent]
+      operationId: createAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgentRequest'
+      responses:
+        '201':
+          description: Agent created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/agents/me/actions/pending:
+    get:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: listAgentPendingActions
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/Claim'
+      responses:
+        '200':
+          description: Pending actions for the authenticated agent.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [actions]
+                properties:
+                  actions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Action'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/sessions:
+    post:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: createOrResumeSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+      responses:
+        '200':
+          description: Existing or newly created session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetail'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/sessions/{session_id}/events:
+    post:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: reportSessionEvent
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReportEventRequest'
+      responses:
+        '200':
+          description: Event accepted or returned from idempotency replay.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventResult'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/sessions/{session_id}/actions/pending:
+    get:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: listSessionPendingActions
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/Claim'
+      responses:
+        '200':
+          description: Pending actions for one session.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [actions]
+                properties:
+                  actions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Action'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/actions/{action_id}/result:
+    post:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: submitActionResult
+      parameters:
+        - name: action_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActionResultRequest'
+      responses:
+        '200':
+          description: Action result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Action'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/devices:
+    post:
+      tags: [Phone]
+      operationId: registerPhoneDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceRegistration'
+      responses:
+        '200':
+          description: Device registration accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/events:
+    get:
+      tags: [Realtime]
+      operationId: openPhoneEventStream
+      parameters:
+        - $ref: '#/components/parameters/AfterCursor'
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Foreground invalidation stream. It is not the data source.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE frames using the SseEvent contract.
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/sync:
+    get:
+      tags: [Realtime]
+      operationId: syncPhoneChanges
+      parameters:
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        '200':
+          description: Durable changes after a cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/sessions:
+    get:
+      tags: [Phone]
+      operationId: listPhoneSessions
+      parameters:
+        - $ref: '#/components/parameters/BeforeCursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        '200':
+          description: Summary-only session list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPage'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/sessions/{session_id}:
+    get:
+      tags: [Phone]
+      operationId: getPhoneSession
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Full session detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetail'
+        default:
+          $ref: '#/components/responses/Error'
+    patch:
+      tags: [Phone]
+      operationId: updatePhoneSession
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, maxLength: 200 }
+                archived: { type: boolean }
+      responses:
+        '200':
+          description: Updated session detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetail'
+        default:
+          $ref: '#/components/responses/Error'
+    delete:
+      tags: [Phone]
+      operationId: deletePhoneSession
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Session soft-deleted and tombstoned for sync.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, session_id, deleted_at]
+                properties:
+                  ok: { type: boolean, const: true }
+                  session_id: { type: string }
+                  deleted_at: { type: string, format: date-time }
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/sessions/{session_id}/history:
+    get:
+      tags: [Compatibility]
+      operationId: listSessionHistory
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/BeforeCursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        '200':
+          description: Compatibility history view; new clients use messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoryPage'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/sessions/{session_id}/messages:
+    get:
+      tags: [Phone]
+      operationId: listSessionMessages
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/BeforeCursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        '200':
+          description: User-visible conversation messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessagePage'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/sessions/{session_id}/export:
+    get:
+      tags: [Phone]
+      operationId: exportPhoneSession
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Exported session snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, exported_at, session, messages, retrieval_items]
+                properties:
+                  schema_version: { type: integer, const: 1 }
+                  exported_at: { type: string, format: date-time }
+                  session: { $ref: '#/components/schemas/SessionDetail' }
+                  messages:
+                    type: array
+                    items: { $ref: '#/components/schemas/Message' }
+                  retrieval_items:
+                    type: array
+                    items: { $ref: '#/components/schemas/RetrievalItem' }
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/sessions/{session_id}/reply:
+    post:
+      tags: [Compatibility]
+      operationId: replyToSessionCompatibility
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompatibilityReplyRequest'
+      responses:
+        '200':
+          description: Compatibility response mapped to a command.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/sessions/{session_id}/confirm:
+    post:
+      tags: [Compatibility]
+      operationId: confirmSessionCompatibility
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompatibilityConfirmRequest'
+      responses:
+        '200':
+          description: Compatibility confirmation response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/commands:
+    post:
+      tags: [Phone]
+      operationId: createPhoneCommand
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommandEnvelope'
+      responses:
+        '202':
+          description: Command accepted for validation or execution.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/commands/{command_id}:
+    get:
+      tags: [Phone]
+      operationId: getPhoneCommand
+      parameters:
+        - $ref: '#/components/parameters/CommandId'
+      responses:
+        '200':
+          description: Current command status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/commands/{command_id}/confirm:
+    post:
+      tags: [Phone]
+      operationId: confirmPhoneCommand
+      parameters:
+        - $ref: '#/components/parameters/CommandId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmationRequest'
+      responses:
+        '200':
+          description: Command confirmation result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/commands/{command_id}/cancel:
+    post:
+      tags: [Phone]
+      operationId: cancelPhoneCommand
+      parameters:
+        - $ref: '#/components/parameters/CommandId'
+      responses:
+        '200':
+          description: Command cancellation result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/commands/{command_id}/undo:
+    post:
+      tags: [Phone]
+      operationId: undoPhoneCommand
+      parameters:
+        - $ref: '#/components/parameters/CommandId'
+      responses:
+        '202':
+          description: Undo command accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/models/{model_id}:
+    get:
+      tags: [Phone]
+      operationId: getPhoneModelArtifactDescriptor
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      responses:
+        '200':
+          description: Signed model metadata and an artifact URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelArtifactDescriptor'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/search:
+    get:
+      tags: [Phone]
+      operationId: searchPhoneHistory
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+        - $ref: '#/components/parameters/BeforeCursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        '200':
+          description: User-scoped search results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchPage'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/pushes/{push_id}/read:
+    post:
+      tags: [Phone]
+      operationId: markPushRead
+      parameters:
+        - name: push_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Push marked read.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Push'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/phone/pushes/read-all:
+    post:
+      tags: [Phone]
+      operationId: markAllPushesRead
+      responses:
+        '200':
+          description: All user pushes marked read.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [updated, read_at]
+                properties:
+                  ok: { type: boolean, const: true, description: Additive acknowledgement for v1 clients. }
+                  updated: { type: integer, minimum: 0 }
+                  read_at: { type: string, format: date-time }
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/dev/pushes:
+    get:
+      tags: [Compatibility]
+      operationId: listDevelopmentPushes
+      responses:
+        '200':
+          description: Development inbox compatibility endpoint.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pushes]
+                properties:
+                  pushes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Push'
+        default:
+          $ref: '#/components/responses/Error'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    agentKey:
+      type: apiKey
+      in: header
+      name: X-Agent-Key
+  parameters:
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema: { type: string }
+    CommandId:
+      name: command_id
+      in: path
+      required: true
+      schema: { type: string }
+    ModelId:
+      name: model_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+    AfterCursor:
+      name: after
+      in: query
+      required: false
+      schema: { type: string }
+    BeforeCursor:
+      name: before
+      in: query
+      required: false
+      schema: { type: string }
+    PageLimit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 50, default: 50 }
+    Claim:
+      name: claim
+      in: query
+      required: false
+      schema: { type: boolean, default: false }
+  responses:
+    Error:
+      description: Structured API error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    AuthCredentials:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8, maxLength: 128 }
+    AuthSession:
+      type: object
+      required: [access_token, refresh_token, user]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer, minimum: 1 }
+        user:
+          $ref: '#/components/schemas/User'
+    User:
+      type: object
+      required: [id, email]
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+    Agent:
+      type: object
+      required: [agent_id, label]
+      properties:
+        agent_id: { type: string }
+        label: { type: string }
+        host_label: { type: [string, 'null'] }
+    CreateAgentRequest:
+      type: object
+      required: [label]
+      properties:
+        label: { type: string, minLength: 1, maxLength: 100 }
+        host_label: { type: [string, 'null'] }
+    DeviceRegistration:
+      type: object
+      required: [platform, push_token, locale]
+      properties:
+        platform: { type: string, enum: [ios, ios_simulator] }
+        push_token: { type: string, minLength: 1 }
+        locale: { type: string, minLength: 2, maxLength: 32 }
+        timezone: { type: [string, 'null'] }
+        device_id: { type: [string, 'null'] }
+    CreateSessionRequest:
+      type: object
+      required: [skill_id]
+      properties:
+        session_id: { type: [string, 'null'] }
+        skill_id: { type: string }
+        idempotency_key: { type: [string, 'null'] }
+        title: { type: [string, 'null'] }
+        chat_id: { type: [string, 'null'] }
+        facts:
+          type: object
+          additionalProperties: true
+    ReportEventRequest:
+      type: object
+      required: [status, idempotency_key]
+      properties:
+        status: { type: string, enum: [needs_user, succeeded, failed] }
+        idempotency_key: { type: string, minLength: 1 }
+        summary: { type: [string, 'null'] }
+        voice_script: { type: [string, 'null'] }
+        actions:
+          type: array
+          items: { type: string }
+        facts:
+          type: object
+          additionalProperties: true
+        force_push: { type: boolean, default: false }
+        retrievals:
+          type: array
+          items:
+            type: object
+            required: [title, url, content_hash]
+            properties:
+              title: { type: string, minLength: 1, maxLength: 500 }
+              url: { type: string, format: uri, maxLength: 2048 }
+              snippet: { type: [string, 'null'] }
+              score: { type: [number, 'null'] }
+              content_hash: { type: string, minLength: 1, maxLength: 256 }
+              r2_key: { type: [string, 'null'] }
+    CommandEnvelope:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - command_id
+        - intent
+        - args
+        - risk_level
+        - needs_confirmation
+        - idempotency_key
+        - confidence
+        - locale
+        - timezone
+      properties:
+        schema_version: { type: integer, const: 1 }
+        command_id: { type: string, minLength: 1, maxLength: 128 }
+        intent: { type: string, minLength: 1, maxLength: 128 }
+        args:
+          type: object
+          additionalProperties: true
+        risk_level:
+          type: string
+          enum: [low, medium, high, destructive]
+        needs_confirmation: { type: boolean }
+        idempotency_key: { type: string, minLength: 1, maxLength: 200 }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        locale: { type: string, minLength: 2, maxLength: 32 }
+        timezone: { type: string, minLength: 1, maxLength: 64 }
+        device_id: { type: [string, 'null'] }
+        session_id: { type: [string, 'null'] }
+        model_version: { type: [string, 'null'] }
+    CommandState:
+      type: string
+      enum: [pending, validated, awaiting_confirmation, queued, running, succeeded, failed, expired, cancelled, unknown]
+    CommandResponse:
+      type: object
+      required: [command_id, state]
+      properties:
+        command_id: { type: string }
+        state:
+          $ref: '#/components/schemas/CommandState'
+        command:
+          $ref: '#/components/schemas/CommandEnvelope'
+        confirmation_token: { type: [string, 'null'] }
+        result:
+          type: [object, 'null']
+          additionalProperties: true
+        error:
+          type: [object, 'null']
+          additionalProperties: true
+        undo_command_id: { type: [string, 'null'] }
+    ModelArtifactDescriptor:
+      type: object
+      additionalProperties: false
+      required: [model_id, manifest, download_url]
+      properties:
+        model_id: { type: string }
+        manifest:
+          $ref: '#/components/schemas/ModelManifest'
+        download_url: { type: string, format: uri }
+        expires_at: { type: [string, 'null'], format: date-time }
+    ModelManifest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, model_id, model_version, sha256, signature, size_bytes, minimum_capability]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        model_id: { type: string, minLength: 1, maxLength: 128 }
+        model_version: { type: string, pattern: '^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$' }
+        sha256: { type: string, pattern: '^[0-9a-fA-F]{64}$' }
+        signature: { type: string, minLength: 1 }
+        size_bytes: { type: integer, minimum: 1 }
+        minimum_capability: { type: string, minLength: 1, maxLength: 64 }
+    ConfirmationRequest:
+      type: object
+      required: [confirmation_token]
+      properties:
+        confirmation_token: { type: string, minLength: 1 }
+    CompatibilityReplyRequest:
+      type: object
+      required: [action_key]
+      properties:
+        action_key: { type: string }
+        utterance: { type: [string, 'null'] }
+        idempotency_key: { type: [string, 'null'], minLength: 1, maxLength: 200 }
+    CompatibilityConfirmRequest:
+      type: object
+      required: [action_id, confirm]
+      properties:
+        action_id: { type: string }
+        confirm: { type: boolean }
+        idempotency_key: { type: [string, 'null'], minLength: 1, maxLength: 200 }
+    Action:
+      type: object
+      required: [action_id, session_id, action_key, status, risk]
+      properties:
+        action_id: { type: string }
+        session_id: { type: string }
+        action_key: { type: string }
+        title: { type: [string, 'null'] }
+        risk: { type: string, enum: [low, medium, high, destructive] }
+        confirm_required: { type: boolean }
+        status: { type: string }
+        expires_at: { type: [string, 'null'], format: date-time }
+        result:
+          type: [object, 'null']
+          additionalProperties: true
+    ActionResultRequest:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        message: { type: [string, 'null'] }
+        output:
+          type: [object, 'null']
+          additionalProperties: true
+    SessionSummary:
+      type: object
+      required: [session_id, state, updated_at]
+      properties:
+        session_id: { type: string }
+        agent_id: { type: string }
+        skill_id: { type: string }
+        state: { type: string }
+        title: { type: [string, 'null'] }
+        summary_text: { type: [string, 'null'] }
+        progress_status: { type: [string, 'null'] }
+        progress_message: { type: [string, 'null'] }
+        progress_percent: { type: [number, 'null'], minimum: 0, maximum: 100 }
+        available_actions:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        version: { type: integer, minimum: 0 }
+        archived_at: { type: [string, 'null'], format: date-time }
+        deleted_at: { type: [string, 'null'], format: date-time }
+        retention_expires_at: { type: [string, 'null'], format: date-time }
+    SessionDetail:
+      allOf:
+        - $ref: '#/components/schemas/SessionSummary'
+        - type: object
+          properties:
+            facts:
+              type: object
+              additionalProperties: true
+            voice_script: { type: [string, 'null'] }
+            retrieval_items:
+              type: array
+              items: { $ref: '#/components/schemas/RetrievalItem' }
+            expires_at: { type: [string, 'null'], format: date-time }
+            archived_at: { type: [string, 'null'], format: date-time }
+            deleted_at: { type: [string, 'null'], format: date-time }
+    Message:
+      type: object
+      required: [message_id, session_id, role, created_at]
+      properties:
+        message_id: { type: string }
+        session_id: { type: string }
+        role: { type: string, enum: [user, agent, system, tool] }
+        content: { type: string }
+        command_id: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+    RetrievalItem:
+      type: object
+      required: [retrieval_id, title, url, content_hash]
+      properties:
+        retrieval_id: { type: string }
+        session_id: { type: string }
+        message_id: { type: [string, 'null'] }
+        title: { type: string }
+        url: { type: string, format: uri }
+        snippet: { type: [string, 'null'] }
+        score: { type: [number, 'null'] }
+        content_hash: { type: string }
+        r2_key: { type: [string, 'null'] }
+        expires_at: { type: [string, 'null'], format: date-time }
+    Push:
+      type: object
+      required: [push_id, title, body, created_at]
+      properties:
+        push_id: { type: string }
+        session_id: { type: [string, 'null'] }
+        title: { type: string }
+        body: { type: string }
+        voice_script: { type: [string, 'null'] }
+        read_at: { type: [string, 'null'], format: date-time }
+        dismissed_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+    MessagePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean, description: Additive pagination hint; absent in the checkpoint response. }
+    HistoryPage:
+      type: object
+      required: [entries, next_cursor]
+      properties:
+        entries:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        next_cursor: { type: [string, 'null'] }
+    SessionPage:
+      type: object
+      required: [sessions, next_cursor, has_more]
+      properties:
+        sessions:
+          type: array
+          items: { $ref: '#/components/schemas/SessionSummary' }
+        next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
+    SearchPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        query: { type: string }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean, description: Additive pagination hint; absent in the checkpoint response. }
+        sessions:
+          type: array
+          items: { $ref: '#/components/schemas/SessionSummary' }
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        retrieval_items:
+          type: array
+          items: { $ref: '#/components/schemas/RetrievalItem' }
+    SyncResponse:
+      type: object
+      required: [cursor, changes, has_more]
+      properties:
+        cursor: { type: string }
+        has_more: { type: boolean }
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Change'
+    Change:
+      type: object
+      required: [cursor, entity_type, entity_id, version]
+      properties:
+        cursor: { type: string }
+        entity_type: { type: string, enum: [session, message, command, push, retrieval] }
+        entity_id: { type: string }
+        session_id: { type: [string, 'null'] }
+        version: { type: integer, minimum: 0 }
+        deleted_at: { type: [string, 'null'], format: date-time }
+    SseEvent:
+      type: object
+      description: Invalidation payload carried in each non-comment SSE frame. Full data is fetched through REST or /v1/phone/sync.
+      required: [id, type]
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [sync.required, session.updated, message.created, command.updated, push.updated] }
+        session_id: { type: [string, 'null'] }
+        version: { type: integer, minimum: 0 }
+        data:
+          type: object
+          additionalProperties: true
+          description: Legacy checkpoint payload retained for compatibility; canonical v1 sends invalidation fields above.
+    EventResult:
+      type: object
+      required: [event_id, session]
+      properties:
+        event_id: { type: string }
+        session:
+          $ref: '#/components/schemas/SessionDetail'
+        pushed: { type: boolean }
+        deduped: { type: boolean }
+    OkResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean, const: true }
+    HealthResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        api: { type: string }
+        runtime: { type: string }
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, retryable, request_id]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            retryable: { type: boolean }
+            request_id: { type: string }
+            retry_after: { type: [integer, 'null'], minimum: 0 }
+            details:
+              type: object
+              additionalProperties: true

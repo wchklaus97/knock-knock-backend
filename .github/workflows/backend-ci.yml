@@ -27,3 +27,5 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Check Worker target
         run: cargo check --target wasm32-unknown-unknown
+      - name: Run architecture and release preflight
+        run: ./scripts/phase45-release-gate.sh

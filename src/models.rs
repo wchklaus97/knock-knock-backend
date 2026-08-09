@@ -93,6 +93,9 @@ pub struct SessionRow {
     pub expires_at: String,
     pub created_at: String,
     pub updated_at: String,
+    pub archived_at: Option<String>,
+    pub deleted_at: Option<String>,
+    pub retention_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,10 +121,180 @@ pub struct EventRow {
     pub voice_script: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum CommandState {
+    Pending,
+    Validated,
+    AwaitingConfirmation,
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Expired,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum CommandRisk {
+    Low,
+    Medium,
+    High,
+    Destructive,
+}
+
+/// Canonical v1 command envelope. Model output is untrusted input; the
+/// backend must validate every field before it changes state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandEnvelope {
+    pub schema_version: i32,
+    pub command_id: String,
+    pub intent: String,
+    pub args: Map<String, Value>,
+    pub risk_level: String,
+    pub needs_confirmation: bool,
+    pub idempotency_key: String,
+    pub confidence: f64,
+    pub locale: String,
+    pub timezone: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub model_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CommandRow {
+    pub id: String,
+    pub user_id: String,
+    pub device_id: Option<String>,
+    pub session_id: Option<String>,
+    pub schema_version: i32,
+    pub intent: String,
+    pub args_json: String,
+    pub risk_level: String,
+    pub needs_confirmation: i32,
+    pub idempotency_key: String,
+    pub confidence: Option<f64>,
+    pub locale: String,
+    pub timezone: String,
+    pub state: String,
+    pub command_hash: String,
+    pub result_json: Option<String>,
+    pub error_code: Option<String>,
+    pub expires_at: Option<String>,
+    pub model_version: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ConfirmationTokenRow {
+    pub id: String,
+    pub command_id: String,
+    pub user_id: String,
+    pub token_hash: String,
+    pub command_hash: String,
+    pub expires_at: String,
+    pub used_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct SessionMessageRow {
+    pub id: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub metadata_json: String,
+    pub command_id: Option<String>,
+    pub sequence: i64,
+    pub retention_expires_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct RetrievalItemRow {
+    pub id: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub message_id: Option<String>,
+    pub title: String,
+    pub url: String,
+    pub snippet: Option<String>,
+    pub score: Option<f64>,
+    pub content_hash: String,
+    pub r2_key: Option<String>,
+    pub retention_expires_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PhoneChangeRow {
+    pub cursor: i64,
+    pub user_id: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub session_id: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct OutboxEventRow {
+    pub id: String,
+    pub user_id: Option<String>,
+    pub topic: String,
+    pub aggregate_id: String,
+    pub payload_json: String,
+    pub idempotency_key: String,
+    pub state: String,
+    pub attempts: i32,
+    pub next_attempt_at: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ActionAttemptRow {
+    pub id: String,
+    pub user_id: Option<String>,
+    pub command_id: Option<String>,
+    pub action_id: Option<String>,
+    pub provider: String,
+    pub provider_idempotency_key: String,
+    pub state: String,
+    pub request_hash: String,
+    pub response_json: Option<String>,
+    pub attempts: i32,
+    pub next_attempt_at: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Lightweight cursor row used by the phone SSE transport. The session table
 /// is the source of truth, so every agent progress update and phone action
 /// automatically becomes observable without duplicating business events.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SessionStreamRow {
     pub id: String,
     pub updated_at: String,
@@ -145,6 +318,8 @@ pub struct PushRow {
     pub body: String,
     pub voice_script: Option<String>,
     pub created_at: String,
+    pub read_at: Option<String>,
+    pub dismissed_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,6 +399,18 @@ pub struct EventRequest {
     pub actions: Option<Vec<ActionInput>>,
     pub idempotency_key: String,
     pub force_push: Option<bool>,
+    #[serde(default)]
+    pub retrievals: Option<Vec<RetrievalInput>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetrievalInput {
+    pub title: String,
+    pub url: String,
+    pub snippet: Option<String>,
+    pub score: Option<f64>,
+    pub content_hash: String,
+    pub r2_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,20 +422,31 @@ pub struct ActionResultRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct DeviceRequest {
     pub platform: String,
     pub push_token: Option<String>,
     pub locale: Option<String>,
+    pub timezone: Option<String>,
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PhoneReplyRequest {
     pub action_key: String,
     pub utterance: Option<String>,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PhoneConfirmRequest {
     pub action_id: String,
     pub confirm: bool,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PhoneSessionUpdateRequest {
+    pub title: Option<String>,
+    pub archived: Option<bool>,
 }

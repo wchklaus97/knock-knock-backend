@@ -5,6 +5,9 @@ pub struct ApiError {
     pub status: u16,
     pub code: String,
     pub message: String,
+    pub retryable: bool,
+    pub retry_after: Option<u64>,
+    pub request_id: Option<String>,
 }
 
 impl ApiError {
@@ -13,7 +16,21 @@ impl ApiError {
             status,
             code: code.into(),
             message: message.into(),
+            retryable: matches!(status, 408 | 425 | 429) || status >= 500,
+            retry_after: None,
+            request_id: None,
         }
+    }
+
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
+    pub fn rate_limited(retry_after: u64) -> Self {
+        let mut error = Self::new(429, "rate_limited", "Too many requests");
+        error.retry_after = Some(retry_after);
+        error
     }
 
     pub fn validation(message: impl Into<String>) -> Self {
@@ -54,9 +71,16 @@ impl ApiError {
         } else {
             &self.message
         };
+        let request_id = self.request_id.as_deref().unwrap_or("req_unassigned");
         let body = serde_json::json!({
-            "error": self.code,
-            "message": message,
+            "error": {
+                "code": self.code,
+                "message": message,
+                "retryable": self.retryable,
+                "request_id": request_id,
+                "retry_after": self.retry_after,
+                "details": {},
+            },
         });
         Ok(Response::from_json(&body)?.with_status(self.status))
     }
