@@ -29,6 +29,14 @@ create_reminder() {
       '{schema_version:1,command_id:$id,intent:"create_reminder",args:{title:"Provider lifecycle smoke",due_at:"2099-01-01T09:00:00Z"},risk_level:"low",needs_confirmation:false,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC"}')"
 }
 
+create_message() {
+  local command_id="$1"
+  local idempotency_key="$2"
+  json "${user_auth[@]}" -X POST "${BASE_URL}/v1/phone/commands" \
+    -d "$(jq -nc --arg id "${command_id}" --arg idem "${idempotency_key}" \
+      '{schema_version:1,command_id:$id,intent:"send_message",args:{recipient:"+85255550123",body:"Provider lifecycle message smoke"},risk_level:"high",needs_confirmation:true,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC"}')"
+}
+
 success_id="cmd-provider-success-$(date +%s%N)"
 success_key="idem-provider-success-$(date +%s%N)"
 success="$(create_reminder "${success_id}" "${success_key}")"
@@ -58,4 +66,26 @@ final="$(curl --fail-with-body --silent --show-error "${user_auth[@]}" \
 test "$(jq -r '.state' <<<"${final}")" = "succeeded"
 test "$(jq -r '.result.provider_id' <<<"${final}")" != "null"
 
-printf '%s\n' 'provider lifecycle smoke passed: delivery, provider cancellation, timeout, status reconciliation, and idempotent completion'
+message_id="cmd-message-reconcile-$(date +%s%N)"
+message_key="idem-message-reconcile-$(date +%s%N)"
+message="$(create_message "${message_id}" "${message_key}")"
+test "$(jq -r '.state' <<<"${message}")" = "awaiting_confirmation"
+confirmation_token="$(jq -r '.confirmation_token' <<<"${message}")"
+json "${user_auth[@]}" -X POST \
+  "${BASE_URL}/v1/phone/commands/${message_id}/confirm" \
+  -d "$(jq -nc --arg token "${confirmation_token}" '{confirmation_token:$token}')" >/dev/null
+curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+message_first="$(curl --fail-with-body --silent --show-error "${user_auth[@]}" \
+  "${BASE_URL}/v1/phone/commands/${message_id}")"
+test "$(jq -r '.state' <<<"${message_first}")" = "unknown"
+test "$(jq -r '.error.code' <<<"${message_first}")" = "provider_pending"
+sleep "${WAIT_SECONDS}"
+curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+message_final="$(curl --fail-with-body --silent --show-error "${user_auth[@]}" \
+  "${BASE_URL}/v1/phone/commands/${message_id}")"
+test "$(jq -r '.state' <<<"${message_final}")" = "succeeded"
+test "$(jq -r '.result.delivery_state' <<<"${message_final}")" = "sent"
+test "$(jq -r '.result.external_delivery' <<<"${message_final}")" = "sent"
+test "$(jq -r '.result.provider_id' <<<"${message_final}")" != "null"
+
+printf '%s\n' 'provider lifecycle smoke passed: reminder delivery/cancellation, reminder status reconciliation, asynchronous message delivery, and idempotent completion'

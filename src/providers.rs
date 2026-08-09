@@ -301,6 +301,7 @@ pub fn scoped_action_idempotency_key(user_id: &str, intent: &str, command_key: &
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
     pub provider_id: Option<String>,
+    pub state: ProviderDeliveryState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,10 +340,11 @@ pub async fn send(
         .token(intent)
         .ok_or_else(|| unavailable(config.mode, intent))?;
     let body = post_json(endpoint, token, intent, idempotency_key, payload).await?;
-    let provider_id = ["provider_id", "id", "message_id", "reminder_id"]
-        .into_iter()
-        .find_map(|key| body.get(key).and_then(Value::as_str).map(str::to_string));
-    Ok(ProviderResponse { provider_id })
+    let provider_id = provider_id_from_body(&body, intent);
+    Ok(ProviderResponse {
+        provider_id,
+        state: send_delivery_state(intent, &body),
+    })
 }
 
 /// Ask a provider for the authoritative state of a request whose network
@@ -370,11 +372,9 @@ pub async fn status(
         .or_else(|| body.get("status"))
         .or_else(|| body.get("delivery_state"))
         .and_then(Value::as_str)
-        .map(parse_delivery_state)
+        .map(|raw| status_delivery_state(intent, raw))
         .unwrap_or(ProviderDeliveryState::Unknown);
-    let provider_id = ["provider_id", "id", "message_id", "reminder_id"]
-        .into_iter()
-        .find_map(|key| body.get(key).and_then(Value::as_str).map(str::to_string));
+    let provider_id = provider_id_from_body(&body, intent);
     Ok(ProviderStatus { state, provider_id })
 }
 
@@ -397,18 +397,73 @@ pub async fn cancel(
         .token(intent)
         .ok_or_else(|| unavailable(config.mode, intent))?;
     let body = post_json(endpoint, token, intent, idempotency_key, payload).await?;
-    let provider_id = ["provider_id", "id", "reminder_id"]
-        .into_iter()
-        .find_map(|key| body.get(key).and_then(Value::as_str).map(str::to_string));
-    Ok(ProviderResponse { provider_id })
+    let provider_id = provider_id_from_body(&body, intent);
+    Ok(ProviderResponse {
+        provider_id,
+        state: ProviderDeliveryState::Succeeded,
+    })
+}
+
+fn provider_id_from_body(body: &Value, intent: &str) -> Option<String> {
+    let keys: &[&str] = if intent == "send_message" {
+        &["provider_id", "id", "message_id"]
+    } else {
+        &["provider_id", "id", "reminder_id"]
+    };
+    keys.iter().find_map(|key| {
+        body.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn send_delivery_state(intent: &str, body: &Value) -> ProviderDeliveryState {
+    let raw = body
+        .get("state")
+        .or_else(|| body.get("status"))
+        .or_else(|| body.get("delivery_state"))
+        .and_then(Value::as_str);
+    let Some(raw) = raw else {
+        // A reminder delivery endpoint creates a scheduled provider resource;
+        // a message endpoint may only have accepted an asynchronous send.
+        return if intent == "send_message" {
+            ProviderDeliveryState::Pending
+        } else {
+            ProviderDeliveryState::Succeeded
+        };
+    };
+    if intent == "create_reminder"
+        && matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "accepted" | "scheduled"
+        )
+    {
+        return ProviderDeliveryState::Succeeded;
+    }
+    parse_delivery_state(raw)
+}
+
+fn status_delivery_state(intent: &str, raw: &str) -> ProviderDeliveryState {
+    if intent == "create_reminder"
+        && matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "accepted" | "scheduled"
+        )
+    {
+        ProviderDeliveryState::Succeeded
+    } else {
+        parse_delivery_state(raw)
+    }
 }
 
 fn parse_delivery_state(raw: &str) -> ProviderDeliveryState {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "succeeded" | "success" | "sent" | "delivered" | "accepted" | "complete" | "completed" => {
+        "succeeded" | "success" | "sent" | "delivered" | "complete" | "completed" => {
             ProviderDeliveryState::Succeeded
         }
-        "pending" | "queued" | "processing" | "running" | "scheduled" => {
+        "accepted" | "pending" | "queued" | "processing" | "running" | "scheduled" => {
             ProviderDeliveryState::Pending
         }
         "failed" | "failure" | "rejected" | "cancelled" | "canceled" | "expired" => {
@@ -594,12 +649,53 @@ mod tests {
             ProviderDeliveryState::Pending
         );
         assert_eq!(
+            parse_delivery_state("accepted"),
+            ProviderDeliveryState::Pending
+        );
+        assert_eq!(
             parse_delivery_state("cancelled"),
             ProviderDeliveryState::Failed
         );
         assert_eq!(
             parse_delivery_state("vendor-specific"),
             ProviderDeliveryState::Unknown
+        );
+    }
+
+    #[test]
+    fn asynchronous_message_acceptance_requires_status_reconciliation() {
+        assert_eq!(
+            send_delivery_state("send_message", &json!({"provider_id": "msg-1"})),
+            ProviderDeliveryState::Pending
+        );
+        assert_eq!(
+            send_delivery_state(
+                "send_message",
+                &json!({"provider_id": "msg-1", "state": "accepted"})
+            ),
+            ProviderDeliveryState::Pending
+        );
+        assert_eq!(
+            send_delivery_state(
+                "send_message",
+                &json!({"provider_id": "msg-1", "state": "delivered"})
+            ),
+            ProviderDeliveryState::Succeeded
+        );
+    }
+
+    #[test]
+    fn scheduled_reminder_response_is_success_only_as_a_provider_resource() {
+        assert_eq!(
+            send_delivery_state("create_reminder", &json!({"provider_id": "rem-1"})),
+            ProviderDeliveryState::Succeeded
+        );
+        assert_eq!(
+            send_delivery_state(
+                "create_reminder",
+                &json!({"provider_id": "rem-1", "state": "scheduled"})
+            ),
+            ProviderDeliveryState::Succeeded
         );
     }
 

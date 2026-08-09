@@ -68,6 +68,7 @@ pub async fn execute(
                     providers::ProviderDeliveryState::Succeeded => {
                         reconciled_provider_response = Some(providers::ProviderResponse {
                             provider_id: status.provider_id,
+                            state: status.state,
                         });
                     }
                     providers::ProviderDeliveryState::Pending => {
@@ -78,6 +79,16 @@ pub async fn execute(
                         ));
                     }
                     providers::ProviderDeliveryState::Failed => {
+                        if command.intent == "send_message" {
+                            mark_message_delivery(
+                                db,
+                                user_id,
+                                &command.id,
+                                "failed",
+                                status.provider_id.as_deref(),
+                            )
+                            .await?;
+                        }
                         return Err(ApiError::new(
                             424,
                             "provider_failed",
@@ -372,6 +383,23 @@ async fn create_reminder(
     } else {
         None
     };
+    if let Some(response) = provider_response.as_ref() {
+        if let Some(error) = provider_state_error("reminder", response.state) {
+            return Err(error);
+        }
+    }
+    if external
+        && provider_response
+            .as_ref()
+            .and_then(|response| response.provider_id.as_deref())
+            .is_none()
+    {
+        return Err(ApiError::new(
+            503,
+            "provider_missing_id",
+            "External reminder provider did not return a provider identifier",
+        ));
+    }
     if !external && !provider_config.mode().local_effects_allowed() {
         return Err(providers::unavailable(
             provider_config.mode(),
@@ -535,7 +563,17 @@ async fn queue_message(
     } else {
         "internal.outbox"
     };
-    let delivery_state = if external { "sent" } else { "queued" };
+    let provider_state = provider_response
+        .as_ref()
+        .map(|response| response.state)
+        .unwrap_or(providers::ProviderDeliveryState::Succeeded);
+    let delivery_state = match provider_state {
+        providers::ProviderDeliveryState::Succeeded => "sent",
+        providers::ProviderDeliveryState::Failed => "failed",
+        providers::ProviderDeliveryState::Pending | providers::ProviderDeliveryState::Unknown => {
+            "queued"
+        }
+    };
     db::run(
         db,
         "INSERT OR IGNORE INTO outbound_messages (id, user_id, command_id, session_id, recipient, body, provider, delivery_state, provider_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -558,6 +596,24 @@ async fn queue_message(
         ],
     )
     .await?;
+    if external {
+        db::run(
+            db,
+            "UPDATE outbound_messages SET delivery_state = ?, provider_message_id = COALESCE(?, provider_message_id), updated_at = ? WHERE user_id = ? AND command_id = ?",
+            vec![
+                db::text(delivery_state),
+                db::optional_text(
+                    provider_response
+                        .as_ref()
+                        .and_then(|value| value.provider_id.as_deref()),
+                ),
+                db::text(&now),
+                db::text(user_id),
+                db::text(&command.id),
+            ],
+        )
+        .await?;
+    }
     let effect: EffectRow = db::first(
         db,
         "SELECT id, delivery_state AS status, NULL AS provider FROM outbound_messages WHERE user_id = ? AND command_id = ?",
@@ -570,10 +626,80 @@ async fn queue_message(
         "message_id": effect.id,
         "delivery_state": effect.status,
         "provider": provider,
-        "external_delivery": if external { "accepted" } else { "not_configured" },
+        "external_delivery": if !external {
+            "not_configured"
+        } else if provider_state == providers::ProviderDeliveryState::Succeeded {
+            "sent"
+        } else if provider_state == providers::ProviderDeliveryState::Failed {
+            "rejected"
+        } else {
+            "accepted"
+        },
         "provider_id": provider_response.as_ref().and_then(|value| value.provider_id.clone()),
     });
+    if external && provider_state != providers::ProviderDeliveryState::Succeeded {
+        return Err(provider_state_error("message", provider_state)
+            .expect("non-success provider state must have an error"));
+    }
     record_attempt(db, user_id, command, provider, &response).await
+}
+
+fn provider_state_error(effect: &str, state: providers::ProviderDeliveryState) -> Option<ApiError> {
+    match (effect, state) {
+        (_, providers::ProviderDeliveryState::Succeeded) => None,
+        ("message", providers::ProviderDeliveryState::Pending) => Some(ApiError::new(
+            503,
+            "provider_pending",
+            "The provider accepted the message but has not finished processing it",
+        )),
+        (_, providers::ProviderDeliveryState::Pending) => Some(ApiError::new(
+            503,
+            "provider_pending",
+            "The provider has not finished processing this request",
+        )),
+        ("message", providers::ProviderDeliveryState::Failed) => Some(ApiError::new(
+            424,
+            "provider_failed",
+            "The provider reported that the message was not sent",
+        )),
+        (_, providers::ProviderDeliveryState::Failed) => Some(ApiError::new(
+            424,
+            "provider_failed",
+            "The provider reported that this request failed",
+        )),
+        ("message", providers::ProviderDeliveryState::Unknown) => Some(ApiError::new(
+            503,
+            "provider_unknown",
+            "The provider returned an unknown message delivery state",
+        )),
+        (_, providers::ProviderDeliveryState::Unknown) => Some(ApiError::new(
+            503,
+            "provider_unknown",
+            "The provider returned an unknown delivery state",
+        )),
+    }
+}
+
+async fn mark_message_delivery(
+    db: &D1Database,
+    user_id: &str,
+    command_id: &str,
+    delivery_state: &str,
+    provider_id: Option<&str>,
+) -> ApiResult<()> {
+    db::run(
+        db,
+        "UPDATE outbound_messages SET delivery_state = ?, provider_message_id = COALESCE(?, provider_message_id), updated_at = ? WHERE user_id = ? AND command_id = ?",
+        vec![
+            db::text(delivery_state),
+            db::optional_text(provider_id),
+            db::text(&db::now_iso()),
+            db::text(user_id),
+            db::text(command_id),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 async fn previous_attempt(
@@ -717,5 +843,24 @@ mod tests {
         let args = serde_json::from_value::<Map<String, Value>>(json!({"body": "x".repeat(9_000)}))
             .unwrap();
         assert!(required_string(&args, &["body"], MAX_BODY, "body").is_err());
+    }
+
+    #[test]
+    fn external_provider_non_success_states_are_retryable_or_explicit_failure() {
+        assert_eq!(
+            provider_state_error("reminder", providers::ProviderDeliveryState::Pending)
+                .unwrap()
+                .code,
+            "provider_pending"
+        );
+        assert_eq!(
+            provider_state_error("message", providers::ProviderDeliveryState::Failed)
+                .unwrap()
+                .status,
+            424
+        );
+        assert!(
+            provider_state_error("reminder", providers::ProviderDeliveryState::Succeeded).is_none()
+        );
     }
 }
