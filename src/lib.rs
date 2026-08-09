@@ -906,6 +906,7 @@ async fn submit_action_result(
 
 async fn phone_sessions(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
+    history::purge_expired(db, &user.user_id).await?;
     let before = query_value(req, "before")?;
     json_response(
         history::list_sessions(db, &user.user_id, before.as_deref(), query_limit(req, 50)?).await?,
@@ -922,7 +923,7 @@ async fn phone_session_for_user(
     let user = require_user(req, env, db).await?;
     sessions::get_session(db, session_id)
         .await?
-        .filter(|row| row.user_id == user.user_id)
+        .filter(|row| row.user_id == user.user_id && row.deleted_at.is_none())
         .ok_or_else(|| ApiError::not_found("Session not found"))
 }
 
@@ -957,39 +958,30 @@ async fn phone_update_session(
     }
     let existing = sessions::get_session(db, session_id)
         .await?
-        .filter(|row| row.user_id == user.user_id)
+        .filter(|row| row.user_id == user.user_id && row.deleted_at.is_none())
         .ok_or_else(|| ApiError::not_found("Session not found"))?;
     let now = db::now_iso();
-    if body.title.is_some() {
-        db::run(
-            db,
-            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-            vec![
-                db::optional_text(body.title.as_deref().map(str::trim)),
-                db::text(&now),
-                db::text(session_id),
-                db::text(&user.user_id),
-            ],
-        )
-        .await?;
+    if body.title.is_none() && body.archived.is_none() {
+        return phone_session_detail(req, env, db, session_id).await;
     }
-    if let Some(archived) = body.archived {
-        db::run(
-            db,
-            "UPDATE sessions SET archived_at = ?, updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-            vec![
-                if archived {
-                    db::text(&now)
-                } else {
-                    db::optional_text(None)
-                },
-                db::text(&now),
-                db::text(session_id),
-                db::text(&user.user_id),
-            ],
-        )
-        .await?;
-    }
+    db::run(
+        db,
+        "UPDATE sessions SET title = CASE WHEN ? = 1 THEN ? ELSE title END, archived_at = CASE WHEN ? = 1 THEN ? ELSE archived_at END, updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+        vec![
+            db::number(if body.title.is_some() { 1 } else { 0 }),
+            db::optional_text(body.title.as_deref().map(str::trim)),
+            db::number(if body.archived.is_some() { 1 } else { 0 }),
+            match body.archived {
+                Some(true) => db::text(&now),
+                Some(false) => db::optional_text(None),
+                None => db::optional_text(None),
+            },
+            db::text(&now),
+            db::text(session_id),
+            db::text(&user.user_id),
+        ],
+    )
+    .await?;
     audit::record_audit(
         db,
         "phone.session.update",
@@ -1014,33 +1006,34 @@ async fn phone_delete_session(
         .filter(|row| row.user_id == user.user_id)
         .ok_or_else(|| ApiError::not_found("Session not found"))?;
     let now = db::now_iso();
-    let result = db::run(
-        db,
-        "UPDATE sessions SET deleted_at = ?, archived_at = COALESCE(archived_at, ?), updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-        vec![
-            db::text(&now),
-            db::text(&now),
-            db::text(&now),
-            db::text(session_id),
-            db::text(&user.user_id),
-        ],
-    )
-    .await?;
-    if db::changes(&result) == 0 {
+    let tombstone_id = new_id("tombstone")?;
+    let statements = vec![
+        db::prepare(
+            db,
+            "UPDATE sessions SET deleted_at = ?, archived_at = COALESCE(archived_at, ?), updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+            vec![
+                db::text(&now),
+                db::text(&now),
+                db::text(&now),
+                db::text(session_id),
+                db::text(&user.user_id),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "INSERT OR IGNORE INTO sync_tombstones (id, user_id, entity_type, entity_id, deleted_at) VALUES (?, ?, 'session', ?, ?)",
+            vec![
+                db::text(&tombstone_id),
+                db::text(&user.user_id),
+                db::text(session_id),
+                db::text(&now),
+            ],
+        )?,
+    ];
+    let results = db.batch(statements).await?;
+    if results.first().map(db::changes).unwrap_or(0) == 0 {
         return Err(ApiError::conflict("Session is already deleted"));
     }
-    let tombstone_id = new_id("tombstone")?;
-    db::run(
-        db,
-        "INSERT OR IGNORE INTO sync_tombstones (id, user_id, entity_type, entity_id, deleted_at) VALUES (?, ?, 'session', ?, ?)",
-        vec![
-            db::text(&tombstone_id),
-            db::text(&user.user_id),
-            db::text(session_id),
-            db::text(&now),
-        ],
-    )
-    .await?;
     audit::record_audit(
         db,
         "phone.session.delete",
@@ -1063,6 +1056,7 @@ async fn phone_messages(
     session_id: &str,
 ) -> ApiResult<Response> {
     let row = phone_session_for_user(req, env, db, session_id).await?;
+    history::purge_expired(db, &row.user_id).await?;
     let before = query_value(req, "before")?;
     json_response(
         history::list_messages(
@@ -1084,11 +1078,13 @@ async fn phone_export(
     session_id: &str,
 ) -> ApiResult<Response> {
     let row = phone_session_for_user(req, env, db, session_id).await?;
+    history::purge_expired(db, &row.user_id).await?;
     json_response(history::export_session(db, &row.user_id, &row).await?, 200)
 }
 
 async fn phone_search(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
+    history::purge_expired(db, &user.user_id).await?;
     let query = query_value(req, "q")?.unwrap_or_default();
     json_response(
         history::search(db, &user.user_id, &query, query_limit(req, 50)?).await?,
@@ -1137,6 +1133,7 @@ fn phone_change_value(row: &models::PhoneChangeRow) -> Value {
         "entity_id": row.entity_id,
         "session_id": row.session_id,
         "version": row.version,
+        "deleted_at": row.deleted_at,
     })
 }
 
@@ -1155,13 +1152,14 @@ fn sync_cursor(request: &Request) -> ApiResult<Option<i64>> {
 
 async fn phone_sync(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
+    history::purge_expired(db, &user.user_id).await?;
     let after = sync_cursor(req)?.unwrap_or(0);
     let limit = crate::realtime::normalize_limit(
         query_value(req, "limit")?.and_then(|value| value.parse::<i64>().ok()),
     );
     let rows: Vec<models::PhoneChangeRow> = db::all(
         db,
-        "SELECT cursor, user_id, entity_type, entity_id, session_id, version, created_at FROM phone_changes WHERE user_id = ? AND cursor > ? ORDER BY cursor ASC LIMIT ?",
+        "SELECT cursor, user_id, entity_type, entity_id, session_id, version, created_at, deleted_at FROM phone_changes WHERE user_id = ? AND cursor > ? ORDER BY cursor ASC LIMIT ?",
         vec![
             db::text(&user.user_id),
             db::number(after),
@@ -1235,7 +1233,12 @@ async fn phone_events(req: &Request, env: &Env, db: D1Database) -> ApiResult<Res
         }
         if state.initial_sync {
             state.initial_sync = false;
-            let data = json!({"reason": "initial", "cursor": state.cursor.to_string()});
+            let data = json!({
+                "id": state.cursor.to_string(),
+                "type": "sync.required",
+                "session_id": Value::Null,
+                "version": 0,
+            });
             let chunk =
                 crate::realtime::sse_frame(&state.cursor.to_string(), "sync.required", &data)
                     .map_err(|error| {
@@ -1247,7 +1250,7 @@ async fn phone_events(req: &Request, env: &Env, db: D1Database) -> ApiResult<Res
         Delay::from(Duration::from_secs(5)).await;
         let rows: Vec<models::PhoneChangeRow> = db::all(
             &state.db,
-            "SELECT cursor, user_id, entity_type, entity_id, session_id, version, created_at FROM phone_changes WHERE user_id = ? AND cursor > ? ORDER BY cursor ASC LIMIT 100",
+            "SELECT cursor, user_id, entity_type, entity_id, session_id, version, created_at, deleted_at FROM phone_changes WHERE user_id = ? AND cursor > ? ORDER BY cursor ASC LIMIT 100",
             vec![
                 db::text(&state.user_id),
                 db::number(state.cursor),
@@ -1259,13 +1262,20 @@ async fn phone_events(req: &Request, env: &Env, db: D1Database) -> ApiResult<Res
         let mut chunk = String::new();
         for row in rows {
             state.cursor = row.cursor;
-            let data = phone_change_value(&row);
-            let frame = crate::realtime::sse_frame(
-                &row.cursor.to_string(),
-                phone_change_event_type(&row.entity_type),
-                &data,
-            )
-            .map_err(|error| stream_error(ApiError::new(500, "sse_error", error.to_string())))?;
+            // SSE is an invalidation hint only. Keep the payload small and
+            // force clients to read the authoritative snapshot through REST
+            // or /v1/phone/sync.
+            let event_type = phone_change_event_type(&row.entity_type);
+            let data = json!({
+                "id": row.cursor.to_string(),
+                "type": event_type,
+                "session_id": row.session_id,
+                "version": row.version,
+            });
+            let frame = crate::realtime::sse_frame(&row.cursor.to_string(), event_type, &data)
+                .map_err(|error| {
+                    stream_error(ApiError::new(500, "sse_error", error.to_string()))
+                })?;
             chunk.push_str(&frame);
         }
         if chunk.is_empty() {
@@ -1292,18 +1302,20 @@ async fn phone_history(
     session_id: &str,
 ) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
+    let exists = sessions::get_session(db, session_id)
+        .await?
+        .filter(|row| row.user_id == user.user_id && row.deleted_at.is_none())
+        .is_some();
+    if !exists {
+        return Err(ApiError::not_found("Session not found"));
+    }
     let entries =
         audit::list_audit_for_session(db, &user.user_id, session_id, query_limit(req, 100)?)
             .await?;
-    if entries.is_empty()
-        && sessions::get_session(db, session_id)
-            .await?
-            .filter(|row| row.user_id == user.user_id)
-            .is_none()
-    {
-        return Err(ApiError::not_found("Session not found"));
-    }
-    json_response(json!({ "entries": entries }), 200)
+    json_response(
+        json!({ "entries": entries, "next_cursor": Value::Null, "has_more": false }),
+        200,
+    )
 }
 
 async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
@@ -1387,10 +1399,25 @@ async fn phone_reply(
     if body.action_key.trim().is_empty() {
         return Err(ApiError::validation("action_key is required"));
     }
-    let _ = body.utterance;
     let idempotency_key = body.idempotency_key.as_deref();
-    if let Some(replayed) =
-        phone_operations::begin(db, &user.user_id, "reply", idempotency_key).await?
+    let request_hash = sha256_hex(
+        &json!({
+            "session_id": session_id,
+            "action_key": body.action_key.trim(),
+            "utterance": body.utterance.as_deref(),
+        })
+        .to_string(),
+    );
+    if let Some(replayed) = phone_operations::begin(
+        db,
+        &user.user_id,
+        "reply",
+        idempotency_key,
+        &request_hash,
+        session_id,
+        None,
+    )
+    .await?
     {
         return json_response(replayed, 200);
     }
@@ -1404,7 +1431,16 @@ async fn phone_reply(
     .await;
     match result {
         Ok(value) => {
-            phone_operations::complete(db, &user.user_id, "reply", idempotency_key, &value).await?;
+            phone_operations::complete(
+                db,
+                &user.user_id,
+                "reply",
+                idempotency_key,
+                &request_hash,
+                session_id,
+                &value,
+            )
+            .await?;
             json_response(value, 200)
         }
         Err(error) => {
@@ -1426,8 +1462,24 @@ async fn phone_confirm(
         return Err(ApiError::validation("action_id is required"));
     }
     let idempotency_key = body.idempotency_key.as_deref();
-    if let Some(replayed) =
-        phone_operations::begin(db, &user.user_id, "confirm", idempotency_key).await?
+    let request_hash = sha256_hex(
+        &json!({
+            "session_id": session_id,
+            "action_id": body.action_id.trim(),
+            "confirm": body.confirm,
+        })
+        .to_string(),
+    );
+    if let Some(replayed) = phone_operations::begin(
+        db,
+        &user.user_id,
+        "confirm",
+        idempotency_key,
+        &request_hash,
+        session_id,
+        Some(body.action_id.trim()),
+    )
+    .await?
     {
         return json_response(replayed, 200);
     }
@@ -1441,8 +1493,16 @@ async fn phone_confirm(
     .await;
     match result {
         Ok(value) => {
-            phone_operations::complete(db, &user.user_id, "confirm", idempotency_key, &value)
-                .await?;
+            phone_operations::complete(
+                db,
+                &user.user_id,
+                "confirm",
+                idempotency_key,
+                &request_hash,
+                session_id,
+                &value,
+            )
+            .await?;
             json_response(value, 200)
         }
         Err(error) => {

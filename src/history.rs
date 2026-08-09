@@ -7,6 +7,26 @@ use crate::models::{RetrievalItemRow, SessionMessageRow, SessionRow};
 use crate::pagination;
 use crate::sessions;
 
+pub async fn purge_expired(db: &D1Database, user_id: &str) -> ApiResult<()> {
+    let now = db::now_iso();
+    // Retrievals reference messages, so remove source metadata before the
+    // message row. This is an opportunistic sweep; a scheduled worker can
+    // later compact old rows for users who are never active.
+    db::run(
+        db,
+        "DELETE FROM retrieval_items WHERE user_id = ? AND retention_expires_at IS NOT NULL AND retention_expires_at <= ?",
+        vec![db::text(user_id), db::text(&now)],
+    )
+    .await?;
+    db::run(
+        db,
+        "DELETE FROM session_messages WHERE user_id = ? AND retention_expires_at IS NOT NULL AND retention_expires_at <= ?",
+        vec![db::text(user_id), db::text(&now)],
+    )
+    .await?;
+    Ok(())
+}
+
 fn parse_json(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::Object(Map::new()))
 }
@@ -58,6 +78,9 @@ pub fn session_summary(row: &SessionRow) -> Value {
         "expires_at": row.expires_at,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
+        "archived_at": row.archived_at,
+        "deleted_at": row.deleted_at,
+        "retention_expires_at": row.retention_expires_at,
     })
 }
 
@@ -72,7 +95,7 @@ pub async fn list_sessions(
     let rows: Vec<SessionRow> = if let Some(cursor) = before {
         db::all(
             db,
-            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (updated_at < ? OR (updated_at = ? AND id < ?)) ORDER BY updated_at DESC, id DESC LIMIT ?",
+            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (updated_at < ? OR (updated_at = ? AND id < ?)) ORDER BY updated_at DESC, id DESC LIMIT ?",
             vec![
                 db::text(user_id),
                 db::text(&cursor.sort_key),
@@ -85,23 +108,20 @@ pub async fn list_sessions(
     } else {
         db::all(
             db,
-            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC, id DESC LIMIT ?",
+            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC, id DESC LIMIT ?",
             vec![db::text(user_id), db::number(safe_limit + 1)],
         )
         .await?
     };
     let has_more = rows.len() as i64 > safe_limit;
+    let next_cursor = rows
+        .get(safe_limit as usize - 1)
+        .map(|row| pagination::encode(&row.updated_at, &row.id));
     let mut result = Vec::new();
     for row in rows.into_iter().take(safe_limit as usize) {
         let fresh = sessions::reconcile_waiting_session(db, row).await?;
         result.push(session_summary(&fresh));
     }
-    let next_cursor = result.last().and_then(|item| {
-        Some(pagination::encode(
-            item.get("updated_at")?.as_str()?,
-            item.get("session_id")?.as_str()?,
-        ))
-    });
     Ok(serde_json::json!({
         "sessions": result,
         "next_cursor": has_more.then_some(next_cursor).flatten(),
@@ -155,8 +175,12 @@ pub async fn list_messages(
     let next_cursor = rows
         .last()
         .map(|row| pagination::encode(&row.created_at, &row.id));
+    let messages = rows.into_iter().map(message_value).collect::<Vec<_>>();
     Ok(serde_json::json!({
-        "messages": rows.into_iter().map(message_value).collect::<Vec<_>>(),
+        // `items` is retained for clients generated from the Phase 0 schema;
+        // `messages` is the canonical v1 field.
+        "items": messages.clone(),
+        "messages": messages,
         "next_cursor": has_more.then_some(next_cursor).flatten(),
         "has_more": has_more,
     }))
@@ -176,7 +200,7 @@ pub async fn list_retrieval(
             db::text(user_id),
             db::text(session_id),
             db::text(&now),
-            db::number(limit.clamp(1, 100) as i64),
+            db::number(limit.clamp(1, 10_001) as i64),
         ],
     )
     .await?;
@@ -194,7 +218,7 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
     let needle = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
     let sessions: Vec<SessionRow> = db::all(
         db,
-        "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (title LIKE ? ESCAPE '\\' OR summary_text LIKE ? ESCAPE '\\' OR facts_json LIKE ? ESCAPE '\\') ORDER BY updated_at DESC, id DESC LIMIT ?",
+        "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (title LIKE ? ESCAPE '\\' OR summary_text LIKE ? ESCAPE '\\' OR facts_json LIKE ? ESCAPE '\\') ORDER BY updated_at DESC, id DESC LIMIT ?",
         vec![
             db::text(user_id),
             db::text(&needle),
@@ -206,7 +230,7 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
     .await?;
     let messages: Vec<SessionMessageRow> = db::all(
         db,
-        "SELECT id, user_id, session_id, role, content, metadata_json, command_id, sequence, retention_expires_at, created_at FROM session_messages WHERE user_id = ? AND (retention_expires_at IS NULL OR retention_expires_at > ?) AND content LIKE ? ESCAPE '\\' ORDER BY created_at DESC, id DESC LIMIT ?",
+        "SELECT m.id, m.user_id, m.session_id, m.role, m.content, m.metadata_json, m.command_id, m.sequence, m.retention_expires_at, m.created_at FROM session_messages AS m JOIN sessions AS s ON s.id = m.session_id AND s.user_id = m.user_id AND s.deleted_at IS NULL WHERE m.user_id = ? AND (m.retention_expires_at IS NULL OR m.retention_expires_at > ?) AND m.content LIKE ? ESCAPE '\\' ORDER BY m.created_at DESC, m.id DESC LIMIT ?",
         vec![
             db::text(user_id),
             db::text(&db::now_iso()),
@@ -217,7 +241,7 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
     .await?;
     let retrievals: Vec<RetrievalItemRow> = db::all(
         db,
-        "SELECT id, user_id, session_id, message_id, title, url, snippet, score, content_hash, r2_key, retention_expires_at, created_at FROM retrieval_items WHERE user_id = ? AND (retention_expires_at IS NULL OR retention_expires_at > ?) AND (title LIKE ? ESCAPE '\\' OR snippet LIKE ? ESCAPE '\\') ORDER BY created_at DESC, id DESC LIMIT ?",
+        "SELECT r.id, r.user_id, r.session_id, r.message_id, r.title, r.url, r.snippet, r.score, r.content_hash, r.r2_key, r.retention_expires_at, r.created_at FROM retrieval_items AS r JOIN sessions AS s ON s.id = r.session_id AND s.user_id = r.user_id AND s.deleted_at IS NULL WHERE r.user_id = ? AND (r.retention_expires_at IS NULL OR r.retention_expires_at > ?) AND (r.title LIKE ? ESCAPE '\\' OR r.snippet LIKE ? ESCAPE '\\') ORDER BY r.created_at DESC, r.id DESC LIMIT ?",
         vec![
             db::text(user_id),
             db::text(&db::now_iso()),
@@ -227,11 +251,20 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
         ],
     )
     .await?;
+    let session_values = sessions.iter().map(session_summary).collect::<Vec<_>>();
+    let message_values = messages.into_iter().map(message_value).collect::<Vec<_>>();
+    let retrieval_values = retrievals
+        .into_iter()
+        .map(retrieval_value)
+        .collect::<Vec<_>>();
     Ok(serde_json::json!({
         "query": query,
-        "sessions": sessions.iter().map(session_summary).collect::<Vec<_>>(),
-        "messages": messages.into_iter().map(message_value).collect::<Vec<_>>(),
-        "retrieval_items": retrievals.into_iter().map(retrieval_value).collect::<Vec<_>>(),
+        "items": message_values.clone(),
+        "next_cursor": Value::Null,
+        "has_more": false,
+        "sessions": session_values,
+        "messages": message_values,
+        "retrieval_items": retrieval_values,
     }))
 }
 
@@ -240,13 +273,44 @@ pub async fn export_session(
     user_id: &str,
     session: &SessionRow,
 ) -> ApiResult<Value> {
-    let messages = list_messages(db, user_id, &session.id, None, 100).await?;
-    let retrieval_items = list_retrieval(db, user_id, &session.id, 100).await?;
+    let mut messages = Vec::new();
+    let mut before = None;
+    let mut truncated = false;
+    loop {
+        let page = list_messages(db, user_id, &session.id, before.as_deref(), 100).await?;
+        let page_messages = page
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        messages.extend(page_messages);
+        let has_more = page
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !has_more {
+            break;
+        }
+        before = page
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if before.is_none() || messages.len() >= 10_000 {
+            truncated = true;
+            break;
+        }
+    }
+    let retrieval_items = list_retrieval(db, user_id, &session.id, 10_001).await?;
+    if retrieval_items.len() > 10_000 {
+        truncated = true;
+    }
+    let retrieval_items = retrieval_items.into_iter().take(10_000).collect::<Vec<_>>();
     Ok(serde_json::json!({
         "schema_version": 1,
         "exported_at": db::now_iso(),
         "session": sessions::session_to_api(session),
-        "messages": messages.get("messages").cloned().unwrap_or(Value::Array(Vec::new())),
+        "messages": messages,
         "retrieval_items": retrieval_items,
+        "truncated": truncated,
     }))
 }
