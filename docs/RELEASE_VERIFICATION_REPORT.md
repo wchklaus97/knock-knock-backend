@@ -10,7 +10,7 @@ and Phase 0–3 integration baseline
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
 | Backend base | `agent/phase45-completion-backend` | `2977322` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | pending local commit | local checkpoint; PR not pushed |
+| Backend follow-up | `agent/phase45-completion-backend` | `f488bff` | local checkpoint; PR not pushed |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
 The branches are intentionally based on the merged Phase 0–3 integration
