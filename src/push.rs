@@ -43,7 +43,7 @@ pub async fn enqueue_push(
     let created_at = db::now_iso();
     db::run(
         db,
-        "INSERT INTO pushes (id, user_id, session_id, title, body, voice_script, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO pushes (id, user_id, session_id, title, body, voice_script, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         vec![
             db::text(&push_id),
             db::text(user_id),
@@ -52,6 +52,7 @@ pub async fn enqueue_push(
             db::text(body),
             db::optional_text(voice_script),
             db::text(&payload.to_string()),
+            db::text(&created_at),
             db::text(&created_at),
         ],
     )

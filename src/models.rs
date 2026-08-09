@@ -184,6 +184,8 @@ pub struct CommandRow {
     pub result_json: Option<String>,
     pub error_code: Option<String>,
     pub expires_at: Option<String>,
+    pub model_version: Option<String>,
+    pub version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
