@@ -30,6 +30,7 @@ migrations, APNs changes, and model rollout.
 
 The detailed evidence and rollback record is in
 `docs/RELEASE_VERIFICATION_REPORT.md`.
+The numbered release handoff is in `docs/RELEASE_GATE_MATRIX.md`.
 
 ### Backend follow-up checkpoint — 2026-08-10
 

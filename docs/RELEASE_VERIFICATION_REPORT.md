@@ -16,7 +16,8 @@ and Phase 0–3 integration baseline
 The follow-up branch is based on merged PR #10. PR #11 is pushed and its
 GitHub Actions Rust backend CI run passed; it is not merged, deployed, or
 applied to production. Paired review and the remaining release gates still
-require human approval.
+require human approval. The numbered gate handoff is tracked in
+[`docs/RELEASE_GATE_MATRIX.md`](RELEASE_GATE_MATRIX.md).
 
 ## Implemented baseline
 
@@ -141,6 +142,10 @@ The latter issues are closed in PR #11 for new data; legacy records remain
 reconcilable and still require staged migration evidence.
 
 ## Remaining release gates
+
+The same gates are numbered RG-01–RG-07 in
+[`docs/RELEASE_GATE_MATRIX.md`](RELEASE_GATE_MATRIX.md) so agents cannot
+mistake local verification for production approval.
 
 These are deliberately not marked as passed:
 
