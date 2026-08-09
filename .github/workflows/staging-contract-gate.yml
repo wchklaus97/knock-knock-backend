@@ -1,0 +1,30 @@
+name: Staging contract gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      staging_url:
+        description: Deployed staging Worker URL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  staging-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: staging
+    env:
+      BASE_URL: ${{ inputs.staging_url }}
+      SMOKE_EMAIL: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_EMAIL }}
+      SMOKE_PASSWORD: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install smoke dependencies
+        run: |
+          command -v curl
+          command -v jq
+      - name: Run deployed staging contract gate
+        run: ./scripts/staging-contract-gate.sh
