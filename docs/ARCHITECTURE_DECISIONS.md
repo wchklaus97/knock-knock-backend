@@ -92,6 +92,8 @@ safety gaps without changing the REST + SSE baseline:
   cancellation endpoints before an enabled production action is considered
   ready. Provider timeouts are reconciled through the status endpoint, and
   external reminder Undo calls cancellation before changing local state.
+  Provider idempotency keys are stable hashes scoped to user and action, while
+  legacy stored keys remain available for status reconciliation.
 
 The remaining backend work is release evidence and deployment configuration,
 not a new transport: create the independent staging D1/Worker and R2 bucket,
@@ -149,7 +151,7 @@ and the current gap. IDs are stable and must not be reused.
 | D37 | Models and model configuration use signed manifests. | Prevents arbitrary model downloads and supports safe rollback. | Hash/signature, minimum capability, expiry, and rollback tests pass. | No model manifest or trust store exists. |
 | D38 | Foreground owns SSE; background uses APNs and resume sync. | Matches iOS power constraints and preserves recoverability after termination. | Foreground/background/terminated flows restore cursor and state. | SSE lifecycle exists but needs durable local cursor and sync endpoint. |
 | D39 | iOS persistence uses system SQLite. | The app has an iOS 15 floor; SwiftData cannot be the required store. | Migration, crash recovery, logout deletion, and offline reads pass on iOS 15. | Current cache/queue uses memory and `UserDefaults`. |
-| D40 | Backend contracts are the single API schema source. | OpenAPI 3.1 plus embedded JSON Schema prevents iOS/backend field drift. | Schema lint, fixture validation, breaking-change CI, and generated examples pass. | OpenAPI 3.1, compatibility baseline, R2 download/provider lifecycle paths, and breaking-change smoke are implemented; remote paired CI evidence remains. |
+| D40 | Backend contracts are the single API schema source. | OpenAPI 3.1 plus embedded JSON Schema prevents iOS/backend field drift. | Schema lint, fixture validation, breaking-change CI, and generated examples pass. | OpenAPI 3.1, compatibility baseline, R2 download/provider lifecycle paths, and breaking-change smoke are implemented; paired PR review remains. |
 
 ## Canonical data model target
 

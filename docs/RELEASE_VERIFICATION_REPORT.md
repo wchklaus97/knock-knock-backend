@@ -10,7 +10,7 @@ and Phase 0–3 integration baseline
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
 | Backend base | `agent/phase45-completion-backend` | `2977322` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | `2dfa7b3` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
+| Backend follow-up | `agent/phase45-completion-backend` | current PR #11 head | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
 The follow-up branch is based on merged PR #10. PR #11 is pushed and its
@@ -42,7 +42,8 @@ require human approval.
   retention cleanup that removes R2 objects before deleting D1 metadata.
 - Provider lifecycle operations for external reminders/messages: delivery,
   status lookup, reminder cancellation for Undo, timeout-to-unknown handling,
-  and idempotent status reconciliation without a duplicate provider delivery.
+  and idempotent status reconciliation without a duplicate provider delivery;
+  provider keys are user/action scoped and legacy keys remain reconcilable.
 - Safe staging Wrangler template with explicit origin/version validation and
   disabled external effects.
 - OpenAPI compatibility baseline and breaking-change smoke for retained v1
@@ -66,7 +67,7 @@ require human approval.
 
 - `cargo fmt --all -- --check` — passed
 - `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test -q` — 35 passed
+- `cargo test -q` — 36 passed
 - `cargo check --target wasm32-unknown-unknown -q` — passed
 - `worker-build --release` — passed; optimized Worker bundle generated
 - `scripts/architecture-migration-smoke.sh` — passed
@@ -81,7 +82,8 @@ require human approval.
   retention cleanup, and cross-user isolation.
 - `scripts/provider-lifecycle-smoke.sh` against an isolated local Worker and
   mock provider — passed for delivery, provider cancellation, timeout,
-  status reconciliation, and idempotent completion.
+  status reconciliation, idempotent completion, and three distinct scoped
+  delivery keys.
 - `scripts/production-config-smoke.sh` — passed, including the staging
   template and staging fail-closed checks
 - `scripts/phase45-release-gate.sh` — passed
@@ -123,7 +125,9 @@ write barriers for sessions and commands, non-atomic event idempotency claims,
 un-fenced compatibility-operation lease takeover, permanently stuck Outbox
 leases, unverified rate-limit identity, discarded structured retry metadata,
 incomplete local tombstone cleanup, a globally writable skill registry, an iOS
-permanent-error retry loop, and non-additive checkpoint response requirements.
+permanent-error retry loop, non-additive checkpoint response requirements, and
+cross-user Provider idempotency-key collision risk. The last issue is now
+closed with user/action-scoped hashes plus legacy-key reconciliation.
 
 ## Remaining release gates
 

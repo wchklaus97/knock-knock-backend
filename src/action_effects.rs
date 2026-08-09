@@ -15,6 +15,7 @@ const MAX_BODY: usize = 8_000;
 #[derive(Debug, Clone, Deserialize)]
 struct EffectAttemptRow {
     provider: String,
+    provider_idempotency_key: String,
     state: String,
     response_json: Option<String>,
 }
@@ -49,15 +50,17 @@ pub async fn execute(
             "running" | "unknown" | "retrying"
                 if provider_config.mode() == providers::ActionProviderMode::External =>
             {
+                let provider_idempotency_key = previous.provider_idempotency_key.clone();
                 let status = providers::status(
                     env,
                     &provider_config,
                     &command.intent,
-                    &command.idempotency_key,
+                    &provider_idempotency_key,
                     json!({
                         "schema_version": 1,
                         "command_id": command.id,
-                        "idempotency_key": command.idempotency_key,
+                        "idempotency_key": provider_idempotency_key.clone(),
+                        "command_idempotency_key": command.idempotency_key,
                     }),
                 )
                 .await?;
@@ -196,12 +199,17 @@ pub async fn undo(
             env,
             &provider_config,
             "create_reminder",
-            &format!("{}:cancel", command.idempotency_key),
+            &providers::scoped_idempotency_key(
+                user_id,
+                "action.reminder.cancel",
+                &command.idempotency_key,
+            ),
             json!({
                 "schema_version": 1,
                 "kind": "reminder",
                 "operation": "cancel",
                 "command_id": command.id,
+                "command_idempotency_key": command.idempotency_key,
                 "provider_id": provider_id,
             }),
         )
@@ -331,11 +339,16 @@ async fn create_reminder(
                     env,
                     &provider_config,
                     "create_reminder",
-                    &command.idempotency_key,
+                    &providers::scoped_action_idempotency_key(
+                        user_id,
+                        &command.intent,
+                        &command.idempotency_key,
+                    ),
                     json!({
                         "schema_version": 1,
                         "kind": "reminder",
                         "command_id": command.id,
+                        "command_idempotency_key": command.idempotency_key,
                         "user_id": user_id,
                         "title": title,
                         "due_at": due_at,
@@ -477,11 +490,16 @@ async fn queue_message(
                     env,
                     &provider_config,
                     "send_message",
-                    &command.idempotency_key,
+                    &providers::scoped_action_idempotency_key(
+                        user_id,
+                        &command.intent,
+                        &command.idempotency_key,
+                    ),
                     json!({
                         "schema_version": 1,
                         "kind": "message",
                         "command_id": command.id,
+                        "command_idempotency_key": command.idempotency_key,
                         "user_id": user_id,
                         "recipient": recipient,
                         "body": body,
@@ -553,7 +571,7 @@ async fn previous_attempt(
 ) -> ApiResult<Option<EffectAttemptRow>> {
     db::first(
         db,
-        "SELECT provider, state, response_json FROM action_attempts WHERE command_id = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT provider, provider_idempotency_key, state, response_json FROM action_attempts WHERE command_id = ? ORDER BY created_at DESC LIMIT 1",
         vec![db::text(&command.id)],
     )
     .await
@@ -566,6 +584,12 @@ async fn record_attempt(
     provider: &str,
     response: &Value,
 ) -> ApiResult<Value> {
+    let attempt_provider = providers::action_attempt_provider(&command.intent).unwrap_or(provider);
+    let provider_idempotency_key = providers::scoped_action_idempotency_key(
+        user_id,
+        &command.intent,
+        &command.idempotency_key,
+    );
     db::run(
         db,
         "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, 'succeeded', ?, ?, 1, NULL, NULL, ?, ?) ON CONFLICT(provider, provider_idempotency_key) DO UPDATE SET state = 'succeeded', response_json = excluded.response_json, attempts = MAX(action_attempts.attempts, excluded.attempts), next_attempt_at = NULL, last_error = NULL, updated_at = excluded.updated_at",
@@ -573,8 +597,8 @@ async fn record_attempt(
             db::text(&new_id("attempt")?),
             db::text(user_id),
             db::text(&command.id),
-            db::text(provider),
-            db::text(&command.idempotency_key),
+            db::text(attempt_provider),
+            db::text(&provider_idempotency_key),
             db::text(&command.command_hash),
             db::text(&response.to_string()),
             db::text(&command.created_at),

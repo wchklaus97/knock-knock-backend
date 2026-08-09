@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 
-use crate::auth::{config_value, secret_value};
+use crate::auth::{config_value, secret_value, sha256_hex};
 use crate::error::{ApiError, ApiResult};
 
 /// Selects how a command effect is materialized.
@@ -272,6 +272,29 @@ pub fn disabled(intent: &str) -> ApiError {
 
 pub fn ready(config: &ActionProviderConfig) -> bool {
     config.ready()
+}
+
+/// Namespace provider idempotency by the authenticated user and action.
+/// Command idempotency keys are only unique within one user, while provider
+/// keys and the action-attempt uniqueness constraint are global.
+pub fn scoped_idempotency_key(user_id: &str, operation: &str, command_key: &str) -> String {
+    format!(
+        "kk_{}",
+        sha256_hex(&format!("v1:{operation}:{user_id}:{command_key}"))
+    )
+}
+
+pub fn action_attempt_provider(intent: &str) -> Option<&'static str> {
+    match intent {
+        "create_reminder" => Some("action.reminder"),
+        "send_message" => Some("action.message"),
+        _ => None,
+    }
+}
+
+pub fn scoped_action_idempotency_key(user_id: &str, intent: &str, command_key: &str) -> String {
+    let operation = action_attempt_provider(intent).unwrap_or(intent);
+    scoped_idempotency_key(user_id, operation, command_key)
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +599,29 @@ mod tests {
         assert_eq!(
             parse_delivery_state("vendor-specific"),
             ProviderDeliveryState::Unknown
+        );
+    }
+
+    #[test]
+    fn scoped_provider_keys_are_stable_and_user_bound() {
+        let first = scoped_idempotency_key("user-a", "action.reminder", "same-key");
+        assert_eq!(
+            first,
+            scoped_idempotency_key("user-a", "action.reminder", "same-key")
+        );
+        assert_ne!(
+            first,
+            scoped_idempotency_key("user-b", "action.reminder", "same-key")
+        );
+        assert_ne!(
+            first,
+            scoped_idempotency_key("user-a", "action.message", "same-key")
+        );
+        assert!(first.starts_with("kk_"));
+        assert_eq!(first.len(), 67);
+        assert_eq!(
+            first,
+            scoped_action_idempotency_key("user-a", "create_reminder", "same-key")
         );
     }
 }

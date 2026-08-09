@@ -53,7 +53,8 @@ template, and a formal contract-breaking compatibility smoke. The adapter now
 requires delivery/status lifecycle endpoints for enabled production actions;
 external reminder Undo calls the provider cancellation endpoint, and timeout
 results are reconciled through provider status. It was verified against a
-local mock provider for delivery, cancellation, timeout, and status recovery.
+local mock provider for delivery, cancellation, timeout, status recovery, and
+user/action-scoped provider idempotency keys.
 The R2 retrieval download route is also implemented and verified with a local
 R2 object plus cross-user isolation. Provider vendor selection, sandbox
 evidence, production credentials, remote staging D1/Worker/R2 E2E, formal

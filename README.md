@@ -83,8 +83,10 @@ carries the command idempotency key. A provider timeout becomes
 `unknown/retryable`; the scheduled worker queries the configured status
 endpoint before materializing a success, and local Undo calls the reviewed
 reminder cancellation endpoint before changing D1 state.
-Production keeps both action flags disabled until the provider delivery/status
-endpoints, idempotency behavior, cancellation policy, and credentials are approved. A
+The `x-idempotency-key` sent to a provider is a stable hash scoped to the
+authenticated user and action; the original command key is retained in the
+payload for provider audit. Production keeps both action flags disabled until
+the provider delivery/status endpoints, idempotency behavior, cancellation policy, and credentials are approved. A
 local queued message is never reported as externally delivered.
 
 For a safe remote staging Worker, copy `wrangler.staging.toml.example`, create

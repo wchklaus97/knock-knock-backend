@@ -461,14 +461,6 @@ async fn finish_success(
     Ok(())
 }
 
-fn provider_for_intent(intent: &str) -> Option<&'static str> {
-    match intent {
-        "create_reminder" => Some("action.reminder"),
-        "send_message" => Some("action.message"),
-        _ => None,
-    }
-}
-
 async fn finish_failure(
     db: &D1Database,
     row: &OutboxEventRow,
@@ -547,7 +539,12 @@ async fn finish_failure(
             ],
         )?,
     ];
-    if let Some(provider) = provider_for_intent(&command.intent) {
+    if let Some(provider) = providers::action_attempt_provider(&command.intent) {
+        let provider_idempotency_key = providers::scoped_action_idempotency_key(
+            user_id,
+            &command.intent,
+            &command.idempotency_key,
+        );
         statements.push(db::prepare(
             db,
             "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?) ON CONFLICT(provider, provider_idempotency_key) DO UPDATE SET state = excluded.state, attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at, last_error = excluded.last_error, updated_at = excluded.updated_at",
@@ -556,7 +553,7 @@ async fn finish_failure(
                 db::text(user_id),
                 db::text(&command.id),
                 db::text(provider),
-                db::text(&command.idempotency_key),
+                db::text(&provider_idempotency_key),
                 db::text(if retry { "retrying" } else { "failed" }),
                 db::text(&command.command_hash),
                 db::number(attempt as i64),
@@ -679,10 +676,13 @@ mod tests {
     #[test]
     fn provider_names_are_stable_for_attempt_reconciliation() {
         assert_eq!(
-            provider_for_intent("create_reminder"),
+            providers::action_attempt_provider("create_reminder"),
             Some("action.reminder")
         );
-        assert_eq!(provider_for_intent("send_message"), Some("action.message"));
-        assert_eq!(provider_for_intent("create_draft"), None);
+        assert_eq!(
+            providers::action_attempt_provider("send_message"),
+            Some("action.message")
+        );
+        assert_eq!(providers::action_attempt_provider("create_draft"), None);
     }
 }
