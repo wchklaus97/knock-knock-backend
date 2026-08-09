@@ -9,6 +9,7 @@ mod models;
 mod pagination;
 mod phone_operations;
 mod push;
+mod rate_limits;
 mod realtime;
 mod sessions;
 mod skills;
@@ -56,11 +57,13 @@ struct ConfirmationRequest {
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let origin = req.headers().get("origin").ok().flatten();
+    let request_id = request_id();
     let result = dispatch(req, env.clone()).await;
-    let response = match result {
+    let mut response = match result {
         Ok(response) => response,
-        Err(error) => error.response()?,
+        Err(error) => error.with_request_id(&request_id).response()?,
     };
+    response.headers_mut().set("X-Request-ID", &request_id)?;
     add_common_headers(response, &env, origin)
 }
 
@@ -96,6 +99,8 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
 
     let db = env.d1("DB")?;
     let segments = path_segments(&path);
+    let identity = rate_limit_identity(&req)?;
+    rate_limits::enforce(&db, &path, &identity).await?;
 
     match (method, segments.as_slice()) {
         (Method::Post, ["v1", "auth", "register"]) => auth_register(&mut req, &env, &db).await,
@@ -195,6 +200,38 @@ fn path_segments(path: &str) -> Vec<&str> {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect()
+}
+
+fn request_id() -> String {
+    let timestamp = worker::Date::now().as_millis();
+    let mut entropy = [0_u8; 8];
+    if getrandom::fill(&mut entropy).is_err() {
+        return format!("req_{timestamp:x}");
+    }
+    let suffix = entropy
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("req_{timestamp:x}_{suffix}")
+}
+
+fn rate_limit_identity(request: &Request) -> ApiResult<String> {
+    for header in ["authorization", "x-agent-key", "x-device-id"] {
+        if let Some(value) = request.headers().get(header)? {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    if let Some(value) = request.headers().get("x-forwarded-for")? {
+        if let Some(first) = value.split(',').next().map(str::trim) {
+            if !first.is_empty() {
+                return Ok(first.to_string());
+            }
+        }
+    }
+    Ok("anonymous".into())
 }
 
 async fn read_json<T: DeserializeOwned>(request: &mut Request) -> ApiResult<T> {
@@ -1504,11 +1541,12 @@ fn add_common_headers(
     }
     response.headers_mut().set(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Agent-Key",
+        "Authorization, Content-Type, X-Agent-Key, X-Device-ID, X-Request-ID",
     )?;
-    response
-        .headers_mut()
-        .set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")?;
+    response.headers_mut().set(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PATCH, DELETE, OPTIONS",
+    )?;
     response
         .headers_mut()
         .set("Access-Control-Max-Age", "86400")?;
