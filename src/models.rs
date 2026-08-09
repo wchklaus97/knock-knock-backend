@@ -120,6 +120,7 @@ pub struct EventRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum CommandState {
     Pending,
     Validated,
@@ -135,6 +136,7 @@ pub enum CommandState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum CommandRisk {
     Low,
     Medium,
@@ -165,6 +167,7 @@ pub struct CommandEnvelope {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct CommandRow {
     pub id: String,
     pub user_id: String,
@@ -191,6 +194,7 @@ pub struct CommandRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ConfirmationTokenRow {
     pub id: String,
     pub command_id: String,
@@ -203,6 +207,7 @@ pub struct ConfirmationTokenRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SessionMessageRow {
     pub id: String,
     pub user_id: String,
@@ -217,6 +222,7 @@ pub struct SessionMessageRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct RetrievalItemRow {
     pub id: String,
     pub user_id: String,
@@ -233,6 +239,7 @@ pub struct RetrievalItemRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct PhoneChangeRow {
     pub cursor: i64,
     pub user_id: String,
@@ -244,6 +251,7 @@ pub struct PhoneChangeRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct OutboxEventRow {
     pub id: String,
     pub user_id: Option<String>,
@@ -260,6 +268,7 @@ pub struct OutboxEventRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ActionAttemptRow {
     pub id: String,
     pub user_id: Option<String>,
@@ -281,6 +290,7 @@ pub struct ActionAttemptRow {
 /// is the source of truth, so every agent progress update and phone action
 /// automatically becomes observable without duplicating business events.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SessionStreamRow {
     pub id: String,
     pub updated_at: String,
@@ -394,6 +404,7 @@ pub struct ActionResultRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct DeviceRequest {
     pub platform: String,
     pub push_token: Option<String>,
