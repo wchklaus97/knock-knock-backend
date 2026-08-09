@@ -31,6 +31,14 @@ pub fn number(value: i64) -> JsValue {
     JsValue::from_f64(value as f64)
 }
 
+pub fn bool_number(value: bool) -> JsValue {
+    number(if value { 1 } else { 0 })
+}
+
+pub fn cursor_string(value: i64) -> String {
+    value.to_string()
+}
+
 pub fn decimal(value: f64) -> JsValue {
     JsValue::from_f64(value)
 }
