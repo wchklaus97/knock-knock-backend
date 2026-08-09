@@ -17,7 +17,7 @@ deployed. The current dependency chain is:
 | Phase 2 | — | [PR #3](https://github.com/wchklaus97/knock-knock-frontend/pull/3) | SQLite/offline implementation complete |
 | Phase 3 | [PR #4](https://github.com/wchklaus97/knock-knock-backend/pull/4), [hardening PR #6](https://github.com/wchklaus97/knock-knock-backend/pull/6) | [PR #4](https://github.com/wchklaus97/knock-knock-frontend/pull/4) | History/retrieval and deletion hardening complete |
 | Phase 4 | — | [PR #5](https://github.com/wchklaus97/knock-knock-frontend/pull/5), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Local voice boundary and command submission complete |
-| Phase 5 | [integrated PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8) | [release PR #6](https://github.com/wchklaus97/knock-knock-frontend/pull/6) | Security/release integration in review |
+| Phase 5 | [integrated PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8) | [release PR #6](https://github.com/wchklaus97/knock-knock-frontend/pull/6), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Security/release integration in review |
 
 Verified in the current integration branches: OpenAPI and migration smoke,
 adversarial SQL isolation/deletion/lease tests, Rust unit tests, Rust WASM
