@@ -10,13 +10,13 @@ and Phase 0–3 integration baseline
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
 | Backend base | `agent/phase45-completion-backend` | `2977322` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | current local checkpoint | not pushed; PR not opened |
+| Backend follow-up | `agent/phase45-completion-backend` | `61941c6` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
-The branches are intentionally based on the merged Phase 0–3 integration
-baseline. They are not merged, deployed, or applied to production
-automatically; the paired review and release gates still require human
-approval.
+The follow-up branch is based on merged PR #10. PR #11 is pushed and its
+GitHub Actions Rust backend CI run passed; it is not merged, deployed, or
+applied to production. Paired review and the remaining release gates still
+require human approval.
 
 ## Implemented baseline
 
@@ -85,6 +85,7 @@ approval.
 - `scripts/production-config-smoke.sh` — passed, including the staging
   template and staging fail-closed checks
 - `scripts/phase45-release-gate.sh` — passed
+- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31337741292) — passed
 - `scripts/contract-smoke.sh` against an isolated local Worker + local D1 —
   passed, including command list, pairing status, push dismissal, and the
   existing multi-turn session/action loop.
@@ -125,7 +126,7 @@ These are deliberately not marked as passed:
 - independent staging Worker + D1 creation and route-level D1/E2E smoke
   plus R2 bucket creation and route-level D1/R2/E2E smoke against those
   deployed bindings;
-- the GitHub CI run and paired PR review for this follow-up branch;
+- paired PR review for [PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11);
 - production provider selection, provider sandbox/contract evidence, real
   provider credentials, vendor-specific cancellation/reconciliation policy,
   and production rollout approval (the generic lifecycle adapter is

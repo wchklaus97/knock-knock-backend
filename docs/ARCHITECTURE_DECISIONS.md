@@ -96,11 +96,11 @@ safety gaps without changing the REST + SSE baseline:
 The remaining backend work is release evidence and deployment configuration,
 not a new transport: create the independent staging D1/Worker and R2 bucket,
 validate the chosen provider endpoints in their sandbox and configure their
-production secrets, run remote D1/E2E and GitHub CI, complete the formal
-security and observability reviews, verify APNs on a real device, and obtain
-human approval for migration/deployment/secret rollout. The generic provider
-adapter, lifecycle reconciliation, R2 stream, local due scanner,
-contract-breaking gate, retention sweep, and local dynamic smokes are
+production secrets, run remote D1/E2E, complete the formal security and
+observability reviews, verify APNs on a real device, and obtain human approval
+for migration/deployment/secret rollout. The PR #11 GitHub CI run is green.
+The generic provider adapter, lifecycle reconciliation, R2 stream, local due
+scanner, contract-breaking gate, retention sweep, and local dynamic smokes are
 implemented and verified in this branch.
 
 ## Decision register
