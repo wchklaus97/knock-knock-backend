@@ -643,27 +643,37 @@ pub async fn require_user(
     env: &Env,
     db: &D1Database,
 ) -> ApiResult<UserPrincipal> {
-    if supabase_auth_enabled(env) {
-        return resolve_supabase_user(request, env, db).await;
-    }
-    let value = authorization_header(request)?
-        .ok_or_else(|| ApiError::unauthorized("Missing Bearer token"))?;
-    let token = value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::unauthorized("Missing Bearer token"))?;
-    let user = verify_user_token(env, token)?;
-    let existing: Option<IdRow> = db::first(
+    let user = if supabase_auth_enabled(env) {
+        resolve_supabase_user(request, env, db).await?
+    } else {
+        let value = authorization_header(request)?
+            .ok_or_else(|| ApiError::unauthorized("Missing Bearer token"))?;
+        let token = value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::unauthorized("Missing Bearer token"))?;
+        let user = verify_user_token(env, token)?;
+        let existing: Option<IdRow> = db::first(
+            db,
+            "SELECT id FROM users WHERE id = ?",
+            vec![db::text(&user.user_id)],
+        )
+        .await?;
+        if existing.is_none() {
+            return Err(ApiError::unauthorized("User not found"));
+        }
+        user
+    };
+    let device_id = request.headers().get("x-device-id")?;
+    crate::rate_limits::enforce_authenticated(
         db,
-        "SELECT id FROM users WHERE id = ?",
-        vec![db::text(&user.user_id)],
+        request.path().as_str(),
+        &format!("user:{}", user.user_id),
+        device_id.as_deref(),
     )
     .await?;
-    if existing.is_none() {
-        return Err(ApiError::unauthorized("User not found"));
-    }
     Ok(user)
 }
 
@@ -677,10 +687,18 @@ pub async fn require_agent(request: &Request, db: &D1Database) -> ApiResult<Agen
     )
     .await?;
     let row = row.ok_or_else(|| ApiError::unauthorized("Invalid agent key"))?;
-    Ok(AgentPrincipal {
+    let principal = AgentPrincipal {
         agent_id: row.id,
         user_id: row.user_id,
-    })
+    };
+    crate::rate_limits::enforce_authenticated(
+        db,
+        request.path().as_str(),
+        &format!("agent:{}", principal.agent_id),
+        None,
+    )
+    .await?;
+    Ok(principal)
 }
 
 pub async fn require_user_or_agent(
@@ -691,6 +709,14 @@ pub async fn require_user_or_agent(
     if supabase_auth_enabled(env) {
         if bearer_token(request)?.is_some() {
             if let Ok(user) = resolve_supabase_user(request, env, db).await {
+                let device_id = request.headers().get("x-device-id")?;
+                crate::rate_limits::enforce_authenticated(
+                    db,
+                    request.path().as_str(),
+                    &format!("user:{}", user.user_id),
+                    device_id.as_deref(),
+                )
+                .await?;
                 return Ok((Some(user), None));
             }
         }
@@ -709,6 +735,14 @@ pub async fn require_user_or_agent(
                     )
                     .await?;
                     if existing.is_some() {
+                        let device_id = request.headers().get("x-device-id")?;
+                        crate::rate_limits::enforce_authenticated(
+                            db,
+                            request.path().as_str(),
+                            &format!("user:{}", user.user_id),
+                            device_id.as_deref(),
+                        )
+                        .await?;
                         return Ok((Some(user), None));
                     }
                 }

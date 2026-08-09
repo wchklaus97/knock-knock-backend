@@ -20,6 +20,12 @@ fn category(path: &str) -> (&'static str, i64) {
         ("auth", 20)
     } else if path.starts_with("/v1/phone/commands") {
         ("command", 60)
+    } else if path == "/v1/phone/events" {
+        ("sse", 30)
+    } else if path == "/v1/phone/devices" {
+        ("device", 60)
+    } else if path.starts_with("/v1/phone/models") || path.starts_with("/v1/phone/model-fallback") {
+        ("model", 30)
     } else if path.starts_with("/v1/sessions/") || path.starts_with("/v1/actions/") {
         ("agent_event", 120)
     } else {
@@ -27,8 +33,7 @@ fn category(path: &str) -> (&'static str, i64) {
     }
 }
 
-pub async fn enforce(db: &D1Database, path: &str, identity: &str) -> ApiResult<()> {
-    let (kind, limit) = category(path);
+async fn enforce_bucket(db: &D1Database, kind: &str, limit: i64, identity: &str) -> ApiResult<()> {
     let bucket_key = format!("{}:{}", kind, digest(identity));
     let now = db::now_iso();
     let expires_at = db::add_seconds_iso(60);
@@ -62,4 +67,46 @@ pub async fn enforce(db: &D1Database, path: &str, identity: &str) -> ApiResult<(
         return Err(ApiError::rate_limited(60));
     }
     Ok(())
+}
+
+/// Applies the pre-authentication bucket. It intentionally receives only an
+/// edge-provided network identity; bearer tokens are not stable principals.
+pub async fn enforce(db: &D1Database, path: &str, identity: &str) -> ApiResult<()> {
+    let (kind, limit) = category(path);
+    enforce_bucket(db, kind, limit, identity).await
+}
+
+/// Applies verified user/agent limits and an optional per-device bucket. This
+/// is called after auth has resolved the principal, so token rotation cannot
+/// bypass the account quota.
+pub async fn enforce_authenticated(
+    db: &D1Database,
+    path: &str,
+    principal: &str,
+    device_id: Option<&str>,
+) -> ApiResult<()> {
+    let (kind, limit) = category(path);
+    enforce_bucket(db, kind, limit, principal).await?;
+    if let Some(device_id) = device_id.map(str::trim).filter(|value| !value.is_empty()) {
+        enforce_bucket(db, "device", 60, &format!("{principal}:{device_id}")).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::category;
+
+    #[test]
+    fn rate_limit_categories_cover_reconnect_and_model_paths() {
+        assert_eq!(category("/v1/auth/login"), ("auth", 20));
+        assert_eq!(category("/v1/phone/commands"), ("command", 60));
+        assert_eq!(category("/v1/phone/events"), ("sse", 30));
+        assert_eq!(category("/v1/phone/devices"), ("device", 60));
+        assert_eq!(category("/v1/phone/models/gemma"), ("model", 30));
+        assert_eq!(
+            category("/v1/actions/action_1/result"),
+            ("agent_event", 120)
+        );
+    }
 }

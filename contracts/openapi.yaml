@@ -627,9 +627,9 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [ok, updated, read_at]
+                required: [updated, read_at]
                 properties:
-                  ok: { type: boolean, const: true }
+                  ok: { type: boolean, const: true, description: Additive acknowledgement for v1 clients. }
                   updated: { type: integer, minimum: 0 }
                   read_at: { type: string, format: date-time }
         default:
@@ -954,7 +954,7 @@ components:
         created_at: { type: string, format: date-time }
     MessagePage:
       type: object
-      required: [items, messages, next_cursor, has_more]
+      required: [items, next_cursor]
       properties:
         items:
           type: array
@@ -963,7 +963,7 @@ components:
           type: array
           items: { $ref: '#/components/schemas/Message' }
         next_cursor: { type: [string, 'null'] }
-        has_more: { type: boolean }
+        has_more: { type: boolean, description: Additive pagination hint; absent in the checkpoint response. }
     HistoryPage:
       type: object
       required: [entries, next_cursor]
@@ -985,14 +985,14 @@ components:
         has_more: { type: boolean }
     SearchPage:
       type: object
-      required: [items, next_cursor, query, sessions, messages, retrieval_items]
+      required: [items, next_cursor]
       properties:
         query: { type: string }
         items:
           type: array
           items: { $ref: '#/components/schemas/Message' }
         next_cursor: { type: [string, 'null'] }
-        has_more: { type: boolean }
+        has_more: { type: boolean, description: Additive pagination hint; absent in the checkpoint response. }
         sessions:
           type: array
           items: { $ref: '#/components/schemas/SessionSummary' }
@@ -1025,12 +1025,16 @@ components:
     SseEvent:
       type: object
       description: Invalidation payload carried in each non-comment SSE frame. Full data is fetched through REST or /v1/phone/sync.
-      required: [id, type, session_id, version]
+      required: [id, type]
       properties:
         id: { type: string }
         type: { type: string, enum: [sync.required, session.updated, message.created, command.updated, push.updated] }
         session_id: { type: [string, 'null'] }
         version: { type: integer, minimum: 0 }
+        data:
+          type: object
+          additionalProperties: true
+          description: Legacy checkpoint payload retained for compatibility; canonical v1 sends invalidation fields above.
     EventResult:
       type: object
       required: [event_id, session]

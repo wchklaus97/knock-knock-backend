@@ -4,6 +4,29 @@
 > The canonical decisions live in `ARCHITECTURE_DECISIONS.md`; this document
 > defines agent boundaries, handoffs, verification, and release gates.
 
+## Execution status — 2026-08-09
+
+The staged implementation is in draft-PR review and has not been merged or
+deployed. The current dependency chain is:
+
+| Stage | Backend | iOS | Status |
+|---|---|---|---|
+| Checkpoint | [PR #1](https://github.com/wchklaus97/knock-knock-backend/pull/1) | [PR #1](https://github.com/wchklaus97/knock-knock-frontend/pull/1) | Baseline, human merge required |
+| Phase 0 | [PR #2](https://github.com/wchklaus97/knock-knock-backend/pull/2) | [PR #2](https://github.com/wchklaus97/knock-knock-frontend/pull/2) | Documents and contract complete |
+| Phase 1 | [PR #3](https://github.com/wchklaus97/knock-knock-backend/pull/3) | — | Foundation implementation complete |
+| Phase 2 | — | [PR #3](https://github.com/wchklaus97/knock-knock-frontend/pull/3) | SQLite/offline implementation complete |
+| Phase 3 | [PR #4](https://github.com/wchklaus97/knock-knock-backend/pull/4), [hardening PR #6](https://github.com/wchklaus97/knock-knock-backend/pull/6) | [PR #4](https://github.com/wchklaus97/knock-knock-frontend/pull/4) | History/retrieval and deletion hardening complete |
+| Phase 4 | — | [PR #5](https://github.com/wchklaus97/knock-knock-frontend/pull/5), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Local voice boundary and command submission complete |
+| Phase 5 | [integrated PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8) | [release PR #6](https://github.com/wchklaus97/knock-knock-frontend/pull/6) | Security/release integration in review |
+
+Verified in the current integration branches: OpenAPI and migration smoke,
+adversarial SQL isolation/deletion/lease tests, Rust unit tests, Rust WASM
+check, strict Clippy, iOS 15 simulator tests, and generic iOS build. Remaining
+human release gates are route-level D1/E2E tests against deployed bindings,
+security review, the 20–100 example golden voice dataset with device
+performance evidence, breaking-contract diff review, and approval of merge,
+production migrations, APNs changes, and model rollout.
+
 ## Operating rules
 
 1. The existing iOS and backend checkpoint PRs are the baseline. Do not add
@@ -188,4 +211,3 @@ Next dependent agent:
   silently discarded.
 - Model downloads use the last verified manifest on failure.
 - Production changes require an explicit human approval record.
-

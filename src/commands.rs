@@ -47,6 +47,7 @@ impl std::fmt::Display for CommandValidationError {
 impl std::error::Error for CommandValidationError {}
 
 const RISKS: [&str; 4] = ["low", "medium", "high", "destructive"];
+#[allow(dead_code)]
 const STATES: [&str; 10] = [
     "pending",
     "validated",
@@ -119,10 +120,12 @@ pub fn requires_confirmation(envelope: &CommandEnvelope, registry_requires: bool
         || matches!(envelope.risk_level.as_str(), "high" | "destructive")
 }
 
+#[allow(dead_code)]
 pub fn valid_state(state: &str) -> bool {
     STATES.contains(&state)
 }
 
+#[allow(dead_code)]
 pub fn valid_transition(from: Option<&str>, to: &str) -> bool {
     if !valid_state(to) {
         return false;
@@ -184,6 +187,7 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
 
 /// Keep this helper next to the validator so route handlers cannot accidentally
 /// trust a client-supplied user ID when a future envelope adds one.
+#[allow(dead_code)]
 pub fn require_owner(authenticated_user_id: &str, resource_user_id: &str) -> bool {
     !authenticated_user_id.is_empty() && authenticated_user_id == resource_user_id
 }
@@ -278,7 +282,7 @@ async fn validate_scope(
     if let Some(session_id) = envelope.session_id.as_deref() {
         if db::first::<crate::models::SessionRow>(
             db,
-            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, idempotency_key, expires_at, created_at, updated_at FROM sessions WHERE id = ? AND user_id = ?",
+            "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
             vec![db::text(session_id), db::text(user_id)],
         )
         .await?
