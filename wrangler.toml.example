@@ -2,6 +2,9 @@ name = "knock-knock-backend"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-04-16"
 
+[triggers]
+crons = ["*/1 * * * *"]
+
 [build]
 command = "worker-build --release"
 
