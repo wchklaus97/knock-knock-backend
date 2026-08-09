@@ -9,8 +9,8 @@ and Phase 0–3 integration baseline
 
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
-| Backend | `agent/phase45-completion-backend` | pending commit | pending draft PR |
-| iOS | `agent/phase45-completion-ios` | pending commit | pending draft PR |
+| Backend | `agent/phase45-completion-backend` | `2977322` | pending draft PR |
+| iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
 The branches are intentionally based on the merged Phase 0–3 integration
 baseline. They are not merged, deployed, or applied to production
