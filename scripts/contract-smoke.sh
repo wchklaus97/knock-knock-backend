@@ -18,6 +18,9 @@ get() {
 health="$(get "$BASE_URL/health")"
 test "$(jq -r '.ok' <<<"$health")" = "true"
 test "$(jq -r '.api' <<<"$health")" = "rust"
+v1_health="$(get "$BASE_URL/v1/health")"
+test "$(jq -r '.ok' <<<"$v1_health")" = "true"
+test "$(jq -r '.api' <<<"$v1_health")" = "rust"
 metrics="$(get "$BASE_URL/metrics")"
 grep -q 'knock_knock_api_info' <<<"$metrics"
 grep -q 'knock_knock_provider_ready' <<<"$metrics"
@@ -46,11 +49,15 @@ login="$(json -X POST "$BASE_URL/v1/auth/login" \
 test -n "$(jq -r '.token' <<<"$login")"
 agent="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/agents" \
   -d '{"label":"rust-contract-smoke","host_label":"local"}')"
-agent_key="$(jq -r '.api_key' <<<"$agent")"
+agent_id="$(jq -r '.agent.agent_id' <<<"$agent")"
+rotated_agent="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/agents/$agent_id/rotate-key")"
+agent_key="$(jq -r '.api_key' <<<"$rotated_agent")"
 test -n "$agent_key" && test "$agent_key" != "null"
 agent_auth=(-H "x-agent-key: $agent_key")
 agents="$(get "${user_auth[@]}" "$BASE_URL/v1/agents")"
 test "$(jq -r '.agents | length' <<<"$agents")" -ge 1
+skills="$(get "${user_auth[@]}" "$BASE_URL/v1/skills")"
+test "$(jq -r '.skills | length' <<<"$skills")" -ge 1
 
 device="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/devices" \
   -d '{"platform":"ios","locale":"zh-HK"}')"

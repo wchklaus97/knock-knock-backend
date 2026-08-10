@@ -169,6 +169,24 @@ paths:
                 $ref: '#/components/schemas/Agent'
         default:
           $ref: '#/components/responses/Error'
+  /v1/agents/{agent_id}/rotate-key:
+    post:
+      tags: [Agent]
+      operationId: rotateAgentKey
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Rotated agent credential. The API key is returned only once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateAgentKeyResponse'
+        default:
+          $ref: '#/components/responses/Error'
   /v1/agents/me/actions/pending:
     get:
       tags: [Agent]
@@ -262,6 +280,47 @@ paths:
                   label: { type: string }
         default:
           $ref: '#/components/responses/Error'
+  /v1/skills:
+    get:
+      tags: [Agent]
+      security:
+        - bearerAuth: []
+        - agentKey: []
+      operationId: listSkills
+      responses:
+        '200':
+          description: Backend-managed action skill registry.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [skills]
+                properties:
+                  skills:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SkillDefinition'
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      tags: [Agent]
+      security:
+        - bearerAuth: []
+        - agentKey: []
+      operationId: replaceSkill
+      description: Reserved registry-management route. It currently fails closed until an explicit backend admin scope is available.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillDefinition'
+      responses:
+        '403':
+          description: Skill registry is managed by the backend release process.
+          $ref: '#/components/responses/Error'
+        default:
+          $ref: '#/components/responses/Error'
   /v1/sessions:
     post:
       tags: [Agent]
@@ -277,6 +336,47 @@ paths:
       responses:
         '200':
           description: Existing or newly created session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetail'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/sessions/{session_id}:
+    get:
+      tags: [Agent]
+      security:
+        - bearerAuth: []
+        - agentKey: []
+      operationId: getSession
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Session detail for the owning user or agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetail'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/sessions/{session_id}/progress:
+    post:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: updateSessionProgress
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProgressRequest'
+      responses:
+        '200':
+          description: Updated session progress.
           content:
             application/json:
               schema:
@@ -910,6 +1010,48 @@ components:
         agent_id: { type: string }
         label: { type: string }
         host_label: { type: [string, 'null'] }
+    RotateAgentKeyResponse:
+      type: object
+      required: [agent, api_key]
+      properties:
+        agent:
+          $ref: '#/components/schemas/Agent'
+        api_key:
+          type: string
+          minLength: 1
+    SkillAction:
+      type: object
+      required: [id, risk, title]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 128 }
+        risk: { type: string, enum: [low, medium, high, destructive] }
+        confirm: { type: boolean, default: false }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        payload:
+          type: [object, 'null']
+          additionalProperties: true
+    SkillTtl:
+      type: object
+      required: [default_sec, destructive_sec]
+      properties:
+        default_sec: { type: integer, minimum: 1, maximum: 86400 }
+        destructive_sec: { type: integer, minimum: 1, maximum: 1800 }
+    SkillDefinition:
+      type: object
+      required: [skill_id, template, ttl]
+      properties:
+        skill_id: { type: string, minLength: 1, maxLength: 128 }
+        template: { type: string, minLength: 1 }
+        facts_schema:
+          type: array
+          items: { type: string }
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SkillAction'
+        ttl:
+          $ref: '#/components/schemas/SkillTtl'
+        version: { type: [integer, 'null'], minimum: 1 }
     PairingCode:
       type: object
       required: [code, expires_at]
@@ -950,6 +1092,16 @@ components:
         chat_id: { type: [string, 'null'] }
         facts:
           type: object
+          additionalProperties: true
+    ProgressRequest:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [started, running, blocked, succeeded, failed, cancelled] }
+        message: { type: [string, 'null'] }
+        percent: { type: [number, 'null'] }
+        facts:
+          type: [object, 'null']
           additionalProperties: true
     ReportEventRequest:
       type: object

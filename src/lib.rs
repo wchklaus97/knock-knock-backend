@@ -108,7 +108,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
     if method == Method::Options {
         return Ok(Response::empty()?);
     }
-    if path == "/health" && method == Method::Get {
+    if matches!(path.as_str(), "/health" | "/v1/health") && method == Method::Get {
         return json_response(
             json!({
                 "ok": true,
