@@ -137,6 +137,13 @@ if ! curl --fail --silent --max-time 2 \
 fi
 
 BASE_URL="http://127.0.0.1:${WORKER_PORT}" \
+"${ROOT_DIR}/scripts/provider-observability-smoke.sh"
+
+if rg -F --quiet "${TOKEN}" "${TMP_DIR}/provider.log" "${TMP_DIR}/worker.log"; then
+  show_failure "provider credentials appeared in local logs"
+fi
+
+BASE_URL="http://127.0.0.1:${WORKER_PORT}" \
 PROVIDER_RECONCILE_WAIT_SECONDS="${PROVIDER_RECONCILE_WAIT_SECONDS:-6}" \
 SMOKE_EMAIL="${SMOKE_EMAIL:-provider-local-$(date +%s)-$$@local.test}" \
 "${ROOT_DIR}/scripts/provider-lifecycle-smoke.sh"

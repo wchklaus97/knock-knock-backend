@@ -39,6 +39,9 @@ the isolated mock gate:
 ./scripts/provider-local-gate.sh
 ```
 
+The gate also checks provider readiness metrics, request-ID fallback behavior,
+and that the local provider credential is absent from Worker/provider logs.
+
 The local endpoint is `http://127.0.0.1:8787`. For the iPhone, use the Mac's
 LAN address instead of `127.0.0.1`.
 

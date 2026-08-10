@@ -161,6 +161,9 @@ deterministic `scripts/provider-mock.py` boundary, starts a local Worker with
 `external` mode, and runs the lifecycle smoke. To run the lower-level smoke
 against an already configured Worker, set `BASE_URL` and use
 `scripts/provider-lifecycle-smoke.sh` directly.
+It also runs `scripts/provider-observability-smoke.sh` to verify readiness
+gauges, request-ID validation, and generated fallback correlation IDs, and
+checks that the local provider token does not appear in Worker/provider logs.
 
 Run the local gate first, then repeat the lifecycle matrix against the selected
 vendor sandbox with fresh test identifiers. Do not place vendor tokens in shell

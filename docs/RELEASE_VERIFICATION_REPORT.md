@@ -115,6 +115,10 @@ release gates still require human approval. The numbered gate handoff is tracked
 - `scripts/provider-local-gate.sh` — passed; it created isolated
   local D1 persistence, started the deterministic mock boundary and an
   `external` Worker, then completed the full provider lifecycle smoke.
+- `scripts/provider-observability-smoke.sh` — passed against that isolated
+  Worker; readiness gauges, valid/invalid request-ID behavior, and generated
+  fallback correlation IDs were verified, and the local provider token was
+  absent from the Worker/provider logs.
 - `scripts/production-config-smoke.sh` — passed, including the staging
   template and staging fail-closed checks
 - `scripts/backup-restore-smoke.sh` — passed for encrypted export/decrypt,

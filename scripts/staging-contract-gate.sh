@@ -22,6 +22,9 @@ jq -e '
 ' <<<"${health}" >/dev/null
 
 BASE_URL="${BASE_URL}" \
+  "${ROOT_DIR}/scripts/provider-observability-smoke.sh"
+
+BASE_URL="${BASE_URL}" \
 SMOKE_EMAIL="${SMOKE_EMAIL}" \
 SMOKE_PASSWORD="${SMOKE_PASSWORD}" \
   "${ROOT_DIR}/scripts/supabase-auth-smoke.sh"

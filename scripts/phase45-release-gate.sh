@@ -23,11 +23,13 @@ test -x ./scripts/r2-download-smoke.sh
 test -x ./scripts/provider-lifecycle-smoke.sh
 test -x ./scripts/provider-local-gate.sh
 test -x ./scripts/provider-mock.py
+test -x ./scripts/provider-observability-smoke.sh
 test -x ./scripts/staging-contract-gate.sh
 for script in \
   ./scripts/r2-download-smoke.sh \
   ./scripts/provider-lifecycle-smoke.sh \
   ./scripts/provider-local-gate.sh \
+  ./scripts/provider-observability-smoke.sh \
   ./scripts/staging-contract-gate.sh; do
   bash -n "$script"
 done
