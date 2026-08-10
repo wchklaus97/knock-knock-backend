@@ -136,6 +136,7 @@ pub enum CommandState {
     Failed,
     Expired,
     Cancelled,
+    Retryable,
     Unknown,
 }
 
@@ -152,6 +153,7 @@ pub enum CommandRisk {
 /// Canonical v1 command envelope. Model output is untrusted input; the
 /// backend must validate every field before it changes state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandEnvelope {
     pub schema_version: i32,
     pub command_id: String,
@@ -271,6 +273,9 @@ pub struct OutboxEventRow {
     pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// A random, single-claim lease fence. It is never returned to clients.
+    pub lease_token: Option<String>,
+    pub lease_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

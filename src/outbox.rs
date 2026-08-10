@@ -16,6 +16,14 @@ const MAX_ATTEMPTS: i32 = 3;
 const LEASE_SECONDS: i64 = 300;
 const UNKNOWN_RECONCILE_SECONDS: i64 = 300;
 
+fn outbox_select() -> &'static str {
+    "SELECT id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, next_attempt_at, last_error, created_at, updated_at, lease_token, lease_expires_at FROM outbox_events"
+}
+
+fn lease_fence_sql() -> &'static str {
+    " AND (lease_token = ? OR (lease_token IS NULL AND ? IS NULL))"
+}
+
 #[derive(Debug, Deserialize)]
 struct CommandPayload {
     command_id: String,
@@ -41,21 +49,25 @@ impl ExecutionFailure {
 
 pub async fn drain(db: &D1Database, env: &worker::Env) -> ApiResult<usize> {
     let provider_config = providers::load(env)?;
+    commands::expire_due(db).await?;
     recover_stale_claims(db).await?;
     let now = db::now_iso();
     let rows: Vec<OutboxEventRow> = db::all(
         db,
-        "SELECT id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, next_attempt_at, last_error, created_at, updated_at FROM outbox_events WHERE state IN ('queued', 'retrying', 'unknown') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
+        &format!(
+            "{} WHERE state IN ('queued', 'retrying', 'unknown') AND lease_token IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
+            outbox_select()
+        ),
         vec![db::text(&now), db::number(BATCH_SIZE)],
     )
     .await?;
 
     let mut processed = 0;
     for row in rows {
-        if claim(db, &row).await? {
+        if let Some(claimed) = claim(db, &row).await? {
             processed += 1;
-            if let Err(error) = process_claimed(db, env, &row, provider_config.clone()).await {
-                settle_processing_error(db, &row, &error).await?;
+            if let Err(error) = process_claimed(db, env, &claimed, provider_config.clone()).await {
+                settle_processing_error(db, &claimed, &error).await?;
             }
         }
     }
@@ -68,10 +80,14 @@ pub async fn drain(db: &D1Database, env: &worker::Env) -> ApiResult<usize> {
 /// version fence prevents the old invocation from reporting a late success.
 async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
     let cutoff = db::add_seconds_iso(-LEASE_SECONDS);
+    let now = db::now_iso();
     let rows: Vec<OutboxEventRow> = db::all(
         db,
-        "SELECT id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, next_attempt_at, last_error, created_at, updated_at FROM outbox_events WHERE state = 'running' AND updated_at <= ? ORDER BY updated_at ASC LIMIT ?",
-        vec![db::text(&cutoff), db::number(BATCH_SIZE)],
+        &format!(
+            "{} WHERE state = 'running' AND ((lease_expires_at IS NOT NULL AND lease_expires_at <= ?) OR (lease_expires_at IS NULL AND updated_at <= ?)) ORDER BY updated_at ASC LIMIT ?",
+            outbox_select()
+        ),
+        vec![db::text(&now), db::text(&cutoff), db::number(BATCH_SIZE)],
     )
     .await?;
 
@@ -111,7 +127,7 @@ async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
         let statements = vec![
             db::prepare(
                 db,
-                "UPDATE commands SET state = 'unknown', error_code = 'worker_lease_expired', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'running' AND version = ? AND updated_at <= ?",
+                "UPDATE commands SET state = 'retryable', error_code = 'worker_lease_expired', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'running' AND version = ? AND updated_at <= ?",
                 vec![
                     db::number(next_version),
                     db::text(&now),
@@ -123,11 +139,16 @@ async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
             )?,
             db::prepare(
                 db,
-                "UPDATE outbox_events SET state = 'retrying', next_attempt_at = ?, last_error = 'worker_lease_expired', updated_at = ? WHERE id = ? AND state = 'running' AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'unknown' AND version = ?)",
+                &format!(
+                    "UPDATE outbox_events SET state = 'retrying', next_attempt_at = ?, last_error = 'worker_lease_expired', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'running' AND changes() = 1{} AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'retryable' AND version = ?)",
+                    lease_fence_sql()
+                ),
                 vec![
                     db::text(&now),
                     db::text(&now),
                     db::text(&row.id),
+                    db::optional_text(row.lease_token.as_deref()),
+                    db::optional_text(row.lease_token.as_deref()),
                     db::text(&command.id),
                     db::text(user_id),
                     db::number(next_version),
@@ -135,12 +156,12 @@ async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
             )?,
             db::prepare(
                 db,
-                "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.unknown', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'unknown' AND version = ?)",
-                vec![
-                    db::text(&new_id("aud")?),
-                    db::text(user_id),
-                    db::optional_text(command.session_id.as_deref()),
-                    db::text(&json!({"command_id": command.id, "reason": "worker_lease_expired"}).to_string()),
+                    "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.retryable', ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'retryable' AND version = ?)",
+                    vec![
+                        db::text(&new_id("aud")?),
+                        db::text(user_id),
+                        db::optional_text(command.session_id.as_deref()),
+                        db::text(&json!({"command_id": command.id, "reason": "worker_lease_expired", "retryable": true}).to_string()),
                     db::text(&now),
                     db::text(&command.id),
                     db::text(user_id),
@@ -149,7 +170,7 @@ async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
             )?,
             db::prepare(
                 db,
-                "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'unknown' AND version = ?)",
+                    "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'retryable' AND version = ?)",
                 vec![
                     db::text(user_id),
                     db::text(&command.id),
@@ -167,15 +188,32 @@ async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
     Ok(())
 }
 
-async fn claim(db: &D1Database, row: &OutboxEventRow) -> ApiResult<bool> {
+async fn claim(db: &D1Database, row: &OutboxEventRow) -> ApiResult<Option<OutboxEventRow>> {
     let now = db::now_iso();
+    let lease_token = new_id("lease")?;
+    let lease_expires_at = db::add_seconds_iso(LEASE_SECONDS);
     let result = db::run(
         db,
-        "UPDATE outbox_events SET state = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ? AND state IN ('queued', 'retrying', 'unknown') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
-        vec![db::text(&now), db::text(&row.id), db::text(&now)],
+        "UPDATE outbox_events SET state = 'running', attempts = attempts + 1, lease_token = ?, lease_expires_at = ?, updated_at = ? WHERE id = ? AND state IN ('queued', 'retrying', 'unknown') AND lease_token IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
+        vec![
+            db::text(&lease_token),
+            db::text(&lease_expires_at),
+            db::text(&now),
+            db::text(&row.id),
+            db::text(&now),
+        ],
     )
     .await?;
-    Ok(db::changes(&result) == 1)
+    if db::changes(&result) != 1 {
+        return Ok(None);
+    }
+    let mut claimed = row.clone();
+    claimed.state = "running".to_string();
+    claimed.attempts += 1;
+    claimed.updated_at = now;
+    claimed.lease_token = Some(lease_token);
+    claimed.lease_expires_at = Some(lease_expires_at);
+    Ok(Some(claimed))
 }
 
 async fn process_claimed(
@@ -193,9 +231,20 @@ async fn process_claimed(
         return settle_orphan(db, row, "missing_command_id").await;
     }
 
-    let command = commands::get_for_user(db, user_id, &payload.command_id)
+    let mut command = commands::get_for_user(db, user_id, &payload.command_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Command for outbox event was not found"))?;
+
+    if command.expires_at.as_deref().is_some_and(db::is_expired)
+        && matches!(
+            command.state.as_str(),
+            "pending" | "validated" | "queued" | "retryable" | "unknown"
+        )
+    {
+        command = commands::expire_if_due(db, user_id, &command.id)
+            .await?
+            .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;
+    }
 
     if let Some(session_id) = command.session_id.as_deref() {
         match commands::ensure_session_live(db, user_id, session_id).await {
@@ -240,19 +289,20 @@ async fn start_command(db: &D1Database, user_id: &str, command: &CommandRow) -> 
     let statements = vec![
         db::prepare(
             db,
-            "UPDATE commands SET state = 'running', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'unknown') AND version = ? AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL))",
+            "UPDATE commands SET state = 'running', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'retryable', 'unknown') AND version = ? AND (expires_at IS NULL OR expires_at > ?) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL))",
             vec![
                 db::number(next_version),
                 db::text(&now),
                 db::text(&command.id),
                 db::text(user_id),
                 db::number(command.version),
+                db::text(&now),
                 db::text(user_id),
             ],
         )?,
         db::prepare(
             db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.running', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'running' AND version = ?)",
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.running', ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'running' AND version = ?)",
             vec![
                 db::text(&new_id("aud")?),
                 db::text(user_id),
@@ -266,7 +316,7 @@ async fn start_command(db: &D1Database, user_id: &str, command: &CommandRow) -> 
         )?,
         db::prepare(
             db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'running' AND version = ?)",
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'running' AND version = ?)",
             vec![
                 db::text(user_id),
                 db::text(&command.id),
@@ -297,7 +347,7 @@ async fn settle_deleted_command(
     let statements = vec![
         db::prepare(
             db,
-            "UPDATE commands SET state = 'cancelled', error_code = 'session_deleted', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'unknown') AND version = ?",
+            "UPDATE commands SET state = 'cancelled', error_code = 'session_deleted', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'retryable', 'unknown') AND version = ?",
             vec![
                 db::number(next_version),
                 db::text(&now),
@@ -308,12 +358,20 @@ async fn settle_deleted_command(
         )?,
         db::prepare(
             db,
-            "UPDATE outbox_events SET state = 'failed', next_attempt_at = NULL, last_error = 'session_deleted', updated_at = ? WHERE id = ? AND state = 'running'",
-            vec![db::text(&now), db::text(&row.id)],
+            &format!(
+                "UPDATE outbox_events SET state = 'failed', next_attempt_at = NULL, last_error = 'session_deleted', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'running' AND changes() = 1{}",
+                lease_fence_sql()
+            ),
+            vec![
+                db::text(&now),
+                db::text(&row.id),
+                db::optional_text(row.lease_token.as_deref()),
+                db::optional_text(row.lease_token.as_deref()),
+            ],
         )?,
         db::prepare(
             db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.cancelled', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'cancelled' AND version = ?)",
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.cancelled', ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'cancelled' AND version = ?)",
             vec![
                 db::text(&new_id("aud")?),
                 db::text(user_id),
@@ -327,7 +385,7 @@ async fn settle_deleted_command(
         )?,
         db::prepare(
             db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'cancelled' AND version = ?)",
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'cancelled' AND version = ?)",
             vec![
                 db::text(user_id),
                 db::text(&command.id),
@@ -396,6 +454,16 @@ fn classify_error(error: ApiError) -> ExecutionFailure {
     }
 }
 
+fn command_failure_state(retryable: bool, automatic_retry: bool) -> &'static str {
+    if automatic_retry {
+        "retryable"
+    } else if retryable {
+        "unknown"
+    } else {
+        "failed"
+    }
+}
+
 async fn finish_success(
     db: &D1Database,
     row: &OutboxEventRow,
@@ -420,10 +488,15 @@ async fn finish_success(
         )?,
         db::prepare(
             db,
-            "UPDATE outbox_events SET state = 'succeeded', next_attempt_at = NULL, last_error = NULL, updated_at = ? WHERE id = ? AND state = 'running' AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
+            &format!(
+                "UPDATE outbox_events SET state = 'succeeded', next_attempt_at = NULL, last_error = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'running' AND changes() = 1{} AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
+                lease_fence_sql()
+            ),
             vec![
                 db::text(&now),
                 db::text(&row.id),
+                db::optional_text(row.lease_token.as_deref()),
+                db::optional_text(row.lease_token.as_deref()),
                 db::text(&command.id),
                 db::text(user_id),
                 db::number(version),
@@ -431,7 +504,7 @@ async fn finish_success(
         )?,
         db::prepare(
             db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.succeeded', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.succeeded', ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
             vec![
                 db::text(&new_id("aud")?),
                 db::text(user_id),
@@ -445,7 +518,7 @@ async fn finish_success(
         )?,
         db::prepare(
             db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
             vec![
                 db::text(user_id),
                 db::text(&command.id),
@@ -471,15 +544,14 @@ async fn finish_failure(
     expected_state: &str,
 ) -> ApiResult<()> {
     let now = db::now_iso();
-    let attempt = row.attempts + 1;
+    let attempt = row.attempts.max(1);
     let retryable = failure.retryable();
     let retry = retryable && attempt < MAX_ATTEMPTS;
-    // A retryable provider/network result is never converted into a false
-    // terminal failure. After the automatic retry budget is exhausted the
-    // command remains `unknown` and the outbox row becomes a durable
-    // reconciliation/dead-letter record for an operator or a future status
-    // worker. Only validation/business failures become `failed`.
-    let command_state = if retryable { "unknown" } else { "failed" };
+    // Automatic transient failures remain explicitly `retryable` while the
+    // outbox has another scheduled attempt. Once the retry budget is spent,
+    // the outcome becomes `unknown` and must be reconciled before success is
+    // ever reported. Only validation/business failures become `failed`.
+    let command_state = command_failure_state(retryable, retry);
     let outbox_state = if retry {
         "retrying"
     } else if retryable {
@@ -513,13 +585,18 @@ async fn finish_failure(
         )?,
         db::prepare(
             db,
-            "UPDATE outbox_events SET state = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ? AND state = 'running' AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = ? AND version = ?)",
+            &format!(
+                "UPDATE outbox_events SET state = ?, next_attempt_at = ?, last_error = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'running' AND changes() = 1{} AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = ? AND version = ?)",
+                lease_fence_sql()
+            ),
             vec![
                 db::text(outbox_state),
                 db::optional_text(retry_at.as_deref()),
                 db::text(&error.code),
                 db::text(&now),
                 db::text(&row.id),
+                db::optional_text(row.lease_token.as_deref()),
+                db::optional_text(row.lease_token.as_deref()),
                 db::text(&command.id),
                 db::text(user_id),
                 db::text(command_state),
@@ -528,7 +605,7 @@ async fn finish_failure(
         )?,
         db::prepare(
             db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = ? AND version = ?)",
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, ?, ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = ? AND version = ?)",
             vec![
                 db::text(&new_id("aud")?),
                 db::text(user_id),
@@ -550,7 +627,7 @@ async fn finish_failure(
         )?,
         db::prepare(
             db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = ? AND version = ?)",
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = ? AND version = ?)",
             vec![
                 db::text(user_id),
                 db::text(&command.id),
@@ -572,7 +649,7 @@ async fn finish_failure(
         );
         statements.push(db::prepare(
             db,
-            "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?) ON CONFLICT(provider, provider_idempotency_key) DO UPDATE SET state = excluded.state, attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at, last_error = excluded.last_error, updated_at = excluded.updated_at",
+            "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) SELECT ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ? WHERE changes() = 1 ON CONFLICT(provider, provider_idempotency_key) DO UPDATE SET state = excluded.state, attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at, last_error = excluded.last_error, updated_at = excluded.updated_at",
             vec![
                 db::text(&new_id("attempt")?),
                 db::text(user_id),
@@ -612,7 +689,7 @@ async fn release_runtime_error(
     row: &OutboxEventRow,
     error: &ApiError,
 ) -> ApiResult<()> {
-    let attempt = row.attempts + 1;
+    let attempt = row.attempts.max(1);
     let retryable = error.retryable;
     let retry = retryable && attempt < MAX_ATTEMPTS;
     let next_attempt_at = if retry {
@@ -625,19 +702,24 @@ async fn release_runtime_error(
     let now = db::now_iso();
     db::run(
         db,
-        "UPDATE outbox_events SET state = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ? AND state = 'running'",
+        &format!(
+            "UPDATE outbox_events SET state = ?, next_attempt_at = ?, last_error = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'running'{}",
+            lease_fence_sql()
+        ),
         vec![
-                db::text(if retry {
-                    "retrying"
-                } else if retryable {
-                    "unknown"
-                } else {
-                    "failed"
-                }),
+            db::text(if retry {
+                "retrying"
+            } else if retryable {
+                "unknown"
+            } else {
+                "failed"
+            }),
             db::optional_text(next_attempt_at.as_deref()),
             db::text(&error.code),
             db::text(&now),
             db::text(&row.id),
+            db::optional_text(row.lease_token.as_deref()),
+            db::optional_text(row.lease_token.as_deref()),
         ],
     )
     .await?;
@@ -660,7 +742,7 @@ async fn settle_processing_error(
     };
     if matches!(
         command.state.as_str(),
-        "pending" | "validated" | "queued" | "unknown" | "running"
+        "pending" | "validated" | "queued" | "retryable" | "unknown" | "running"
     ) {
         return finish_failure(
             db,
@@ -678,11 +760,16 @@ async fn settle_processing_error(
 async fn settle_orphan(db: &D1Database, row: &OutboxEventRow, reason: &str) -> ApiResult<()> {
     db::run(
         db,
-        "UPDATE outbox_events SET state = 'failed', next_attempt_at = NULL, last_error = ?, updated_at = ? WHERE id = ? AND state = 'running'",
+        &format!(
+            "UPDATE outbox_events SET state = 'failed', next_attempt_at = NULL, last_error = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'running'{}",
+            lease_fence_sql()
+        ),
         vec![
             db::text(reason),
             db::text(&db::now_iso()),
             db::text(&row.id),
+            db::optional_text(row.lease_token.as_deref()),
+            db::optional_text(row.lease_token.as_deref()),
         ],
     )
     .await?;
@@ -712,6 +799,20 @@ mod tests {
         assert!(classify_error(ApiError::new(503, "timeout", "retry")).retryable());
         assert!(classify_error(ApiError::new(425, "stale", "retry")).retryable());
         assert!(!classify_error(ApiError::validation("bad input")).retryable());
+    }
+
+    #[test]
+    fn command_failures_keep_retryable_distinct_from_unknown() {
+        assert_eq!(command_failure_state(true, true), "retryable");
+        assert_eq!(command_failure_state(true, false), "unknown");
+        assert_eq!(command_failure_state(false, false), "failed");
+    }
+
+    #[test]
+    fn outbox_queries_include_explicit_lease_columns_and_fence() {
+        assert!(outbox_select().contains("lease_token, lease_expires_at"));
+        assert!(lease_fence_sql().contains("lease_token = ?"));
+        assert!(lease_fence_sql().contains("lease_token IS NULL"));
     }
 
     #[test]
