@@ -24,6 +24,10 @@ fn lease_fence_sql() -> &'static str {
     " AND (lease_token = ? OR (lease_token IS NULL AND ? IS NULL))"
 }
 
+fn confirmation_fence_sql() -> &'static str {
+    " AND (needs_confirmation = 0 OR EXISTS (SELECT 1 FROM confirmation_tokens WHERE command_id = commands.id AND user_id = commands.user_id AND command_hash = commands.command_hash AND used_at IS NOT NULL))"
+}
+
 #[derive(Debug, Deserialize)]
 struct CommandPayload {
     command_id: String,
@@ -230,6 +234,9 @@ async fn process_claimed(
     if payload.command_id.trim().is_empty() {
         return settle_orphan(db, row, "missing_command_id").await;
     }
+    if payload.command_id != row.aggregate_id {
+        return settle_orphan(db, row, "outbox_command_mismatch").await;
+    }
 
     let mut command = commands::get_for_user(db, user_id, &payload.command_id)
         .await?
@@ -272,6 +279,18 @@ async fn process_claimed(
         .await;
     }
 
+    if !commands::execution_policy_matches(
+        &command.intent,
+        &command.risk_level,
+        command.needs_confirmation != 0,
+    ) {
+        return Err(ApiError::new(
+            422,
+            "command_policy_mismatch",
+            "Command policy does not match the registered action",
+        ));
+    }
+
     start_command(db, user_id, &command).await?;
     let current = commands::get_for_user(db, user_id, &command.id)
         .await?
@@ -289,7 +308,10 @@ async fn start_command(db: &D1Database, user_id: &str, command: &CommandRow) -> 
     let statements = vec![
         db::prepare(
             db,
-            "UPDATE commands SET state = 'running', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'retryable', 'unknown') AND version = ? AND (expires_at IS NULL OR expires_at > ?) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL))",
+            &format!(
+                "UPDATE commands SET state = 'running', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'retryable', 'unknown') AND version = ? AND (expires_at IS NULL OR expires_at > ?) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL)){}",
+                confirmation_fence_sql()
+            ),
             vec![
                 db::number(next_version),
                 db::text(&now),
@@ -813,6 +835,14 @@ mod tests {
         assert!(outbox_select().contains("lease_token, lease_expires_at"));
         assert!(lease_fence_sql().contains("lease_token = ?"));
         assert!(lease_fence_sql().contains("lease_token IS NULL"));
+    }
+
+    #[test]
+    fn execution_query_requires_used_confirmation_for_protected_commands() {
+        let query = confirmation_fence_sql();
+        assert!(query.contains("needs_confirmation = 0"));
+        assert!(query.contains("confirmation_tokens"));
+        assert!(query.contains("used_at IS NOT NULL"));
     }
 
     #[test]

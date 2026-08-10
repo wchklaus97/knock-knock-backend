@@ -135,6 +135,9 @@ pub async fn execute(
         }
     }
 
+    commands::validate_action_args(&command.intent, args)
+        .map_err(|error| ApiError::validation(error.to_string()))?;
+
     // Persist the provider-level running fence before making any external
     // request. If the Worker stops during the request, the next outbox retry
     // can reconcile this durable key through the provider status endpoint
