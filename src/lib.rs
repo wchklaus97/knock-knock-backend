@@ -1432,7 +1432,11 @@ fn phone_change_event_type(entity_type: &str) -> &'static str {
         "message" => "message.created",
         "command" => "command.updated",
         "push" => "push.updated",
-        "retrieval" => "message.created",
+        // Retrieval changes are represented by the sync cursor, not a
+        // message-created notification. This keeps the legacy SSE vocabulary
+        // stable while forcing clients to reconcile retrieval tombstones and
+        // metadata changes through the authoritative snapshot.
+        "retrieval" => "sync.required",
         _ => "sync.required",
     }
 }
@@ -1971,7 +1975,7 @@ fn add_common_headers(
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_request_id, validate_model_manifest};
+    use super::{phone_change_event_type, valid_request_id, validate_model_manifest};
     use serde_json::json;
 
     #[test]
@@ -1998,5 +2002,11 @@ mod tests {
         assert!(!valid_request_id("req bad"));
         assert!(!valid_request_id("req\nlog-injection"));
         assert!(!valid_request_id(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn retrieval_changes_require_snapshot_reconciliation() {
+        assert_eq!(phone_change_event_type("retrieval"), "sync.required");
+        assert_eq!(phone_change_event_type("message"), "message.created");
     }
 }
