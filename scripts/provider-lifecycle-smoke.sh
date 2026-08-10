@@ -49,7 +49,7 @@ test "$(jq -r '.state' <<<"${success_result}")" = "succeeded"
 test "$(jq -r '.result.provider' <<<"${success_result}")" = "external.reminder"
 test "$(jq -r '.result.provider_id' <<<"${success_result}")" != "null"
 if [[ -n "${PROVIDER_LOG}" ]]; then
-  success_delivery_count="$(rg -c '\[provider-mock\] POST /reminders/deliver' "${PROVIDER_LOG}" || true)"
+  success_delivery_count="$(grep -Ec '\[provider-mock\] POST /reminders/deliver' "${PROVIDER_LOG}" || true)"
   test "${success_delivery_count}" = "1"
 fi
 undo="$(json "${user_auth[@]}" -X POST \
@@ -61,7 +61,7 @@ duplicate_success="$(create_reminder "${success_id}" "${success_key}")"
 test "$(jq -r '.state' <<<"${duplicate_success}")" = "succeeded"
 test "$(jq -r '.result.provider_id' <<<"${duplicate_success}")" = "$(jq -r '.result.provider_id' <<<"${success_result}")"
 if [[ -n "${PROVIDER_LOG}" ]]; then
-  duplicate_success_delivery_count="$(rg -c '\[provider-mock\] POST /reminders/deliver' "${PROVIDER_LOG}" || true)"
+  duplicate_success_delivery_count="$(grep -Ec '\[provider-mock\] POST /reminders/deliver' "${PROVIDER_LOG}" || true)"
   test "${duplicate_success_delivery_count}" = "1"
 fi
 
@@ -86,7 +86,7 @@ test "$(jq -r '.result.undo.status' <<<"${cancel_final}")" = "cancelled"
 reconcile_id="cmd-status-reconcile-$(date +%s%N)"
 reconcile_key="idem-status-reconcile-$(date +%s%N)"
 if [[ -n "${PROVIDER_LOG}" ]]; then
-  reconcile_delivery_before="$(rg -c '\[provider-mock\] POST /reminders/deliver' "${PROVIDER_LOG}" || true)"
+  reconcile_delivery_before="$(grep -Ec '\[provider-mock\] POST /reminders/deliver' "${PROVIDER_LOG}" || true)"
 fi
 reconcile="$(create_reminder "${reconcile_id}" "${reconcile_key}")"
 test "$(jq -r '.state' <<<"${reconcile}")" = "queued"
@@ -101,7 +101,7 @@ final="$(curl --fail-with-body --silent --show-error "${user_auth[@]}" \
 test "$(jq -r '.state' <<<"${final}")" = "succeeded"
 test "$(jq -r '.result.provider_id' <<<"${final}")" != "null"
 if [[ -n "${PROVIDER_LOG}" ]]; then
-  reconcile_delivery_after="$(rg -c '\[provider-mock\] POST /reminders/deliver' "${PROVIDER_LOG}" || true)"
+  reconcile_delivery_after="$(grep -Ec '\[provider-mock\] POST /reminders/deliver' "${PROVIDER_LOG}" || true)"
   test "${reconcile_delivery_after}" = "$((reconcile_delivery_before + 1))"
 fi
 
@@ -127,7 +127,7 @@ test "$(jq -r '.result.delivery_state' <<<"${message_final}")" = "sent"
 test "$(jq -r '.result.external_delivery' <<<"${message_final}")" = "sent"
 test "$(jq -r '.result.provider_id' <<<"${message_final}")" != "null"
 if [[ -n "${PROVIDER_LOG}" ]]; then
-  message_delivery_count="$(rg -c '\[provider-mock\] POST /messages/deliver' "${PROVIDER_LOG}" || true)"
+  message_delivery_count="$(grep -Ec '\[provider-mock\] POST /messages/deliver' "${PROVIDER_LOG}" || true)"
   test "${message_delivery_count}" = "1"
 fi
 
@@ -135,7 +135,7 @@ duplicate_message="$(create_message "${message_id}" "${message_key}")"
 test "$(jq -r '.state' <<<"${duplicate_message}")" = "succeeded"
 test "$(jq -r '.result.provider_id' <<<"${duplicate_message}")" = "$(jq -r '.result.provider_id' <<<"${message_final}")"
 if [[ -n "${PROVIDER_LOG}" ]]; then
-  duplicate_message_delivery_count="$(rg -c '\[provider-mock\] POST /messages/deliver' "${PROVIDER_LOG}" || true)"
+  duplicate_message_delivery_count="$(grep -Ec '\[provider-mock\] POST /messages/deliver' "${PROVIDER_LOG}" || true)"
   test "${duplicate_message_delivery_count}" = "1"
 fi
 

@@ -39,7 +39,7 @@ python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("scripts/provider-mock.p
 
 echo "[phase45] repository hygiene"
 git diff --check
-if git ls-files | rg -n '(^|/)(\.env($|\.)|.*\.p8$|.*\.pem$|.*\.key$)' ; then
+if git ls-files | grep -En '(^|/)(\.env($|\.)|.*\.p8$|.*\.pem$|.*\.key$)' ; then
   echo "tracked secret-like file detected" >&2
   exit 1
 fi
