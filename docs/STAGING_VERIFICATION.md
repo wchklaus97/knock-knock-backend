@@ -40,6 +40,11 @@ from staging health.
 - iOS `Staging` configuration was added and built successfully for the iOS
   Simulator. It uses the staging HTTPS Worker URL and the development APNs
   entitlement.
+- After reclaiming simulator disk space and erasing the affected simulator,
+  the iOS regression suite passed with 37 unit tests and 3 UI tests. That
+  regression used the local Worker fixture, so it proves the app shell and
+  test harness are healthy but does not replace the remote staging auth or
+  physical-device gates below.
 
 ## Full gate status
 
