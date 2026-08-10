@@ -29,3 +29,24 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown
       - name: Run architecture and release preflight
         run: ./scripts/phase45-release-gate.sh
+
+  dynamic-local-smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain for Worker build
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install pinned worker-build
+        run: cargo install worker-build --version 0.8.3 --locked
+      - name: Install pinned dynamic smoke dependencies
+        run: npm install --global wrangler@4.81.1
+      - name: Verify dynamic gate prerequisites
+        run: ./scripts/ci-prerequisites.sh dynamic
+      - name: Run isolated contract, R2, and provider gates
+        run: |
+          ./scripts/local-contract-gate.sh
+          ./scripts/provider-local-gate.sh

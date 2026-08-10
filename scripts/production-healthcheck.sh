@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"${ROOT_DIR}/scripts/ci-prerequisites.sh" health >/dev/null
+
 API="${1:-https://knock-knock-backend-production.wch-klaus.workers.dev}"
 API="${API%/}"
 PROBE="$(date +%s)"
