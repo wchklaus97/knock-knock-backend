@@ -14,6 +14,7 @@ use crate::providers::{self, ActionProviderConfig};
 const BATCH_SIZE: i64 = 20;
 const MAX_ATTEMPTS: i32 = 3;
 const LEASE_SECONDS: i64 = 300;
+const UNKNOWN_RECONCILE_SECONDS: i64 = 300;
 
 #[derive(Debug, Deserialize)]
 struct CommandPayload {
@@ -44,7 +45,7 @@ pub async fn drain(db: &D1Database, env: &worker::Env) -> ApiResult<usize> {
     let now = db::now_iso();
     let rows: Vec<OutboxEventRow> = db::all(
         db,
-        "SELECT id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, next_attempt_at, last_error, created_at, updated_at FROM outbox_events WHERE state IN ('queued', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
+        "SELECT id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, next_attempt_at, last_error, created_at, updated_at FROM outbox_events WHERE state IN ('queued', 'retrying', 'unknown') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
         vec![db::text(&now), db::number(BATCH_SIZE)],
     )
     .await?;
@@ -170,7 +171,7 @@ async fn claim(db: &D1Database, row: &OutboxEventRow) -> ApiResult<bool> {
     let now = db::now_iso();
     let result = db::run(
         db,
-        "UPDATE outbox_events SET state = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ? AND state IN ('queued', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
+        "UPDATE outbox_events SET state = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ? AND state IN ('queued', 'retrying', 'unknown') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
         vec![db::text(&now), db::text(&row.id), db::text(&now)],
     )
     .await?;
@@ -486,7 +487,13 @@ async fn finish_failure(
     } else {
         "failed"
     };
-    let retry_at = retry.then(|| db::add_seconds_iso(backoff_seconds(row.attempts)));
+    let retry_at = if retry {
+        Some(db::add_seconds_iso(backoff_seconds(row.attempts)))
+    } else if retryable {
+        Some(db::add_seconds_iso(UNKNOWN_RECONCILE_SECONDS))
+    } else {
+        None
+    };
     let version = command.version + 1;
     let error = failure.error();
     let mut statements = vec![
@@ -608,6 +615,13 @@ async fn release_runtime_error(
     let attempt = row.attempts + 1;
     let retryable = error.retryable;
     let retry = retryable && attempt < MAX_ATTEMPTS;
+    let next_attempt_at = if retry {
+        Some(db::add_seconds_iso(backoff_seconds(row.attempts)))
+    } else if retryable {
+        Some(db::add_seconds_iso(UNKNOWN_RECONCILE_SECONDS))
+    } else {
+        None
+    };
     let now = db::now_iso();
     db::run(
         db,
@@ -620,11 +634,7 @@ async fn release_runtime_error(
                 } else {
                     "failed"
                 }),
-            db::optional_text(
-                retry
-                    .then(|| db::add_seconds_iso(backoff_seconds(row.attempts)))
-                    .as_deref(),
-            ),
+            db::optional_text(next_attempt_at.as_deref()),
             db::text(&error.code),
             db::text(&now),
             db::text(&row.id),

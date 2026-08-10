@@ -51,6 +51,24 @@ undo="$(json "${user_auth[@]}" -X POST \
 test "$(jq -r '.undo_result.status' <<<"${undo}")" = "cancelled"
 test "$(jq -r '.undo_result.provider' <<<"${undo}")" = "external.reminder"
 
+cancel_reconcile_id="cmd-cancel-reconcile-$(date +%s%N)"
+cancel_reconcile_key="idem-cancel-reconcile-$(date +%s%N)"
+cancel_reconcile="$(create_reminder "${cancel_reconcile_id}" "${cancel_reconcile_key}")"
+test "$(jq -r '.state' <<<"${cancel_reconcile}")" = "queued"
+curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+cancel_response="$(curl --silent --show-error \
+  -H 'content-type: application/json' "${user_auth[@]}" \
+  -X POST "${BASE_URL}/v1/phone/commands/${cancel_reconcile_id}/undo" \
+  -w $'\n%{http_code}')"
+cancel_status="${cancel_response##*$'\n'}"
+cancel_body="${cancel_response%$'\n'*}"
+test "${cancel_status}" = "503"
+test "$(jq -r '.error.code' <<<"${cancel_body}")" = "provider_cancel_pending"
+curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+cancel_final="$(curl --fail-with-body --silent --show-error "${user_auth[@]}" \
+  "${BASE_URL}/v1/phone/commands/${cancel_reconcile_id}")"
+test "$(jq -r '.result.undo.status' <<<"${cancel_final}")" = "cancelled"
+
 reconcile_id="cmd-status-reconcile-$(date +%s%N)"
 reconcile_key="idem-status-reconcile-$(date +%s%N)"
 reconcile="$(create_reminder "${reconcile_id}" "${reconcile_key}")"
@@ -88,4 +106,4 @@ test "$(jq -r '.result.delivery_state' <<<"${message_final}")" = "sent"
 test "$(jq -r '.result.external_delivery' <<<"${message_final}")" = "sent"
 test "$(jq -r '.result.provider_id' <<<"${message_final}")" != "null"
 
-printf '%s\n' 'provider lifecycle smoke passed: reminder delivery/cancellation, reminder status reconciliation, asynchronous message delivery, and idempotent completion'
+printf '%s\n' 'provider lifecycle smoke passed: reminder delivery/cancellation, scheduled cancellation recovery, reminder status reconciliation, asynchronous message delivery, and idempotent completion'

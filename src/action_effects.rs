@@ -3,6 +3,7 @@ use serde_json::{json, Map, Value};
 use worker::{D1Database, Env};
 
 use crate::auth::new_id;
+use crate::commands;
 use crate::db;
 use crate::error::{ApiError, ApiResult};
 use crate::models::CommandRow;
@@ -11,6 +12,7 @@ use crate::providers::{self, ActionProviderConfig};
 const MAX_TITLE: usize = 200;
 const MAX_RECIPIENT: usize = 320;
 const MAX_BODY: usize = 8_000;
+const CANCEL_LEASE_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, Deserialize)]
 struct EffectAttemptRow {
@@ -24,6 +26,13 @@ struct EffectAttemptRow {
 struct CancelAttemptRow {
     state: String,
     response_json: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CancelReconciliationRow {
+    user_id: String,
+    command_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -365,6 +374,38 @@ pub async fn undo(
         return Err(ApiError::conflict("Command was already undone or changed"));
     }
     Ok(result)
+}
+
+/// Reconcile external reminder cancellations after an inline Undo request
+/// returned pending/unknown or the Worker stopped while the provider call was
+/// in flight. The provider idempotency key is retained in action_attempts;
+/// calling undo again reuses that key and only changes local state after the
+/// provider reports a terminal cancellation state.
+pub async fn reconcile_external_cancellations(
+    env: &Env,
+    db: &D1Database,
+    provider_config: ActionProviderConfig,
+) -> ApiResult<usize> {
+    if provider_config.mode() != providers::ActionProviderMode::External {
+        return Ok(0);
+    }
+    let cutoff = db::add_seconds_iso(-CANCEL_LEASE_SECONDS);
+    let rows: Vec<CancelReconciliationRow> = db::all(
+        db,
+        "SELECT user_id, command_id FROM action_attempts WHERE provider = 'external.reminder.cancel' AND user_id IS NOT NULL AND command_id IS NOT NULL AND (state IN ('unknown', 'retrying') OR (state = 'running' AND updated_at <= ?)) ORDER BY updated_at ASC LIMIT 20",
+        vec![db::text(&cutoff)],
+    )
+    .await?;
+
+    let mut processed = 0;
+    for row in rows {
+        let Some(command) = commands::get_for_user(db, &row.user_id, &row.command_id).await? else {
+            continue;
+        };
+        let _ = undo(env, db, &row.user_id, &command, provider_config.clone()).await;
+        processed += 1;
+    }
+    Ok(processed)
 }
 
 async fn create_reminder(
@@ -867,7 +908,7 @@ async fn claim_cancel_attempt(
 
     let existing: CancelAttemptRow = db::first(
         db,
-        "SELECT state, response_json FROM action_attempts WHERE provider = ? AND provider_idempotency_key = ?",
+        "SELECT state, response_json, updated_at FROM action_attempts WHERE provider = ? AND provider_idempotency_key = ?",
         vec![db::text(provider), db::text(provider_idempotency_key)],
     )
     .await?
@@ -888,6 +929,25 @@ async fn claim_cancel_attempt(
             provider_id,
             state: providers::ProviderDeliveryState::Succeeded,
         }));
+    }
+
+    if existing.state == "running"
+        && existing.updated_at <= db::add_seconds_iso(-CANCEL_LEASE_SECONDS)
+    {
+        let reclaimed = db::run(
+            db,
+            "UPDATE action_attempts SET state = 'running', attempts = attempts + 1, response_json = NULL, next_attempt_at = NULL, last_error = 'cancel_lease_expired', updated_at = ? WHERE provider = ? AND provider_idempotency_key = ? AND state = 'running' AND updated_at <= ?",
+            vec![
+                db::text(&now),
+                db::text(provider),
+                db::text(provider_idempotency_key),
+                db::text(&db::add_seconds_iso(-CANCEL_LEASE_SECONDS)),
+            ],
+        )
+        .await?;
+        if db::changes(&reclaimed) == 1 {
+            return Ok(None);
+        }
     }
 
     if matches!(existing.state.as_str(), "unknown" | "retrying" | "failed") {

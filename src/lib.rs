@@ -61,7 +61,7 @@ struct ConfirmationRequest {
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let origin = req.headers().get("origin").ok().flatten();
-    let request_id = request_id();
+    let request_id = request_id_for(&req);
     let result = dispatch(req, env.clone()).await;
     let mut response = match result {
         Ok(response) => response,
@@ -90,6 +90,10 @@ pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: Schedu
     }
     if let Ok(db) = env.d1("DB") {
         let _ = outbox::drain(&db, &env).await;
+        if let Ok(provider_config) = providers::load(&env) {
+            let _ =
+                action_effects::reconcile_external_cancellations(&env, &db, provider_config).await;
+        }
         let _ = reminders::drain_due(&db, &env).await;
         let _ = history::purge_expired_all(&db, &env).await;
     }
@@ -123,11 +127,31 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         );
     }
     if path == "/metrics" && method == Method::Get {
-        return Ok(Response::ok(
+        let provider_ready = if providers::ready(&action_provider_config) {
+            1
+        } else {
+            0
+        };
+        let apns_ready = if crate::apns::is_ready(&env) { 1 } else { 0 };
+        let model_enabled = if config_value(&env, "VOICE_MODEL_ENABLED", "false") == "true" {
+            1
+        } else {
+            0
+        };
+        return Ok(Response::ok(format!(
             "# HELP knock_knock_api_info API runtime information\n\
              # TYPE knock_knock_api_info gauge\n\
-             knock_knock_api_info{runtime=\"cloudflare-worker\",api=\"rust\"} 1\n",
-        )?);
+             knock_knock_api_info{{runtime=\"cloudflare-worker\",api=\"rust\"}} 1\n\
+             # HELP knock_knock_provider_ready Whether the configured action provider is ready\n\
+             # TYPE knock_knock_provider_ready gauge\n\
+             knock_knock_provider_ready {provider_ready}\n\
+             # HELP knock_knock_apns_ready Whether APNs signing configuration is ready\n\
+             # TYPE knock_knock_apns_ready gauge\n\
+             knock_knock_apns_ready {apns_ready}\n\
+             # HELP knock_knock_model_enabled Whether the voice model feature flag is enabled\n\
+             # TYPE knock_knock_model_enabled gauge\n\
+             knock_knock_model_enabled {model_enabled}\n"
+        ))?);
     }
 
     let db = env.d1("DB")?;
@@ -248,7 +272,17 @@ fn path_segments(path: &str) -> Vec<&str> {
         .collect()
 }
 
-fn request_id() -> String {
+fn request_id_for(request: &Request) -> String {
+    if let Ok(Some(value)) = request.headers().get("x-request-id") {
+        let trimmed = value.trim();
+        if valid_request_id(trimmed) {
+            return trimmed.to_owned();
+        }
+    }
+    new_request_id()
+}
+
+fn new_request_id() -> String {
     let timestamp = worker::Date::now().as_millis();
     let mut entropy = [0_u8; 8];
     if getrandom::fill(&mut entropy).is_err() {
@@ -261,17 +295,20 @@ fn request_id() -> String {
     format!("req_{timestamp:x}_{suffix}")
 }
 
+fn valid_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
 fn rate_limit_identity(request: &Request) -> ApiResult<String> {
+    // Cloudflare's cf-connecting-ip is supplied by the trusted edge. Do not
+    // use a caller-controlled X-Forwarded-For value for abuse controls.
     if let Some(value) = request.headers().get("cf-connecting-ip")? {
         if !value.trim().is_empty() {
             return Ok(format!("edge:{}", value.trim()));
-        }
-    }
-    if let Some(value) = request.headers().get("x-forwarded-for")? {
-        if let Some(first) = value.split(',').next().map(str::trim) {
-            if !first.is_empty() {
-                return Ok(format!("edge:{first}"));
-            }
         }
     }
     Ok("edge:anonymous".into())
@@ -315,10 +352,7 @@ fn query_claim(request: &Request) -> ApiResult<bool> {
 
 fn request_metadata(request: &Request) -> ApiResult<(Option<String>, Option<String>)> {
     let user_agent = request.headers().get("user-agent")?;
-    let ip_address = request
-        .headers()
-        .get("x-forwarded-for")?
-        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string));
+    let ip_address = request.headers().get("cf-connecting-ip")?;
     Ok((user_agent, ip_address))
 }
 
@@ -1937,7 +1971,7 @@ fn add_common_headers(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_model_manifest;
+    use super::{valid_request_id, validate_model_manifest};
     use serde_json::json;
 
     #[test]
@@ -1956,5 +1990,13 @@ mod tests {
         let mut invalid = valid.clone();
         invalid["sha256"] = json!("not-a-hash");
         assert!(validate_model_manifest(&invalid, "whisperkit-base").is_err());
+    }
+
+    #[test]
+    fn request_id_accepts_safe_correlation_values_only() {
+        assert!(valid_request_id("req_mobile-123.abc:1"));
+        assert!(!valid_request_id("req bad"));
+        assert!(!valid_request_id("req\nlog-injection"));
+        assert!(!valid_request_id(&"x".repeat(129)));
     }
 }

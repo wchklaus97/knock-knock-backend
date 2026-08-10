@@ -17,6 +17,7 @@ echo "[phase45] contract, migration, configuration, and adversarial checks"
 ./scripts/architecture-migration-smoke.sh
 ./scripts/adversarial-data-smoke.sh
 ./scripts/production-config-smoke.sh
+./scripts/backup-restore-smoke.sh
 test -x ./scripts/r2-download-smoke.sh
 test -x ./scripts/provider-lifecycle-smoke.sh
 test -x ./scripts/staging-contract-gate.sh

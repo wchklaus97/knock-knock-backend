@@ -20,6 +20,12 @@ test "$(jq -r '.ok' <<<"$health")" = "true"
 test "$(jq -r '.api' <<<"$health")" = "rust"
 metrics="$(get "$BASE_URL/metrics")"
 grep -q 'knock_knock_api_info' <<<"$metrics"
+grep -q 'knock_knock_provider_ready' <<<"$metrics"
+grep -q 'knock_knock_apns_ready' <<<"$metrics"
+request_headers="$(curl --fail-with-body --silent --show-error \
+  -H 'x-request-id: contract-smoke-correlation' \
+  -D - -o /dev/null "$BASE_URL/health")"
+grep -qi '^x-request-id: contract-smoke-correlation' <<<"$request_headers"
 
 auth="$(json -X POST "$BASE_URL/v1/auth/register" \
   -d "$(jq -nc --arg email "$EMAIL" --arg password "$PASSWORD" '{email:$email,password:$password}')")"

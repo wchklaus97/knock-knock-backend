@@ -64,6 +64,11 @@ idempotency keys.
 Cancellation now requires an explicit terminal provider state and a durable
 per-operation fence; retryable Outbox exhaustion remains `unknown` for
 reconciliation instead of becoming a false terminal failure.
+Cancellation fences also recover after a bounded stale lease, so a Worker
+crash cannot leave an Undo operation permanently stuck. Request correlation
+accepts only validated `X-Request-ID` values, rate limiting and audit metadata
+use the trusted Cloudflare edge IP header, and `/metrics` exposes provider,
+APNs, and model readiness gauges.
 The R2 retrieval download route is also implemented and verified with a local
 R2 object plus cross-user isolation. Provider vendor selection, sandbox
 evidence, production credentials, remote staging D1/Worker/R2 E2E, formal

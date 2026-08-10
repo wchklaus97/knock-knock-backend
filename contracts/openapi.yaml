@@ -30,6 +30,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
+  /metrics:
+    get:
+      tags: [Auth]
+      security: []
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Prometheus-compatible runtime readiness gauges.
+          content:
+            text/plain:
+              schema:
+                type: string
   /v1/health:
     get:
       tags: [Auth]

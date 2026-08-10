@@ -31,7 +31,8 @@ require human approval. The numbered gate handoff is tracked in
 - Provider cancellation now requires an explicit terminal cancellation state
   and uses a durable per-operation idempotency fence; exhausted retryable
   outbox work remains `unknown` instead of being misreported as terminal
-  failure.
+  failure, and scheduled reconciliation can complete pending cancellation
+  without another user request.
 - Durable local reminder and draft effects, an internal queued message effect,
   and provider-idempotency records for the three release vertical actions.
 - Additive command-list, pairing-status, push-dismiss, and rich action-descriptor
@@ -43,6 +44,9 @@ require human approval. The numbered gate handoff is tracked in
   32-character secret; pairing codes use high-entropy URL-safe tokens with a
   tighter unauthenticated rate-limit bucket; APNs payloads contain only
   privacy-light identifiers rather than the full voice script.
+- Request correlation accepts only validated `X-Request-ID` values, rate-limit
+  and audit metadata use the trusted Cloudflare edge IP header, and `/metrics`
+  exposes provider/APNs/model readiness gauges.
 - Secret-authenticated HTTPS provider webhook adapter for reminders and
   messages, reminder due-time leases/retries, deduplicated reminder pushes,
   and scheduled message/retrieval retention sweep.
@@ -84,7 +88,7 @@ require human approval. The numbered gate handoff is tracked in
 
 - `cargo fmt --all -- --check` — passed
 - `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test -q` — 41 passed
+- `cargo test -q` — 42 passed
 - `cargo check --target wasm32-unknown-unknown -q` — passed
 - `worker-build --release` — passed; optimized Worker bundle generated
 - `scripts/architecture-migration-smoke.sh` — passed
@@ -101,12 +105,14 @@ require human approval. The numbered gate handoff is tracked in
   flow against deployed staging with `R2_SMOKE_REMOTE=true` and a materialized
   staging Wrangler config; that external run remains pending.
 - `scripts/provider-lifecycle-smoke.sh` against an isolated local Worker and
-  mock provider — passed for reminder delivery/cancellation, timeout status
-  reconciliation, and an asynchronous high-risk message moving from provider
+  mock provider — passed for reminder delivery/cancellation, scheduled
+  cancellation recovery, timeout status reconciliation, and an asynchronous high-risk message moving from provider
   `accepted` to status `delivered` before the command became `sent`; provider
   keys remained user/action scoped and no duplicate delivery was observed.
 - `scripts/production-config-smoke.sh` — passed, including the staging
   template and staging fail-closed checks
+- `scripts/backup-restore-smoke.sh` — passed for encrypted export/decrypt,
+  checksum, SQLite integrity, and schema/data restore
 - `scripts/phase45-release-gate.sh` — passed
 - [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31345903877) — passed for commit `22f1e114b6430064f67614fb16fbd55860e35e15`
 - Read-only production health probe — passed; deployed version was
@@ -118,7 +124,8 @@ require human approval. The numbered gate handoff is tracked in
   UAT credentials do not yet exist.
 - `scripts/contract-smoke.sh` against an isolated local Worker + local D1 —
   passed, including command list, pairing status, push dismissal, and the
-  existing multi-turn session/action loop.
+  existing multi-turn session/action loop, metrics readiness gauges, and
+  validated request-ID propagation.
 - Local `/__scheduled` Outbox smoke — passed for reminder, draft, and message;
   message result remained `queued` with `external_delivery: not_configured`.
 - Local reminder due-time smoke — passed: a due reminder generated one
