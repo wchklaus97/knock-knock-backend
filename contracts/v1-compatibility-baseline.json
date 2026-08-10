@@ -74,7 +74,7 @@
       }
     },
     "CommandState": {
-      "enum": ["pending", "validated", "awaiting_confirmation", "queued", "running", "succeeded", "failed", "expired", "cancelled", "unknown"]
+      "enum": ["pending", "validated", "awaiting_confirmation", "queued", "running", "succeeded", "failed", "expired", "cancelled", "retryable", "unknown"]
     },
     "ErrorResponse": {
       "required": ["error"],

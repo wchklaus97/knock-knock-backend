@@ -59,10 +59,9 @@ if git grep -qE '(^|[[:space:]])[r][g]([[:space:]]|$)' -- .github/workflows scri
 fi
 
 cat <<'EOF'
-phase45 static release gate passed.
-Required before production: deployed D1/E2E contract smoke, configured and
-reviewed provider endpoints/sandbox evidence, configured model
-manifest/public-key rollout, security review, physical iPhone performance and
-voice golden-set evidence, human approval of migration/APNs/provider/model
-rollout.
+phase45 static release preflight passed.
+This output is limited to the local static checks above; it does not claim
+staging deployment, APNs delivery, physical-iPhone performance, voice
+golden-set, provider sandbox, or production rollout evidence. Those remain
+explicit release prerequisites.
 EOF

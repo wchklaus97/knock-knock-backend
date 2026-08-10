@@ -67,7 +67,7 @@ assert_error_response() {
 assert_structured_command_error() {
   local body="$1"
   jq -e '
-    (.state == "unknown") and
+    (.state == "unknown" or .state == "retryable") and
     (.error.code | type == "string" and length > 0) and
     (.error.message | type == "string" and length > 0)
   ' <<<"${body}" >/dev/null
@@ -182,7 +182,7 @@ json "${user_auth[@]}" -X POST \
   -d "$(jq -nc --arg token "${confirmation_token}" '{confirmation_token:$token}')" >/dev/null
 curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
 message_first="$(get_json "${user_auth[@]}" "${BASE_URL}/v1/phone/commands/${message_id}")"
-test "$(jq -r '.state' <<<"${message_first}")" = "unknown"
+jq -e '(.state == "unknown" or .state == "retryable")' <<<"${message_first}" >/dev/null
 test "$(jq -r '.error.code' <<<"${message_first}")" = "provider_pending"
 sleep "${WAIT_SECONDS}"
 curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
@@ -249,7 +249,7 @@ if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
     -d "$(jq -nc --arg token "${message_missing_token}" '{confirmation_token:$token}')" >/dev/null
   curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
   message_missing_final="$(get_json "${user_auth[@]}" "${BASE_URL}/v1/phone/commands/${message_missing_id}")"
-  test "$(jq -r '.state' <<<"${message_missing_final}")" = "unknown"
+jq -e '(.state == "unknown" or .state == "retryable")' <<<"${message_missing_final}" >/dev/null
   test "$(jq -r '.error.code' <<<"${message_missing_final}")" = "provider_missing_id"
 else
   echo "provider lifecycle smoke: strict provider-resource identity checks are disabled for this backend base"

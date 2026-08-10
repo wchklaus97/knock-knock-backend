@@ -38,6 +38,8 @@ use crate::models::{
     PhoneSessionUpdateRequest, ProgressRequest, RefreshRequest, SessionRequest,
 };
 
+const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 struct IdOnly {
     #[serde(rename = "id")]
@@ -315,9 +317,35 @@ fn rate_limit_identity(request: &Request) -> ApiResult<String> {
 }
 
 async fn read_json<T: DeserializeOwned>(request: &mut Request) -> ApiResult<T> {
-    request
-        .json()
+    if let Some(content_length) = request.headers().get("content-length")? {
+        if content_length
+            .trim()
+            .parse::<usize>()
+            .is_ok_and(|length| length > MAX_JSON_BODY_BYTES)
+        {
+            return Err(ApiError::new(
+                413,
+                "request_body_too_large",
+                "Request body is too large",
+            ));
+        }
+    }
+    let body = request
+        .bytes()
         .await
+        .map_err(|_| ApiError::validation("Request body must be valid JSON"))?;
+    decode_json(&body)
+}
+
+fn decode_json<T: DeserializeOwned>(body: &[u8]) -> ApiResult<T> {
+    if body.len() > MAX_JSON_BODY_BYTES {
+        return Err(ApiError::new(
+            413,
+            "request_body_too_large",
+            "Request body is too large",
+        ));
+    }
+    serde_json::from_slice(body)
         .map_err(|_| ApiError::validation("Request body must be valid JSON"))
 }
 
@@ -1059,10 +1087,37 @@ async fn phone_session_detail(
 ) -> ApiResult<Response> {
     let row = phone_session_for_user(req, env, db, session_id).await?;
     let row = sessions::reconcile_waiting_session(db, row).await?;
-    let retrieval_items = history::list_retrieval(db, &row.user_id, &row.id, 100).await?;
+    let before = query_value(req, "before")?;
+    let retrieval_page = history::list_retrieval_page(
+        db,
+        &row.user_id,
+        &row.id,
+        before.as_deref(),
+        query_limit(req, 50)?,
+    )
+    .await?;
+    let retrieval_items = retrieval_page
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let mut detail = sessions::session_api(db, row).await?;
     if let Value::Object(ref mut object) = detail {
         object.insert("retrieval_items".into(), Value::Array(retrieval_items));
+        object.insert(
+            "retrieval_next_cursor".into(),
+            retrieval_page
+                .get("next_cursor")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "retrieval_has_more".into(),
+            retrieval_page
+                .get("has_more")
+                .cloned()
+                .unwrap_or(Value::Bool(false)),
+        );
     }
     json_response(detail, 200)
 }
@@ -1129,6 +1184,17 @@ async fn phone_delete_session(
         .await?
         .filter(|row| row.user_id == user.user_id)
         .ok_or_else(|| ApiError::not_found("Session not found"))?;
+    if let Some(deleted_at) = existing.deleted_at.as_deref() {
+        return json_response(
+            json!({
+                "ok": true,
+                "session_id": session_id,
+                "deleted_at": deleted_at,
+                "idempotent": true,
+            }),
+            200,
+        );
+    }
     let now = db::now_iso();
     let tombstone_id = new_id("tombstone")?;
     let statements = vec![
@@ -1998,5 +2064,20 @@ mod tests {
         assert!(!valid_request_id("req bad"));
         assert!(!valid_request_id("req\nlog-injection"));
         assert!(!valid_request_id(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn json_reader_rejects_oversized_bodies_before_decoding() {
+        let oversized = vec![b' '; super::MAX_JSON_BODY_BYTES + 1];
+        let error = super::decode_json::<serde_json::Value>(&oversized).unwrap_err();
+        assert_eq!(error.status, 413);
+        assert_eq!(error.code, "request_body_too_large");
+    }
+
+    #[test]
+    fn json_reader_preserves_strict_json_decoding() {
+        let value = super::decode_json::<serde_json::Value>(br#"{"ok":true}"#).unwrap();
+        assert_eq!(value["ok"], serde_json::Value::Bool(true));
+        assert!(super::decode_json::<serde_json::Value>(b"not-json").is_err());
     }
 }

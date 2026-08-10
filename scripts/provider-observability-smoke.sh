@@ -74,4 +74,4 @@ if [[ -n "${MODEL_ID}" ]]; then
     <<<"${model}" >/dev/null
 fi
 
-echo "provider-observability-smoke passed: API/provider/APNs/model readiness, request-ID validation, and secret-safe metrics"
+echo "provider-observability-smoke passed: local readiness gauges, request-ID validation, and secret-safe metrics (no APNs delivery evidence)"

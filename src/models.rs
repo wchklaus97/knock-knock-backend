@@ -242,6 +242,9 @@ pub struct RetrievalItemRow {
     pub content_hash: String,
     pub r2_key: Option<String>,
     pub retention_expires_at: Option<String>,
+    pub r2_delete_status: String,
+    pub r2_deleted_at: Option<String>,
+    pub expired_at: Option<String>,
     pub created_at: String,
 }
 
