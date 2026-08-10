@@ -244,6 +244,16 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
                 "PUSH_MODE must be dev, apns, or both in staging",
             ));
         }
+        let apns_production = config_value(env, "APNS_PRODUCTION", "false")
+            .trim()
+            .to_ascii_lowercase();
+        if apns_production != "false" {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "APNS_PRODUCTION must be false in staging",
+            ));
+        }
         return Ok(());
     }
 

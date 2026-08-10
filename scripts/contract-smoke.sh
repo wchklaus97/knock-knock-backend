@@ -195,10 +195,14 @@ test "$(jq -r '.session_id' <<<"$session_view")" = "$session_id"
 
 event="$(json "${agent_auth[@]}" -X POST "$BASE_URL/v1/sessions/$session_id/events" \
   -d "$(jq -nc --arg key "needs-user-$(date +%s%N)" \
-    '{status:"needs_user",idempotency_key:$key,facts:{status:"waiting"},actions:[{id:"rollback",risk:"destructive",confirm:true,title:"Rollback deployment",payload:{scope:"service"}},{id:"ack",risk:"low",confirm:false,title:"Acknowledge"}]}')")"
+    '{status:"needs_user",idempotency_key:$key,facts:{status:"waiting"},actions:[{id:"rollback",risk:"destructive",confirm:true,title:"Rollback deployment",payload:{scope:"service"}},{id:"ack",risk:"low",confirm:false,title:"Acknowledge"}],retrievals:[range(0;51) | {title:("export source " + tostring),url:("https://example.com/export/" + tostring),snippet:"export fixture",content_hash:($key + "-" + tostring)}]}')")"
 test "$(jq -r '.session.state' <<<"$event")" = "needs_user"
 test "$(jq -r '.pushed' <<<"$event")" = "true"
 test "$(jq -r '[.session.available_action_descriptors[] | select(.action_key == "rollback" and .risk == "destructive" and .confirm_required == true and (.title | type == "string") and (.title | length > 0) and .payload.scope == "service")] | length' <<<"$event")" = "1"
+
+exported_session="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/sessions/$session_id/export")"
+test "$(jq -r '.retrieval_items | length' <<<"$exported_session")" = "51"
+test "$(jq -r '.truncated' <<<"$exported_session")" = "false"
 
 offered="$(get "${agent_auth[@]}" "$BASE_URL/v1/sessions/$session_id/actions/pending?claim=false")"
 test "$(jq -r '.actions | length' <<<"$offered")" = "0"
@@ -303,4 +307,4 @@ test "$(jq -r '.ok' <<<"$logout")" = "true"
 
 BASE_URL="$BASE_URL" "${ROOT_DIR}/scripts/rate-limit-smoke.sh"
 
-printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/chat/multi-turn/phone/command-pagination/pairing-isolation-and-expiry/push-isolation-and-dismissal/action-descriptors/confirm/claim/result/refresh'
+printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/chat/multi-turn/phone/export-pagination/command-pagination/pairing-isolation-and-expiry/push-isolation-and-dismissal/action-descriptors/confirm/claim/result/refresh'

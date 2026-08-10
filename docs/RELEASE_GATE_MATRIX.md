@@ -80,9 +80,11 @@ configuration:
 - R2: the R2 route smoke, including user namespace, shared-key retention, and
   object deletion checks.
 - Supabase: the staging-only login/protected API/refresh/logout smoke.
-- APNs: the health `apns_ready` value and metrics gauge; staging must be
-  explicitly not-ready in dev push mode, while production readiness still
-  requires separately approved real APNs evidence.
+- APNs: the health `apns_ready` value and metrics gauge; the agreed staging
+  sandbox profile is `push_mode=both`, `apns_ready=true`, and
+  `apns_production=false`. This is signing readiness only; production APNs
+  readiness and real-device delivery still require separately approved
+  evidence.
 - Provider/model: provider and model gauges, optional model ID/manifest
   correlation, and provider lifecycle state transitions.
 

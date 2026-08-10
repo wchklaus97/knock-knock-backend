@@ -30,8 +30,9 @@ jq -e '
   (.ok == true) and
   (.api == "rust") and
   (.runtime == "cloudflare-worker") and
-  (.push_mode == "dev") and
-  (.apns_ready == false) and
+  (.push_mode == "both") and
+  (.apns_ready == true) and
+  (.apns_production == false) and
   (.action_provider_mode == "disabled") and
   (.action_provider_ready == false) and
   (.action_reminder_enabled == false) and
@@ -40,7 +41,8 @@ jq -e '
 
 BASE_URL="${BASE_URL}" \
 EXPECTED_PROVIDER_READY=false \
-EXPECTED_APNS_READY=false \
+EXPECTED_APNS_READY=true \
+EXPECTED_APNS_PRODUCTION=false \
 EXPECTED_MODEL_ENABLED=0 \
   "${ROOT_DIR}/scripts/provider-observability-smoke.sh"
 

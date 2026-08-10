@@ -10,6 +10,8 @@ use crate::pagination;
 use crate::sessions;
 
 const RETENTION_SWEEP_BATCH: i64 = 500;
+const EXPORT_MAX_ITEMS: usize = 10_000;
+const EXPORT_QUERY_LIMIT: i64 = EXPORT_MAX_ITEMS as i64 + 1;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ExpiredRetrievalRow {
@@ -436,6 +438,32 @@ pub async fn list_retrieval_page(
     }))
 }
 
+// Keep export retrieval reads independent from the bounded summary page. The
+// additive retention columns introduced by migration 0013 are intentionally
+// included via SELECT * so this query remains compatible with both the
+// pre-migration model and the tombstone-aware model; serde ignores columns
+// unknown to the older model. The response still passes through
+// retrieval_value, which never exposes the internal R2 key.
+async fn list_retrieval_for_export(
+    db: &D1Database,
+    user_id: &str,
+    session_id: &str,
+) -> ApiResult<Vec<Value>> {
+    let now = db::now_iso();
+    let rows: Vec<RetrievalItemRow> = db::all(
+        db,
+        "SELECT * FROM retrieval_items WHERE user_id = ? AND session_id = ? AND (retention_expires_at IS NULL OR retention_expires_at > ?) ORDER BY created_at DESC, id DESC LIMIT ?",
+        vec![
+            db::text(user_id),
+            db::text(session_id),
+            db::text(&now),
+            db::number(EXPORT_QUERY_LIMIT),
+        ],
+    )
+    .await?;
+    Ok(rows.into_iter().map(retrieval_value).collect())
+}
+
 /// Resolve one retrieval snapshot for an authenticated user without exposing
 /// its internal R2 object key. Deleted sessions and expired snapshots are
 /// intentionally indistinguishable from a missing retrieval to avoid leaking
@@ -466,7 +494,7 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
         ));
     }
     let safe_limit = limit.clamp(1, 50) as i64;
-    let needle = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+    let needle = search_like_pattern(query);
     let sessions: Vec<SessionRow> = db::all(
         db,
         "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, available_action_descriptors_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (title LIKE ? ESCAPE '\\' OR summary_text LIKE ? ESCAPE '\\' OR facts_json LIKE ? ESCAPE '\\') ORDER BY updated_at DESC, id DESC LIMIT ?",
@@ -519,6 +547,16 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
     }))
 }
 
+fn search_like_pattern(query: &str) -> String {
+    format!(
+        "%{}%",
+        query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
+}
+
 pub async fn export_session(
     db: &D1Database,
     user_id: &str,
@@ -551,11 +589,14 @@ pub async fn export_session(
             break;
         }
     }
-    let retrieval_items = list_retrieval(db, user_id, &session.id, 10_001).await?;
-    if retrieval_items.len() > 10_000 {
+    let retrieval_items = list_retrieval_for_export(db, user_id, &session.id).await?;
+    if retrieval_items.len() > EXPORT_MAX_ITEMS {
         truncated = true;
     }
-    let retrieval_items = retrieval_items.into_iter().take(10_000).collect::<Vec<_>>();
+    let retrieval_items = retrieval_items
+        .into_iter()
+        .take(EXPORT_MAX_ITEMS)
+        .collect::<Vec<_>>();
     Ok(serde_json::json!({
         "schema_version": 1,
         "exported_at": db::now_iso(),
@@ -606,5 +647,16 @@ mod tests {
             value.get("r2_delete_status").and_then(Value::as_str),
             Some("active")
         );
+    }
+
+    #[test]
+    fn export_query_keeps_a_truncation_sentinel() {
+        assert_eq!(EXPORT_MAX_ITEMS, 10_000);
+        assert_eq!(EXPORT_QUERY_LIMIT, 10_001);
+    }
+
+    #[test]
+    fn search_like_pattern_escapes_sql_like_controls() {
+        assert_eq!(search_like_pattern(r"a\b%c_d"), r"%a\\b\%c\_d%");
     }
 }

@@ -8,6 +8,7 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:8787}"
 BASE_URL="${BASE_URL%/}"
 EXPECTED_PROVIDER_READY="${EXPECTED_PROVIDER_READY:-}"
 EXPECTED_APNS_READY="${EXPECTED_APNS_READY:-}"
+EXPECTED_APNS_PRODUCTION="${EXPECTED_APNS_PRODUCTION:-}"
 EXPECTED_MODEL_ENABLED="${EXPECTED_MODEL_ENABLED:-}"
 MODEL_ID="${MODEL_ID:-}"
 
@@ -23,6 +24,7 @@ jq -e '
   (.version | type == "string") and
   (.push_mode | type == "string") and
   (.apns_ready | type == "boolean") and
+  (.apns_production | type == "boolean") and
   (.action_provider_ready | type == "boolean")
 ' <<<"${health}" >/dev/null
 
@@ -33,6 +35,10 @@ fi
 if [[ -n "${EXPECTED_APNS_READY}" ]]; then
   jq -e --arg expected "${EXPECTED_APNS_READY}" \
     '(.apns_ready | tostring) == $expected' <<<"${health}" >/dev/null
+fi
+if [[ -n "${EXPECTED_APNS_PRODUCTION}" ]]; then
+  jq -e --arg expected "${EXPECTED_APNS_PRODUCTION}" \
+    '(.apns_production | tostring) == $expected' <<<"${health}" >/dev/null
 fi
 
 metrics="$(get "${BASE_URL}/metrics")"

@@ -1,7 +1,8 @@
 # Safe staging template. Replace all REPLACE_* values and configure Supabase
 # publishable key as a Worker var/secret before deploying. This environment
-# intentionally disables external effects and uses the development push inbox;
-# it is for contract, migration, sync, and UI integration testing only.
+# intentionally disables external action effects but uses APNs sandbox mode
+# alongside the development push inbox for push integration testing. APNs
+# production mode must remain explicitly disabled.
 name = "knock-knock-backend-staging"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-04-16"
@@ -17,7 +18,8 @@ command = "worker-build --release"
 NODE_ENV = "staging"
 AUTH_PROVIDER = "supabase"
 SUPABASE_URL = "REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL"
-PUSH_MODE = "dev"
+PUSH_MODE = "both"
+APNS_PRODUCTION = "false"
 CORS_ORIGIN = "REPLACE_WITH_STAGING_ALLOWED_ORIGIN"
 SERVICE_VERSION = "REPLACE_WITH_STAGING_RELEASE_VERSION"
 ACTION_PROVIDER_MODE = "disabled"
@@ -41,5 +43,8 @@ bucket_name = "REPLACE_WITH_STAGING_R2_BUCKET_NAME"
 
 # Required secret:
 # wrangler secret put SUPABASE_PUBLISHABLE_KEY --config wrangler.staging.toml
+# For the agreed APNs sandbox profile, also configure APNS_KEY,
+# APNS_KEY_ID, and APNS_TEAM_ID as staging-only secrets. Never set
+# APNS_PRODUCTION to true in this environment.
 # If AUTH_PROVIDER is changed to legacy for a temporary test, also set:
 # wrangler secret put JWT_SECRET --config wrangler.staging.toml
