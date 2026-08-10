@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"${ROOT_DIR}/scripts/ci-prerequisites.sh" health >/dev/null
+
 BASE_URL="${BASE_URL:-https://knock-knock-backend-production.wch-klaus.workers.dev}"
 BASE_URL="${BASE_URL%/}"
 : "${SMOKE_EMAIL:?Set SMOKE_EMAIL to the Supabase UAT account email}"
