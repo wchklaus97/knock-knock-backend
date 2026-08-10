@@ -35,6 +35,7 @@ pub enum CommandValidationError {
     InvalidFieldLength,
     EnvelopeTooLarge,
     SensitiveArgument,
+    InvalidActionArguments,
 }
 
 impl std::fmt::Display for CommandValidationError {
@@ -51,6 +52,7 @@ impl std::fmt::Display for CommandValidationError {
             Self::InvalidFieldLength => "command field exceeds the maximum length",
             Self::EnvelopeTooLarge => "command envelope exceeds the maximum size",
             Self::SensitiveArgument => "command arguments cannot contain credentials or secrets",
+            Self::InvalidActionArguments => "command arguments do not match the registered action",
         };
         formatter.write_str(message)
     }
@@ -65,6 +67,10 @@ const MAX_MODEL_VERSION: usize = 128;
 const MAX_CONFIRMATION_TOKEN: usize = 256;
 const COMMAND_TTL_SECONDS: i64 = 900;
 const CONFIRMATION_TTL_SECONDS: i64 = 600;
+const MAX_ACTION_TITLE: usize = 200;
+const MAX_ACTION_RECIPIENT: usize = 320;
+const MAX_ACTION_BODY: usize = 8_000;
+const MAX_ACTION_DUE_AT: usize = 64;
 #[allow(dead_code)]
 const STATES: [&str; 11] = [
     "pending",
@@ -123,6 +129,85 @@ pub fn registry_policy(intent: &str) -> Option<ActionPolicy> {
 
 pub fn registry_requires_confirmation(intent: &str) -> Option<bool> {
     registry_policy(intent).map(|policy| policy.requires_confirmation)
+}
+
+/// Validate the argument shape for a registered action before it can enter
+/// the durable queue. The executor repeats this check immediately before an
+/// effect, so legacy or manually repaired rows cannot bypass the same rules.
+pub fn validate_action_args(
+    intent: &str,
+    args: &Map<String, Value>,
+) -> Result<(), CommandValidationError> {
+    let valid = match intent {
+        "search_history" => {
+            valid_required_action_string(args, &["q", "query", "text"], 2, usize::MAX)
+        }
+        "create_reminder" => {
+            valid_required_action_string(args, &["title", "text", "message"], 1, MAX_ACTION_TITLE)
+                && valid_required_action_string(
+                    args,
+                    &["due_at", "time", "datetime"],
+                    1,
+                    MAX_ACTION_DUE_AT,
+                )
+        }
+        "create_draft" => {
+            valid_required_action_string(args, &["body", "content", "text"], 1, MAX_ACTION_BODY)
+                && valid_optional_action_strings(args, &["title", "subject"], MAX_ACTION_TITLE)
+                && valid_optional_action_strings(args, &["recipient", "to"], MAX_ACTION_RECIPIENT)
+        }
+        "send_message" => {
+            valid_required_action_string(args, &["body", "message", "text"], 1, MAX_ACTION_BODY)
+                && valid_required_action_string(
+                    args,
+                    &["recipient", "to", "email", "phone"],
+                    1,
+                    MAX_ACTION_RECIPIENT,
+                )
+        }
+        _ => true,
+    };
+    valid
+        .then_some(())
+        .ok_or(CommandValidationError::InvalidActionArguments)
+}
+
+fn valid_required_action_string(
+    args: &Map<String, Value>,
+    names: &[&str],
+    min_length: usize,
+    max_length: usize,
+) -> bool {
+    names
+        .iter()
+        .find_map(|name| args.get(*name).and_then(Value::as_str))
+        .map(str::trim)
+        .is_some_and(|value| {
+            !value.is_empty() && value.len() >= min_length && value.chars().count() <= max_length
+        })
+}
+
+fn valid_optional_action_strings(
+    args: &Map<String, Value>,
+    names: &[&str],
+    max_length: usize,
+) -> bool {
+    names.iter().all(|name| {
+        args.get(*name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(|value| value.chars().count() <= max_length)
+            .unwrap_or(true)
+    })
+}
+
+/// Check the persisted policy again at the execution boundary. This is a
+/// defense against stale or manually repaired rows, where create-time policy
+/// enforcement is no longer enough to protect a side effect.
+pub fn execution_policy_matches(intent: &str, risk_level: &str, needs_confirmation: bool) -> bool {
+    registry_policy(intent).is_some_and(|policy| {
+        policy.risk_level == risk_level && policy.requires_confirmation == needs_confirmation
+    })
 }
 
 fn action_metadata(intent: &str) -> Value {
@@ -726,6 +811,8 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
         return Ok(response(&existing, None));
     }
 
+    validate_action_args(&envelope.intent, &envelope.args).map_err(validation_error)?;
+
     let command_id = envelope.command_id.clone();
     let now = db::now_iso();
     let expires_at = db::add_seconds_iso(COMMAND_TTL_SECONDS);
@@ -1219,6 +1306,49 @@ mod tests {
             Some("high")
         );
         assert_eq!(registry_requires_confirmation("run_arbitrary_code"), None);
+    }
+
+    #[test]
+    fn registered_action_arguments_are_validated_before_queueing() {
+        let empty = Map::new();
+        assert_eq!(
+            validate_action_args("send_message", &empty),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
+        assert!(validate_action_args(
+            "send_message",
+            &serde_json::from_value(json!({
+                "body": "hello",
+                "recipient": "+85255550123"
+            }))
+            .unwrap()
+        )
+        .is_ok());
+
+        assert_eq!(
+            validate_action_args(
+                "create_draft",
+                &serde_json::from_value(json!({"body": "x".repeat(MAX_ACTION_BODY + 1)})).unwrap()
+            ),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
+        assert!(validate_action_args(
+            "create_reminder",
+            &serde_json::from_value(json!({
+                "title": "Pay rent",
+                "due_at": "2099-01-01T09:00:00Z"
+            }))
+            .unwrap()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn execution_policy_must_match_the_registered_action() {
+        assert!(execution_policy_matches("send_message", "high", true));
+        assert!(!execution_policy_matches("send_message", "low", true));
+        assert!(!execution_policy_matches("send_message", "high", false));
+        assert!(!execution_policy_matches("unknown", "low", false));
     }
 
     #[test]
