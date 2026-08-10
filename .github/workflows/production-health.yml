@@ -15,6 +15,8 @@ jobs:
     timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
+      - name: Verify healthcheck prerequisites
+        run: ./scripts/ci-prerequisites.sh health
       - name: Check production Worker
         run: ./scripts/production-healthcheck.sh https://knock-knock-backend-production.wch-klaus.workers.dev
       - name: Open or update production alert
