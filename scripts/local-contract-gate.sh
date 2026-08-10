@@ -45,7 +45,9 @@ PY
 }
 
 wait_for_health() {
-  for _ in $(seq 1 60); do
+  # A clean CI runner may compile the Rust Worker before Wrangler can serve
+  # /health. Keep this bounded, but allow enough time for the first build.
+  for _ in $(seq 1 180); do
     if curl --fail --silent --max-time 2 "http://127.0.0.1:${WORKER_PORT}/health" >/dev/null 2>&1; then
       return 0
     fi
