@@ -24,7 +24,14 @@ test -x ./scripts/provider-lifecycle-smoke.sh
 test -x ./scripts/provider-local-gate.sh
 test -x ./scripts/provider-mock.py
 test -x ./scripts/staging-contract-gate.sh
-bash -n ./scripts/r2-download-smoke.sh ./scripts/provider-lifecycle-smoke.sh ./scripts/provider-local-gate.sh ./scripts/staging-contract-gate.sh
+for script in \
+  ./scripts/r2-download-smoke.sh \
+  ./scripts/provider-lifecycle-smoke.sh \
+  ./scripts/provider-local-gate.sh \
+  ./scripts/staging-contract-gate.sh; do
+  bash -n "$script"
+done
+python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("scripts/provider-mock.py").read_text())'
 
 echo "[phase45] repository hygiene"
 git diff --check

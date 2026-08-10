@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/knock-knock-provider-local.XXXXXX")"
 PROVIDER_PORT="${PROVIDER_PORT:-}"
 WORKER_PORT="${WORKER_PORT:-}"
@@ -10,18 +11,61 @@ TOKEN="knock-knock-local-provider"
 PROVIDER_PID=""
 WORKER_PID=""
 
+stop_process() {
+  local pid="$1"
+  [[ -n "${pid}" ]] || return 0
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    wait "${pid}" 2>/dev/null || true
+    return 0
+  fi
+  kill "${pid}" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      wait "${pid}" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.25
+  done
+  kill -KILL "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+}
+
+redact_log() {
+  sed -E \
+    -e 's/(Bearer )[A-Za-z0-9._~-]+/\1[REDACTED]/g' \
+    -e 's/(ACTION_(REMINDER|MESSAGE)_TOKEN=)[^[:space:]]+/\1[REDACTED]/g' \
+    -e 's/(JWT_SECRET=)[^[:space:]]+/\1[REDACTED]/g' \
+    "$1"
+}
+
+show_failure() {
+  echo "provider-local-gate: $1" >&2
+  for log in "${TMP_DIR}/migrations.log" "${TMP_DIR}/worker.log" "${TMP_DIR}/provider.log"; do
+    if [[ -f "${log}" ]]; then
+      redact_log "${log}" >&2 || true
+    fi
+  done
+  exit 1
+}
+
 cleanup() {
-  if [[ -n "${WORKER_PID}" ]]; then
-    kill "${WORKER_PID}" 2>/dev/null || true
-    wait "${WORKER_PID}" 2>/dev/null || true
-  fi
-  if [[ -n "${PROVIDER_PID}" ]]; then
-    kill "${PROVIDER_PID}" 2>/dev/null || true
-    wait "${PROVIDER_PID}" 2>/dev/null || true
-  fi
+  stop_process "${WORKER_PID}"
+  stop_process "${PROVIDER_PID}"
   rm -rf "${TMP_DIR}"
 }
 trap cleanup EXIT INT TERM
+
+wait_for_http() {
+  local url="$1"
+  local attempts="${2:-30}"
+  for _ in $(seq 1 "${attempts}"); do
+    if curl --fail --silent --show-error --max-time 2 "${url}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 
 pick_port() {
   python3 - <<'PY'
@@ -60,6 +104,10 @@ python3 "${ROOT_DIR}/scripts/provider-mock.py" \
   >"${TMP_DIR}/provider.log" 2>&1 &
 PROVIDER_PID=$!
 
+if ! wait_for_http "http://127.0.0.1:${PROVIDER_PORT}/health"; then
+  show_failure "mock provider did not become ready"
+fi
+
 wrangler d1 migrations apply DB --local \
   --persist-to "${PERSIST_TO}" \
   --config "${ROOT_DIR}/wrangler.toml" \
@@ -73,8 +121,8 @@ wrangler dev --local --port "${WORKER_PORT}" --test-scheduled \
   >"${TMP_DIR}/worker.log" 2>&1 &
 WORKER_PID=$!
 
-for _ in $(seq 1 60); do
-  if curl --fail-with-body --silent --show-error \
+  for _ in $(seq 1 60); do
+  if curl --fail --silent --max-time 2 \
       "http://127.0.0.1:${WORKER_PORT}/health" \
       | jq -e '.action_provider_mode == "external" and .action_provider_ready == true' >/dev/null; then
     break
@@ -82,14 +130,10 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-if ! curl --fail-with-body --silent --show-error \
+if ! curl --fail --silent --max-time 2 \
     "http://127.0.0.1:${WORKER_PORT}/health" \
     | jq -e '.action_provider_mode == "external" and .action_provider_ready == true' >/dev/null; then
-  echo "provider-local-gate: Worker did not become external/ready" >&2
-  cat "${TMP_DIR}/migrations.log" >&2 || true
-  cat "${TMP_DIR}/worker.log" >&2 || true
-  cat "${TMP_DIR}/provider.log" >&2 || true
-  exit 1
+  show_failure "Worker did not become external/ready"
 fi
 
 BASE_URL="http://127.0.0.1:${WORKER_PORT}" \

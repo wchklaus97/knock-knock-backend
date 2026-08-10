@@ -15,6 +15,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+MAX_BODY_BYTES = 64 * 1024
+
 
 class ProviderState:
     def __init__(self) -> None:
@@ -27,7 +29,7 @@ class ProviderState:
         with self.lock:
             existing = self.resources.get(key)
             if existing is not None:
-                return existing
+                return dict(existing)
             prefix = "rem" if kind == "reminder" else "msg"
             value = {
                 "provider_id": f"mock-{prefix}-{self.next_id}",
@@ -36,12 +38,25 @@ class ProviderState:
             }
             self.next_id += 1
             self.resources[key] = value
-            return value
+            return dict(value)
 
-    def cancel_attempt(self, command_id: str) -> int:
+    def resource_for(self, key: str) -> dict[str, Any] | None:
         with self.lock:
-            attempt = self.cancel_attempts.get(command_id, 0) + 1
-            self.cancel_attempts[command_id] = attempt
+            resource = self.resources.get(key)
+            return dict(resource) if resource is not None else None
+
+    def fail_delivery_once(self, key: str) -> bool:
+        with self.lock:
+            resource = self.resources.get(key)
+            if resource is None or resource.get("failed_once") is True:
+                return False
+            resource["failed_once"] = True
+            return True
+
+    def cancel_attempt(self, idempotency_key: str) -> int:
+        with self.lock:
+            attempt = self.cancel_attempts.get(idempotency_key, 0) + 1
+            self.cancel_attempts[idempotency_key] = attempt
             return attempt
 
 
@@ -85,7 +100,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/reminders/status" and intent == "create_reminder":
             self.reminder_status(key)
         elif self.path == "/reminders/cancel" and intent == "create_reminder":
-            self.reminder_cancel(body)
+            self.reminder_cancel(body, key)
         elif self.path == "/messages/deliver" and intent == "send_message":
             self.message_delivery(key, command_id)
         elif self.path == "/messages/status" and intent == "send_message":
@@ -99,6 +114,9 @@ class Handler(BaseHTTPRequestHandler):
     def read_json(self) -> dict[str, Any] | None:
         try:
             length = int(self.headers.get("content-length", "0"))
+            if length < 0 or length > MAX_BODY_BYTES:
+                self.send_json(413, {"error": "request_too_large"})
+                return None
             raw = self.rfile.read(length)
             value = json.loads(raw.decode("utf-8"))
             if not isinstance(value, dict):
@@ -112,8 +130,7 @@ class Handler(BaseHTTPRequestHandler):
         resource = self.state.resource("reminder", key, command_id)
         # Force one retryable delivery outcome for the status-reconciliation
         # scenario. The durable backend attempt then uses /reminders/status.
-        if command_id.startswith("cmd-status-reconcile-") and resource.get("failed_once") is not True:
-            resource["failed_once"] = True
+        if command_id.startswith("cmd-status-reconcile-") and self.state.fail_delivery_once(key):
             self.send_json(503, {"error": "simulated_delivery_timeout"})
             return
         self.send_json(
@@ -122,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def reminder_status(self, key: str) -> None:
-        resource = self.state.resources.get(key)
+        resource = self.state.resource_for(key)
         if resource is None:
             self.send_json(404, {"error": "unknown_resource"})
             return
@@ -131,10 +148,10 @@ class Handler(BaseHTTPRequestHandler):
             {"provider_id": resource["provider_id"], "state": "scheduled"},
         )
 
-    def reminder_cancel(self, body: dict[str, Any]) -> None:
+    def reminder_cancel(self, body: dict[str, Any], key: str) -> None:
         command_id = str(body.get("command_id", "")).strip()
         provider_id = str(body.get("provider_id", "")).strip()
-        attempt = self.state.cancel_attempt(command_id)
+        attempt = self.state.cancel_attempt(key)
         if command_id.startswith("cmd-cancel-reconcile-") and attempt == 1:
             self.send_json(200, {"provider_id": provider_id, "state": "pending"})
             return
@@ -148,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def message_status(self, key: str) -> None:
-        resource = self.state.resources.get(key)
+        resource = self.state.resource_for(key)
         if resource is None:
             self.send_json(404, {"error": "unknown_resource"})
             return
@@ -181,7 +198,10 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8889)
     parser.add_argument("--token", default="knock-knock-local-provider")
+    parser.add_argument("--allow-non-loopback", action="store_true")
     args = parser.parse_args()
+    if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.allow_non_loopback:
+        parser.error("refusing non-loopback bind without --allow-non-loopback")
     server = Server((args.host, args.port), args.token)
     print(f"provider mock listening on http://{args.host}:{args.port}", flush=True)
     try:
