@@ -65,15 +65,62 @@ const STATES: [&str; 10] = [
     "unknown",
 ];
 
-/// The backend action registry is intentionally small until each action has a
-/// real executor and an explicit permission policy. Model output cannot invent
-/// an executable intent.
-pub fn registry_requires_confirmation(intent: &str) -> Option<bool> {
+/// The backend action registry is the only authority for command risk and
+/// confirmation. The model may suggest a risk, but it cannot raise or lower
+/// the policy that is persisted and shown to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionPolicy {
+    pub risk_level: &'static str,
+    pub requires_confirmation: bool,
+    pub reversible: bool,
+    pub title: &'static str,
+}
+
+pub fn registry_policy(intent: &str) -> Option<ActionPolicy> {
     match intent {
-        "search_history" | "create_reminder" | "create_draft" => Some(false),
-        "send_message" => Some(true),
+        "search_history" => Some(ActionPolicy {
+            risk_level: "low",
+            requires_confirmation: false,
+            reversible: false,
+            title: "Search history",
+        }),
+        "create_reminder" => Some(ActionPolicy {
+            risk_level: "low",
+            requires_confirmation: false,
+            reversible: true,
+            title: "Create reminder",
+        }),
+        "create_draft" => Some(ActionPolicy {
+            risk_level: "low",
+            requires_confirmation: false,
+            reversible: true,
+            title: "Create draft",
+        }),
+        "send_message" => Some(ActionPolicy {
+            risk_level: "high",
+            requires_confirmation: true,
+            reversible: false,
+            title: "Send message",
+        }),
         _ => None,
     }
+}
+
+pub fn registry_requires_confirmation(intent: &str) -> Option<bool> {
+    registry_policy(intent).map(|policy| policy.requires_confirmation)
+}
+
+fn action_metadata(intent: &str) -> Value {
+    registry_policy(intent)
+        .map(|policy| {
+            json!({
+                "title": policy.title,
+                "risk": policy.risk_level,
+                "confirm_required": policy.requires_confirmation,
+                "reversible": policy.reversible,
+            })
+        })
+        .unwrap_or(Value::Null)
 }
 
 /// Validate the transport-level portion of CommandEnvelope v1.
@@ -146,11 +193,19 @@ fn contains_sensitive_argument(value: &Value) -> bool {
     }
 }
 
-/// Backend policy always wins over the model's needs_confirmation value.
-pub fn requires_confirmation(envelope: &CommandEnvelope, registry_requires: bool) -> bool {
+/// Backend policy always wins over the model's needs_confirmation and
+/// risk_level values. Keeping the envelope parameter makes the call site
+/// explicit and leaves room for future policy checks without reintroducing
+/// client authority.
+pub fn requires_confirmation(_envelope: &CommandEnvelope, registry_requires: bool) -> bool {
     registry_requires
-        || envelope.needs_confirmation
-        || matches!(envelope.risk_level.as_str(), "high" | "destructive")
+}
+
+fn authoritative_envelope(envelope: &CommandEnvelope, policy: ActionPolicy) -> CommandEnvelope {
+    let mut authoritative = envelope.clone();
+    authoritative.risk_level = policy.risk_level.to_string();
+    authoritative.needs_confirmation = policy.requires_confirmation;
+    authoritative
 }
 
 #[allow(dead_code)]
@@ -372,6 +427,7 @@ pub fn response(row: &CommandRow, confirmation_token: Option<&str>) -> Value {
         "command_id": row.id,
         "state": row.state,
         "command": envelope_from_row(row),
+        "action": action_metadata(&row.intent),
         "confirmation_token": confirmation_token,
         "result": result_value(row),
         "error": error_value(row),
@@ -437,10 +493,11 @@ pub async fn ensure_session_live(
 
 pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -> ApiResult<Value> {
     validate_envelope(&envelope).map_err(validation_error)?;
-    let registry_requires = registry_requires_confirmation(&envelope.intent)
-        .ok_or_else(|| registry_error(&envelope.intent))?;
+    let policy =
+        registry_policy(&envelope.intent).ok_or_else(|| registry_error(&envelope.intent))?;
     validate_scope(db, user_id, &envelope).await?;
-    let command_hash = canonical_hash(&envelope)?;
+    let authoritative = authoritative_envelope(&envelope, policy);
+    let command_hash = canonical_hash(&authoritative)?;
 
     if let Some(existing) = db::first::<CommandRow>(
         db,
@@ -463,7 +520,9 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
     let command_id = envelope.command_id.clone();
     let now = db::now_iso();
     let expires_at = db::add_seconds_iso(900);
-    let confirmation_required = requires_confirmation(&envelope, registry_requires);
+    let registry_confirmation = registry_requires_confirmation(&envelope.intent)
+        .ok_or_else(|| registry_error(&envelope.intent))?;
+    let confirmation_required = requires_confirmation(&envelope, registry_confirmation);
     let final_version = 2_i64;
     let outbox_idempotency_key =
         providers::scoped_idempotency_key(user_id, "command.execute", &envelope.idempotency_key);
@@ -479,8 +538,8 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
                 db::number(envelope.schema_version as i64),
                 db::text(&envelope.intent),
                 db::text(&Value::Object(normalized_args(&envelope.args)).to_string()),
-                db::text(&envelope.risk_level),
-                db::bool_number(envelope.needs_confirmation || confirmation_required),
+                db::text(policy.risk_level),
+                db::bool_number(confirmation_required),
                 db::text(&envelope.idempotency_key),
                 db::decimal(envelope.confidence),
                 db::text(&envelope.locale),
@@ -854,22 +913,43 @@ mod tests {
     }
 
     #[test]
-    fn backend_risk_policy_overrides_model_flag() {
+    fn backend_registry_policy_overrides_model_risk_and_flag() {
         let mut low = envelope();
         assert!(!requires_confirmation(&low, false));
         low.risk_level = "destructive".to_string();
-        assert!(requires_confirmation(&low, false));
+        low.needs_confirmation = true;
+        assert!(!requires_confirmation(&low, false));
         assert!(requires_confirmation(&envelope(), true));
     }
 
     #[test]
-    fn registry_rejects_unimplemented_intents() {
+    fn registry_exposes_authoritative_risk_and_confirmation() {
         assert_eq!(
-            registry_requires_confirmation("search_history"),
-            Some(false)
+            registry_policy("search_history")
+                .map(|policy| (policy.risk_level, policy.requires_confirmation)),
+            Some(("low", false))
         );
         assert_eq!(registry_requires_confirmation("send_message"), Some(true));
+        assert_eq!(
+            registry_policy("send_message").map(|policy| policy.risk_level),
+            Some("high")
+        );
         assert_eq!(registry_requires_confirmation("run_arbitrary_code"), None);
+    }
+
+    #[test]
+    fn authoritative_envelope_normalizes_model_risk_before_hashing() {
+        let mut model = envelope();
+        model.risk_level = "destructive".to_string();
+        model.needs_confirmation = true;
+        let policy = registry_policy("search_history").unwrap();
+        let authoritative = authoritative_envelope(&model, policy);
+        assert_eq!(authoritative.risk_level, "low");
+        assert!(!authoritative.needs_confirmation);
+        assert_ne!(
+            canonical_hash(&model).unwrap(),
+            canonical_hash(&authoritative).unwrap()
+        );
     }
 
     #[test]
