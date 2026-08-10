@@ -26,6 +26,7 @@ approval.
 - executable Rust dispatch ↔ OpenAPI route parity smoke — 47 operations
 - migration, adversarial-data, provider-safety, and production-config smokes
 - local contract smoke, including `/v1/health`, key rotation, skills, session detail/progress, R2 download/retention, and provider lifecycle smokes
+- reproducible `scripts/provider-local-gate.sh` with isolated local D1 and deterministic provider boundary
 - local model-manifest shape/integrity validation and high-entropy pairing checks
 - request-ID propagation, Prometheus readiness gauges, trusted-edge identity, and stale cancellation lease recovery
 - PR #11 GitHub Actions Rust backend CI

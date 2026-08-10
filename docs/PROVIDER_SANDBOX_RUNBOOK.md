@@ -153,16 +153,19 @@ provider resource IDs, and a redacted response fixture for every row.
 The complete local equivalent is:
 
 ```bash
-BASE_URL=http://127.0.0.1:<worker-port> \
-PROVIDER_RECONCILE_WAIT_SECONDS=6 \
-SMOKE_EMAIL=provider-sandbox-<unique>@local.test \
-./scripts/provider-lifecycle-smoke.sh
+./scripts/provider-local-gate.sh
 ```
 
-Run this against an isolated local D1 and a local mock first. Then repeat it
-against the selected vendor sandbox with fresh test identifiers. Do not place
-vendor tokens in shell history; use a temporary Wrangler secret store or the
-approved CI secret mechanism.
+The gate creates an isolated local D1 persistence directory, starts the
+deterministic `scripts/provider-mock.py` boundary, starts a local Worker with
+`external` mode, and runs the lifecycle smoke. To run the lower-level smoke
+against an already configured Worker, set `BASE_URL` and use
+`scripts/provider-lifecycle-smoke.sh` directly.
+
+Run the local gate first, then repeat the lifecycle matrix against the selected
+vendor sandbox with fresh test identifiers. Do not place vendor tokens in shell
+history; use a temporary Wrangler secret store or the approved CI secret
+mechanism.
 
 ## Promotion sequence
 

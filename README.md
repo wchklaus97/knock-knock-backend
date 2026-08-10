@@ -32,6 +32,13 @@ the full auth/pairing/phone loop and two consecutive decisions on the same
 ./scripts/contract-smoke.sh
 ```
 
+To run the external-provider lifecycle locally without a vendor account, use
+the isolated mock gate:
+
+```sh
+./scripts/provider-local-gate.sh
+```
+
 The local endpoint is `http://127.0.0.1:8787`. For the iPhone, use the Mac's
 LAN address instead of `127.0.0.1`.
 

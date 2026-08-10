@@ -21,8 +21,10 @@ echo "[phase45] contract, migration, configuration, and adversarial checks"
 ./scripts/backup-restore-smoke.sh
 test -x ./scripts/r2-download-smoke.sh
 test -x ./scripts/provider-lifecycle-smoke.sh
+test -x ./scripts/provider-local-gate.sh
+test -x ./scripts/provider-mock.py
 test -x ./scripts/staging-contract-gate.sh
-bash -n ./scripts/r2-download-smoke.sh ./scripts/provider-lifecycle-smoke.sh ./scripts/staging-contract-gate.sh
+bash -n ./scripts/r2-download-smoke.sh ./scripts/provider-lifecycle-smoke.sh ./scripts/provider-local-gate.sh ./scripts/staging-contract-gate.sh
 
 echo "[phase45] repository hygiene"
 git diff --check
