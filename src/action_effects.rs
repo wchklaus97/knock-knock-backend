@@ -315,7 +315,7 @@ pub async fn undo(
         )?,
         db::prepare(
             db,
-            "UPDATE commands SET result_json = ?, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?",
+            "UPDATE commands SET result_json = ?, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ? AND changes() = 1",
             vec![
                 db::text(&command_result.to_string()),
                 db::number(next_version),
@@ -327,30 +327,24 @@ pub async fn undo(
         )?,
         db::prepare(
             db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.undo', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.undo', ?, ? WHERE changes() = 1",
             vec![
                 db::text(&new_id("aud")?),
                 db::text(user_id),
                 db::optional_text(command.session_id.as_deref()),
                 db::text(&json!({"command_id": command.id, "effect_id": effect.id, "version": next_version}).to_string()),
                 db::text(&now),
-                db::text(&command.id),
-                db::text(user_id),
-                db::number(next_version),
             ],
         )?,
         db::prepare(
             db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)",
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1",
             vec![
                 db::text(user_id),
                 db::text(&command.id),
                 db::optional_text(command.session_id.as_deref()),
                 db::number(next_version),
                 db::text(&now),
-                db::text(&command.id),
-                db::text(user_id),
-                db::number(next_version),
             ],
         )?,
     ];
