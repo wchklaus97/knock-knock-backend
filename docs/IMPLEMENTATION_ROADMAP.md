@@ -61,6 +61,9 @@ identifier fails closed so Undo cannot claim a cancellation it cannot perform.
 It was verified against a local mock provider for delivery, cancellation,
 timeout, asynchronous message status recovery, and user/action-scoped provider
 idempotency keys.
+Cancellation now requires an explicit terminal provider state and a durable
+per-operation fence; retryable Outbox exhaustion remains `unknown` for
+reconciliation instead of becoming a false terminal failure.
 The R2 retrieval download route is also implemented and verified with a local
 R2 object plus cross-user isolation. Provider vendor selection, sandbox
 evidence, production credentials, remote staging D1/Worker/R2 E2E, formal
@@ -91,9 +94,14 @@ The follow-up branch now extends the earlier staged work with:
 - provider delivery/status/cancel endpoints with timeout reconciliation and
   local dynamic smoke scripts in `scripts/r2-download-smoke.sh` and
   `scripts/provider-lifecycle-smoke.sh`;
+- high-entropy pairing tokens with a dedicated unauthenticated rate-limit
+  bucket, non-development legacy JWT fail-closed configuration, privacy-light
+  APNs payloads, encrypted private-R2 production backup workflow, and model
+  manifest shape/integrity validation;
 - `wrangler.staging.toml.example`, with staging fail-closed validation and
   external action flags disabled by default, plus explicit R2 and provider
-  lifecycle placeholders.
+  lifecycle placeholders. The staging gate can now run the R2 route smoke
+  remotely after materializing this config.
 - user/operation-scoped Outbox idempotency keys, bounded local reminder stale
   lease recovery, and a deleted-session barrier for local due notifications.
 

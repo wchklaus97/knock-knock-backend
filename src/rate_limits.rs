@@ -18,6 +18,10 @@ fn digest(value: &str) -> String {
 fn category(path: &str) -> (&'static str, i64) {
     if path.starts_with("/v1/auth/") {
         ("auth", 20)
+    } else if path.starts_with("/v1/pairing/") {
+        // Pairing claims are intentionally unauthenticated. Keep a tighter
+        // edge bucket in addition to the high-entropy token requirement.
+        ("pairing", 10)
     } else if path.starts_with("/v1/phone/commands") {
         ("command", 60)
     } else if path == "/v1/phone/events" {
@@ -102,6 +106,7 @@ mod tests {
     #[test]
     fn rate_limit_categories_cover_reconnect_and_model_paths() {
         assert_eq!(category("/v1/auth/login"), ("auth", 20));
+        assert_eq!(category("/v1/pairing/claim"), ("pairing", 10));
         assert_eq!(category("/v1/phone/commands"), ("command", 60));
         assert_eq!(category("/v1/phone/events"), ("sse", 30));
         assert_eq!(category("/v1/phone/devices"), ("device", 60));

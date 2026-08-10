@@ -84,8 +84,11 @@ safety gaps without changing the REST + SSE baseline:
   required fields.
 - Outbox failures update provider attempt state, include 425 in retry handling,
   cap stale lease retries, reconcile pre-execution failures, and persist the
-  provider running fence before an external call. Undo updates the command
-  version and audit/change records atomically and is idempotent.
+  provider running fence before an external call. Retryable exhaustion remains
+  `unknown` for reconciliation rather than becoming a false terminal failure.
+  Undo requires an explicit provider cancellation terminal state, uses a
+  durable per-operation fence, and updates the command version and
+  audit/change records atomically.
 - Command arguments reject credential-shaped keys, while JWT and APNs signing
   material is read from Wrangler secrets rather than ordinary Worker vars.
 - Retrieval snapshots now expose only a user-scoped `download_path`; the
@@ -98,6 +101,7 @@ safety gaps without changing the REST + SSE baseline:
   cancellation endpoints before an enabled production action is considered
   ready. Provider timeouts are reconciled through the status endpoint, and
   external reminder Undo calls cancellation before changing local state.
+  Cancellation is not treated as successful from HTTP 2xx alone.
   Accepted asynchronous message sends are not promoted to `sent` until status
   returns a terminal delivery state. Provider and Outbox idempotency keys are
   stable hashes scoped to user and operation, while the original command key
@@ -150,12 +154,12 @@ and the current gap. IDs are stable and must not be reused.
 | D27 | APNs is a wake-up/reminder channel, never the data source. | Push loss is safe because REST sync recovers state; payloads stay privacy-light. | Drop push delivery and confirm foreground/resume sync produces the same state. | Push read/dismiss routes, dev inbox, and REST/SSE recovery exist; real APNs token/device and payload review remain. |
 | D28 | Commands within one session have backend ordering/version checks. | Clients cannot use wall-clock timestamps to resolve concurrent state changes. | Stale version returns conflict; concurrent same-session writes serialize. | Command versions, phone-change versions, and cursor ordering exist; multi-device concurrent session E2E remains. |
 | D29 | State, domain event, audit, and phone change are committed atomically. | Clients must never be notified about a state that was not durably written. | Batch failure leaves no partial event or notification cursor. | Core command/event batches are atomic; some compatibility/business audit paths remain separate and require an outbox or explicit reliability review. |
-| D30 | External side effects use an Outbox/Worker and provider idempotency. | Database transactions cannot atomically include email, messaging, payment, or provider APIs. | Timeout becomes `unknown/retryable`; accepted asynchronous delivery remains queued until status reconciliation; cancellation and repeated scheduled runs never duplicate a provider effect. | Outbox, pre-call running fence, user/action-scoped action keys, conservative delivery/status/cancel adapter, and local async message/reminder mock evidence are implemented; a selected production vendor, sandbox proof, and durable cancel-operation policy remain. |
+| D30 | External side effects use an Outbox/Worker and provider idempotency. | Database transactions cannot atomically include email, messaging, payment, or provider APIs. | Timeout becomes `unknown/retryable`; accepted asynchronous delivery remains queued until status reconciliation; cancellation requires an explicit terminal provider state and repeated scheduled runs never duplicate a provider effect. | Outbox, pre-call running fence, user/action-scoped action keys, cancellation-operation fencing, conservative delivery/status/cancel adapter, and local async message/reminder mock evidence are implemented; a selected production vendor, sandbox proof, and durable cancel reconciliation policy remain. |
 | D31 | First voice UX is push-to-talk with VAD end detection. | Avoids always-on microphone privacy, battery, and background complexity. | Permission, interruption, silence, cancel, and background transitions are tested. | iOS push-to-talk/VAD boundary exists; real-device interruption, thermal, and crash evidence remains. |
 | D32 | Locale and timezone are explicit protocol metadata. | Backend must normalize dates, amounts, and names using device context. | Hong Kong Chinese/English fixtures parse against `Asia/Hong_Kong` deterministically. | `CommandEnvelope v1` requires locale/timezone and validation preserves them; full locale/clarification golden fixtures remain. |
 | D33 | Rate-limit users, devices, SSE, commands, model fallback, and downloads. | Protects D1/AI cost and avoids reconnect storms. | Limits return stable error code and `retry_after`; normal usage remains unaffected. | User/device/SSE/command/model/download buckets are implemented; production thresholds and alert calibration remain. |
 | D34 | Use one structured error envelope with retryability. | iOS can distinguish auth, conflict, expiry, validation, and network retry safely. | Client retries only retryable errors with backoff/jitter. | Versioned error envelope, retry metadata, and OpenAPI coverage exist; full cross-repository generated fixture and UI retry review remain. |
-| D35 | Reversible actions return an explicit Undo command. | Compensating actions are safer than pretending an external transaction can roll back. | Undo is authorized, idempotent, time-bounded, and visibly fails when unavailable. | Local reminder/draft Undo and external reminder cancel are implemented and locally verified; durable asynchronous cancel/reconciliation and production vendor semantics remain. |
+| D35 | Reversible actions return an explicit Undo command. | Compensating actions are safer than pretending an external transaction can roll back. | Undo is authorized, idempotent, time-bounded, and visibly fails when unavailable or when cancellation remains pending/unknown. | Local reminder/draft Undo and external reminder cancel fencing are implemented and locally verified; durable asynchronous cancel reconciliation and production vendor semantics remain. |
 | D36 | Retrieval content is untrusted data. | Web/file text cannot rewrite policy, permissions, or action instructions. | Prompt-injection fixtures never create an unauthorized action. | Retrieval snapshots are stored as data and never authorize commands; a formal prompt-injection golden suite and model retrieval path remain. |
 | D37 | Models and model configuration use signed manifests. | Prevents arbitrary model downloads and supports safe rollback. | Hash/signature, minimum capability, expiry, and rollback tests pass. | Signed manifest validation, trust key handling, capability checks, and rollback code exist; signed production artifact/key and rollout evidence remain. |
 | D38 | Foreground owns SSE; background uses APNs and resume sync. | Matches iOS power constraints and preserves recoverability after termination. | Foreground/background/terminated flows restore cursor and state. | SSE resume, REST sync, persisted cursor, and iOS lifecycle boundary exist; real termination/multi-device E2E remains. |

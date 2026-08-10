@@ -400,7 +400,7 @@ pub async fn cancel(
     let provider_id = provider_id_from_body(&body, intent);
     Ok(ProviderResponse {
         provider_id,
-        state: ProviderDeliveryState::Succeeded,
+        state: cancel_delivery_state(&body),
     })
 }
 
@@ -435,10 +435,7 @@ fn send_delivery_state(intent: &str, body: &Value) -> ProviderDeliveryState {
         };
     };
     if intent == "create_reminder"
-        && matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "accepted" | "scheduled"
-        )
+        && matches!(raw.trim().to_ascii_lowercase().as_str(), "scheduled")
     {
         return ProviderDeliveryState::Succeeded;
     }
@@ -447,14 +444,36 @@ fn send_delivery_state(intent: &str, body: &Value) -> ProviderDeliveryState {
 
 fn status_delivery_state(intent: &str, raw: &str) -> ProviderDeliveryState {
     if intent == "create_reminder"
-        && matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "accepted" | "scheduled"
-        )
+        && matches!(raw.trim().to_ascii_lowercase().as_str(), "scheduled")
     {
         ProviderDeliveryState::Succeeded
     } else {
         parse_delivery_state(raw)
+    }
+}
+
+fn cancel_delivery_state(body: &Value) -> ProviderDeliveryState {
+    if body.get("cancelled").and_then(Value::as_bool) == Some(true)
+        || body.get("canceled").and_then(Value::as_bool) == Some(true)
+    {
+        return ProviderDeliveryState::Succeeded;
+    }
+    let Some(raw) = body
+        .get("state")
+        .or_else(|| body.get("status"))
+        .or_else(|| body.get("delivery_state"))
+        .and_then(Value::as_str)
+    else {
+        return ProviderDeliveryState::Unknown;
+    };
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "cancelled" | "canceled" | "deleted" | "removed" => ProviderDeliveryState::Succeeded,
+        "pending" | "accepted" | "queued" | "processing" | "running" => {
+            ProviderDeliveryState::Pending
+        }
+        "failed" | "failure" | "rejected" | "expired" => ProviderDeliveryState::Failed,
+        _ => ProviderDeliveryState::Unknown,
     }
 }
 
@@ -697,6 +716,13 @@ mod tests {
             ),
             ProviderDeliveryState::Succeeded
         );
+        assert_eq!(
+            send_delivery_state(
+                "create_reminder",
+                &json!({"provider_id": "rem-1", "state": "accepted"})
+            ),
+            ProviderDeliveryState::Pending
+        );
     }
 
     #[test]
@@ -719,6 +745,30 @@ mod tests {
         assert_eq!(
             first,
             scoped_action_idempotency_key("user-a", "create_reminder", "same-key")
+        );
+    }
+
+    #[test]
+    fn cancellation_requires_an_explicit_terminal_provider_state() {
+        assert_eq!(
+            cancel_delivery_state(&json!({"cancelled": true})),
+            ProviderDeliveryState::Succeeded
+        );
+        assert_eq!(
+            cancel_delivery_state(&json!({"state": "cancelled"})),
+            ProviderDeliveryState::Succeeded
+        );
+        assert_eq!(
+            cancel_delivery_state(&json!({"state": "accepted"})),
+            ProviderDeliveryState::Pending
+        );
+        assert_eq!(
+            cancel_delivery_state(&json!({"state": "failed"})),
+            ProviderDeliveryState::Failed
+        );
+        assert_eq!(
+            cancel_delivery_state(&json!({})),
+            ProviderDeliveryState::Unknown
         );
     }
 }

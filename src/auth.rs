@@ -108,8 +108,11 @@ pub fn mint_refresh_token() -> ApiResult<String> {
 }
 
 pub fn mint_pairing_code() -> ApiResult<String> {
-    let raw = u32::from_le_bytes(random_bytes::<4>()?);
-    Ok(format!("{:06}", raw % 1_000_000))
+    // Pairing is an unauthenticated claim boundary. Use a high-entropy URL
+    // safe token instead of a six-digit value that can be guessed over the
+    // code's lifetime. The `pair_` prefix also makes accidental API-key or
+    // refresh-token reuse easier to spot in diagnostics.
+    random_token("pair_", 12)
 }
 
 fn env_value(env: &Env, name: &str) -> Option<String> {
@@ -195,6 +198,13 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
             500,
             "configuration_error",
             "AUTH_PROVIDER must be legacy or supabase",
+        ));
+    }
+    if !matches!(node_env.as_str(), "development" | "test") && auth_provider != "supabase" {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "AUTH_PROVIDER must be supabase outside development",
         ));
     }
     if auth_provider == "supabase" {
@@ -603,17 +613,23 @@ async fn resolve_supabase_user(
 }
 
 pub fn jwt_secret(env: &Env) -> ApiResult<String> {
-    let node_env = config_value(env, "NODE_ENV", "development");
-    let value = if node_env.trim().eq_ignore_ascii_case("production") {
-        secret_value(env, "JWT_SECRET").unwrap_or_default()
-    } else {
+    let node_env = config_value(env, "NODE_ENV", "development")
+        .trim()
+        .to_ascii_lowercase();
+    let local_environment = matches!(node_env.as_str(), "development" | "test");
+    let value = if local_environment {
         config_value(env, "JWT_SECRET", "dev-change-me")
+    } else {
+        // Staging must not silently inherit the development signing key. A
+        // missing secret is a startup/request configuration failure rather
+        // than an authentication fallback.
+        secret_value(env, "JWT_SECRET").unwrap_or_default()
     };
-    if node_env.trim().eq_ignore_ascii_case("production") && value.len() < 32 {
+    if !local_environment && value.len() < 32 {
         return Err(ApiError::new(
             500,
             "configuration_error",
-            "JWT_SECRET must be a random value of at least 32 characters in production",
+            "JWT_SECRET must be a random value of at least 32 characters outside development",
         ));
     }
     Ok(value)
@@ -933,10 +949,13 @@ mod tests {
 
         assert!(api_key.starts_with("vak_"));
         assert!(refresh_token.starts_with("vbr_"));
-        assert_eq!(pairing_code.len(), 6);
+        assert!(pairing_code.starts_with("pair_"));
+        assert!(pairing_code.len() >= 20);
         assert!(pairing_code
             .chars()
-            .all(|character| character.is_ascii_digit()));
+            .all(|character| character.is_ascii_alphanumeric()
+                || character == '_'
+                || character == '-'));
         assert_ne!(api_key, mint_api_key().unwrap());
     }
 }

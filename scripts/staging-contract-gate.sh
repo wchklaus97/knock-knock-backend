@@ -6,6 +6,8 @@ BASE_URL="${BASE_URL:?Set BASE_URL to the deployed staging Worker URL}"
 BASE_URL="${BASE_URL%/}"
 : "${SMOKE_EMAIL:?Set SMOKE_EMAIL to a staging Supabase UAT account}"
 : "${SMOKE_PASSWORD:?Set SMOKE_PASSWORD to the staging Supabase UAT password}"
+: "${STAGING_WRANGLER_CONFIG:?Set STAGING_WRANGLER_CONFIG to a materialized staging Wrangler config}"
+: "${R2_SMOKE_BUCKET:?Set R2_SMOKE_BUCKET to the private staging R2 bucket}"
 
 health="$(curl --fail-with-body --silent --show-error "${BASE_URL}/health")"
 jq -e '
@@ -32,4 +34,12 @@ SMOKE_EMAIL="staging-contract-$(date +%s)-$$@local.test" \
 SMOKE_PASSWORD="${SMOKE_PASSWORD}" \
   "${ROOT_DIR}/scripts/contract-smoke.sh"
 
-printf '%s\n' 'staging contract gate passed: fail-closed health, Supabase auth, and full route smoke'
+BASE_URL="${BASE_URL}" \
+SMOKE_EMAIL="staging-r2-$(date +%s)-$$@local.test" \
+SMOKE_PASSWORD="${SMOKE_PASSWORD}" \
+R2_SMOKE_BUCKET="${R2_SMOKE_BUCKET}" \
+R2_SMOKE_REMOTE=true \
+R2_SMOKE_WRANGLER_CONFIG="${STAGING_WRANGLER_CONFIG}" \
+  "${ROOT_DIR}/scripts/r2-download-smoke.sh"
+
+printf '%s\n' 'staging contract gate passed: fail-closed health, Supabase auth, D1 routes, R2 download, retention, and isolation'

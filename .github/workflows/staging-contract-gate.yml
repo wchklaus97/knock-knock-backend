@@ -20,11 +20,38 @@ jobs:
       BASE_URL: ${{ inputs.staging_url }}
       SMOKE_EMAIL: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_EMAIL }}
       SMOKE_PASSWORD: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_PASSWORD }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
+      STAGING_D1_DATABASE_ID: ${{ vars.KNOCK_KNOCK_STAGING_D1_DATABASE_ID }}
+      STAGING_R2_BUCKET: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
+      STAGING_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_STAGING_SUPABASE_URL }}
+      STAGING_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_STAGING_CORS_ORIGIN }}
+      STAGING_RELEASE_VERSION: ${{ vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION }}
     steps:
       - uses: actions/checkout@v4
       - name: Install smoke dependencies
         run: |
           command -v curl
           command -v jq
+          npm install --global wrangler@4.81.1
+      - name: Materialize staging Wrangler config
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$STAGING_D1_DATABASE_ID"
+          test -n "$STAGING_R2_BUCKET"
+          test -n "$STAGING_SUPABASE_URL"
+          test -n "$STAGING_CORS_ORIGIN"
+          test -n "$STAGING_RELEASE_VERSION"
+          config="$RUNNER_TEMP/wrangler.staging.toml"
+          sed \
+            -e "s|REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL|$STAGING_SUPABASE_URL|g" \
+            -e "s|REPLACE_WITH_STAGING_ALLOWED_ORIGIN|$STAGING_CORS_ORIGIN|g" \
+            -e "s|REPLACE_WITH_STAGING_RELEASE_VERSION|$STAGING_RELEASE_VERSION|g" \
+            -e "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|$STAGING_D1_DATABASE_ID|g" \
+            -e "s|REPLACE_WITH_STAGING_R2_BUCKET_NAME|$STAGING_R2_BUCKET|g" \
+            wrangler.staging.toml.example > "$config"
+          echo "STAGING_WRANGLER_CONFIG=$config" >> "$GITHUB_ENV"
+          echo "R2_SMOKE_BUCKET=$STAGING_R2_BUCKET" >> "$GITHUB_ENV"
       - name: Run deployed staging contract gate
         run: ./scripts/staging-contract-gate.sh

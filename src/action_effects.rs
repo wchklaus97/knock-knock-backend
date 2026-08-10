@@ -21,6 +21,12 @@ struct EffectAttemptRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct CancelAttemptRow {
+    state: String,
+    response_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct EffectRow {
     id: String,
     status: String,
@@ -217,25 +223,52 @@ pub async fn undo(
         let provider_id = effect.provider_reminder_id.as_deref().ok_or_else(|| {
             ApiError::conflict("External reminder has no provider identifier to cancel")
         })?;
-        providers::cancel(
-            env,
-            &provider_config,
-            "create_reminder",
-            &providers::scoped_idempotency_key(
-                user_id,
-                "action.reminder.cancel",
-                &command.idempotency_key,
-            ),
-            json!({
-                "schema_version": 1,
-                "kind": "reminder",
-                "operation": "cancel",
-                "command_id": command.id,
-                "command_idempotency_key": command.idempotency_key,
-                "provider_id": provider_id,
-            }),
-        )
-        .await?;
+        let cancel_key = providers::scoped_idempotency_key(
+            user_id,
+            "action.reminder.cancel",
+            &command.idempotency_key,
+        );
+        let payload = json!({
+            "schema_version": 1,
+            "kind": "reminder",
+            "operation": "cancel",
+            "command_id": command.id,
+            "command_idempotency_key": command.idempotency_key,
+            "provider_id": provider_id,
+        });
+        let existing = claim_cancel_attempt(db, user_id, command, &cancel_key).await?;
+        let response = if let Some(response) = existing {
+            response
+        } else {
+            match providers::cancel(
+                env,
+                &provider_config,
+                "create_reminder",
+                &cancel_key,
+                payload,
+            )
+            .await
+            {
+                Ok(response) => {
+                    let state = match response.state {
+                        providers::ProviderDeliveryState::Succeeded => "succeeded",
+                        providers::ProviderDeliveryState::Pending
+                        | providers::ProviderDeliveryState::Unknown => "unknown",
+                        providers::ProviderDeliveryState::Failed => "failed",
+                    };
+                    finish_cancel_attempt(db, &cancel_key, state, Some(&response), None).await?;
+                    response
+                }
+                Err(error) => {
+                    let state = if error.retryable { "unknown" } else { "failed" };
+                    finish_cancel_attempt(db, &cancel_key, state, None, Some(&error)).await?;
+                    return Err(error);
+                }
+            }
+        };
+        if let Some(error) = cancel_state_error(response.state) {
+            return Err(error);
+        }
     }
 
     let result = json!({
@@ -782,6 +815,131 @@ fn parse_response(raw: Option<&str>) -> ApiResult<Value> {
     raw.map(serde_json::from_str)
         .transpose()?
         .ok_or_else(|| ApiError::new(500, "effect_error", "Provider result is missing"))
+}
+
+fn cancel_state_error(state: providers::ProviderDeliveryState) -> Option<ApiError> {
+    match state {
+        providers::ProviderDeliveryState::Succeeded => None,
+        providers::ProviderDeliveryState::Pending => Some(ApiError::new(
+            503,
+            "provider_cancel_pending",
+            "The provider has not finished cancelling this reminder",
+        )),
+        providers::ProviderDeliveryState::Failed => Some(ApiError::new(
+            424,
+            "provider_cancel_failed",
+            "The provider reported that cancelling this reminder failed",
+        )),
+        providers::ProviderDeliveryState::Unknown => Some(ApiError::new(
+            503,
+            "provider_cancel_unknown",
+            "The provider returned no authoritative cancellation state",
+        )),
+    }
+}
+
+async fn claim_cancel_attempt(
+    db: &D1Database,
+    user_id: &str,
+    command: &CommandRow,
+    provider_idempotency_key: &str,
+) -> ApiResult<Option<providers::ProviderResponse>> {
+    let provider = "external.reminder.cancel";
+    let now = db::now_iso();
+    let inserted = db::run(
+        db,
+        "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, 'running', ?, NULL, 1, NULL, NULL, ?, ?) ON CONFLICT(provider, provider_idempotency_key) DO NOTHING",
+        vec![
+            db::text(&new_id("attempt")?),
+            db::text(user_id),
+            db::text(&command.id),
+            db::text(provider),
+            db::text(provider_idempotency_key),
+            db::text(&command.command_hash),
+            db::text(&now),
+            db::text(&now),
+        ],
+    )
+    .await?;
+    if db::changes(&inserted) == 1 {
+        return Ok(None);
+    }
+
+    let existing: CancelAttemptRow = db::first(
+        db,
+        "SELECT state, response_json FROM action_attempts WHERE provider = ? AND provider_idempotency_key = ?",
+        vec![db::text(provider), db::text(provider_idempotency_key)],
+    )
+    .await?
+    .ok_or_else(|| ApiError::new(500, "provider_cancel_error", "Cancellation fence disappeared"))?;
+
+    if existing.state == "succeeded" {
+        let provider_id = existing
+            .response_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|value| {
+                value
+                    .get("provider_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        return Ok(Some(providers::ProviderResponse {
+            provider_id,
+            state: providers::ProviderDeliveryState::Succeeded,
+        }));
+    }
+
+    if matches!(existing.state.as_str(), "unknown" | "retrying" | "failed") {
+        let reclaimed = db::run(
+            db,
+            "UPDATE action_attempts SET state = 'running', attempts = attempts + 1, response_json = NULL, next_attempt_at = NULL, last_error = NULL, updated_at = ? WHERE provider = ? AND provider_idempotency_key = ? AND state IN ('unknown', 'retrying', 'failed')",
+            vec![
+                db::text(&now),
+                db::text(provider),
+                db::text(provider_idempotency_key),
+            ],
+        )
+        .await?;
+        if db::changes(&reclaimed) == 1 {
+            return Ok(None);
+        }
+    }
+
+    Err(ApiError::new(
+        503,
+        "provider_cancel_in_progress",
+        "Another request is already cancelling this reminder",
+    ))
+}
+
+async fn finish_cancel_attempt(
+    db: &D1Database,
+    provider_idempotency_key: &str,
+    state: &str,
+    response: Option<&providers::ProviderResponse>,
+    error: Option<&ApiError>,
+) -> ApiResult<()> {
+    let response_json = response.map(|value| {
+        json!({
+            "provider_id": value.provider_id,
+            "state": state,
+        })
+        .to_string()
+    });
+    db::run(
+        db,
+        "UPDATE action_attempts SET state = ?, response_json = ?, next_attempt_at = NULL, last_error = ?, updated_at = ? WHERE provider = 'external.reminder.cancel' AND provider_idempotency_key = ? AND state = 'running'",
+        vec![
+            db::text(state),
+            db::optional_text(response_json.as_deref()),
+            db::optional_text(error.map(|value| value.code.as_str())),
+            db::text(&db::now_iso()),
+            db::text(provider_idempotency_key),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 fn required_string<'a>(

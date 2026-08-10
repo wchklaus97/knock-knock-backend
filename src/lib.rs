@@ -746,7 +746,7 @@ async fn pairing_status(
 ) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
     let code = code.trim();
-    if code.len() < 4 || code.len() > 12 {
+    if code.len() < 4 || code.len() > 64 {
         return Err(ApiError::validation("Invalid pairing code"));
     }
     let row = db::first::<models::PairingRow>(
@@ -778,7 +778,7 @@ async fn pairing_claim(req: &mut Request, _env: &Env, db: &D1Database) -> ApiRes
     let body: PairingClaimRequest = read_json(req).await?;
     let code = body.code.trim();
     let label = body.label.trim();
-    if code.len() < 4 || code.len() > 12 || label.is_empty() {
+    if code.len() < 4 || code.len() > 64 || label.is_empty() {
         return Err(ApiError::validation("code and label are required"));
     }
     let now = db::now_iso();
@@ -1310,13 +1310,7 @@ async fn phone_model_descriptor(
 
     let manifest: Value = serde_json::from_str(&manifest_json)
         .map_err(|_| ApiError::new(503, "model_unavailable", "The model manifest is invalid"))?;
-    let manifest_model_id = manifest
-        .get("model_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::new(503, "model_unavailable", "The model manifest is invalid"))?;
-    if manifest_model_id != model_id {
-        return Err(ApiError::not_found("Model not found"));
-    }
+    validate_model_manifest(&manifest, model_id)?;
 
     let expires_at = config_value(env, "VOICE_MODEL_EXPIRES_AT", "");
     json_response(
@@ -1328,6 +1322,41 @@ async fn phone_model_descriptor(
         }),
         200,
     )
+}
+
+fn validate_model_manifest(manifest: &Value, model_id: &str) -> ApiResult<()> {
+    let valid = manifest.get("schema_version").and_then(Value::as_i64) == Some(1)
+        && manifest.get("model_id").and_then(Value::as_str) == Some(model_id)
+        && manifest
+            .get("model_version")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        && manifest
+            .get("sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        && manifest
+            .get("signature")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        && manifest
+            .get("size_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0)
+        && manifest
+            .get("minimum_capability")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty() && value.len() <= 64);
+    if !valid {
+        return Err(ApiError::new(
+            503,
+            "model_unavailable",
+            "The model manifest is invalid",
+        ));
+    }
+    Ok(())
 }
 
 async fn phone_mark_push_read(
@@ -1632,8 +1661,7 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
         json!({
             "device_id": device_id,
             "platform": body.platform,
-            "device_id": body.device_id,
-            "push_token": body.push_token,
+            "push_token_registered": body.push_token.is_some(),
             "locale": body.locale,
             "timezone": body.timezone,
         }),
@@ -1905,4 +1933,28 @@ fn add_common_headers(
         .headers_mut()
         .set("Referrer-Policy", "no-referrer")?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_model_manifest;
+    use serde_json::json;
+
+    #[test]
+    fn model_manifest_requires_integrity_and_capability_fields() {
+        let valid = json!({
+            "schema_version": 1,
+            "model_id": "whisperkit-base",
+            "model_version": "1.0.0",
+            "sha256": "a".repeat(64),
+            "signature": "sig-ed25519",
+            "size_bytes": 1024,
+            "minimum_capability": "iphone13"
+        });
+        assert!(validate_model_manifest(&valid, "whisperkit-base").is_ok());
+
+        let mut invalid = valid.clone();
+        invalid["sha256"] = json!("not-a-hash");
+        assert!(validate_model_manifest(&invalid, "whisperkit-base").is_err());
+    }
 }

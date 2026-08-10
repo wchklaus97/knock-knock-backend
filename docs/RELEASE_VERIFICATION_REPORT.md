@@ -10,7 +10,7 @@ and Phase 0–3 integration baseline
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
 | Backend base | `main` | `185b5e9` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | `a8d9e98aae28dc44c75a602ac46e134a92ceb834` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
+| Backend follow-up | `agent/phase45-completion-backend` | `working tree after a8d9e98; final SHA is recorded in the PR handoff` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
 The follow-up branch is based on merged PR #10. PR #11 is pushed and its
@@ -28,6 +28,10 @@ require human approval. The numbered gate handoff is tracked in
   compatibility-operation claim fencing, and durable vertical-action effects.
 - Server-side command validation, action registry, idempotency, confirmation,
   undo/cancel routes, retryable unknown outcomes, and outbox execution boundary.
+- Provider cancellation now requires an explicit terminal cancellation state
+  and uses a durable per-operation idempotency fence; exhausted retryable
+  outbox work remains `unknown` instead of being misreported as terminal
+  failure.
 - Durable local reminder and draft effects, an internal queued message effect,
   and provider-idempotency records for the three release vertical actions.
 - Additive command-list, pairing-status, push-dismiss, and rich action-descriptor
@@ -35,6 +39,10 @@ require human approval. The numbered gate handoff is tracked in
 - Explicit local/external/disabled provider modes, action feature flags,
   provider-attempt failure states, bounded stale-lease recovery, credential-key
   rejection in command arguments, and secret-only JWT/APNs signing material.
+- Non-development legacy JWT configuration fails closed without an explicit
+  32-character secret; pairing codes use high-entropy URL-safe tokens with a
+  tighter unauthenticated rate-limit bucket; APNs payloads contain only
+  privacy-light identifiers rather than the full voice script.
 - Secret-authenticated HTTPS provider webhook adapter for reminders and
   messages, reminder due-time leases/retries, deduplicated reminder pushes,
   and scheduled message/retrieval retention sweep.
@@ -58,7 +66,8 @@ require human approval. The numbered gate handoff is tracked in
   routes, methods, required fields, enum values, and the actual `/health` route.
 - Versioned, atomic, idempotent command Undo for local reminder/draft effects.
 - Signed model descriptor endpoint and production fail-closed model
-  configuration checks; the iOS target consumes the official LiteRT-LM 0.12
+  configuration checks, including required manifest integrity/capability
+  fields; the iOS target consumes the official LiteRT-LM 0.12
   C framework without the upstream unsafe SwiftPM linker flags.
 - User-scoped history/retrieval/search/session/push routes and deletion
   tombstones.
@@ -75,7 +84,7 @@ require human approval. The numbered gate handoff is tracked in
 
 - `cargo fmt --all -- --check` — passed
 - `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test -q` — 39 passed
+- `cargo test -q` — 41 passed
 - `cargo check --target wasm32-unknown-unknown -q` — passed
 - `worker-build --release` — passed; optimized Worker bundle generated
 - `scripts/architecture-migration-smoke.sh` — passed
@@ -88,6 +97,9 @@ require human approval. The numbered gate handoff is tracked in
 - `scripts/r2-download-smoke.sh` against an isolated local Worker + local D1/R2
   — passed for authorized streaming, metadata headers, no key disclosure,
   user-namespaced keys, shared-key retention cleanup, and cross-user isolation.
+- `scripts/r2-download-smoke.sh` now supports the same route/retention/isolation
+  flow against deployed staging with `R2_SMOKE_REMOTE=true` and a materialized
+  staging Wrangler config; that external run remains pending.
 - `scripts/provider-lifecycle-smoke.sh` against an isolated local Worker and
   mock provider — passed for reminder delivery/cancellation, timeout status
   reconciliation, and an asynchronous high-risk message moving from provider
@@ -101,8 +113,9 @@ require human approval. The numbered gate handoff is tracked in
   `2026.08.08-build-25`, so this does not count as PR #11 deployment evidence.
 - `scripts/staging-contract-gate.sh` and manual
   `.github/workflows/staging-contract-gate.yml` — prepared, not executed;
-  independent staging Worker/D1/R2 resources and UAT credentials do not yet
-  exist.
+  the workflow now materializes a staging Wrangler config and includes the
+  deployed R2 route smoke, but independent staging Worker/D1/R2 resources and
+  UAT credentials do not yet exist.
 - `scripts/contract-smoke.sh` against an isolated local Worker + local D1 —
   passed, including command list, pairing status, push dismissal, and the
   existing multi-turn session/action loop.

@@ -210,7 +210,7 @@ paths:
         - name: code
           in: path
           required: true
-          schema: { type: string, minLength: 4, maxLength: 12 }
+          schema: { type: string, minLength: 4, maxLength: 64 }
       responses:
         '200':
           description: Pairing code status for its owner.
@@ -233,7 +233,7 @@ paths:
               type: object
               required: [code, label]
               properties:
-                code: { type: string, minLength: 4, maxLength: 12 }
+                code: { type: string, minLength: 4, maxLength: 64 }
                 label: { type: string, minLength: 1, maxLength: 100 }
                 host_label: { type: [string, 'null'], maxLength: 100 }
       responses:
@@ -902,13 +902,13 @@ components:
       type: object
       required: [code, expires_at]
       properties:
-        code: { type: string, minLength: 4, maxLength: 12 }
+        code: { type: string, minLength: 4, maxLength: 64 }
         expires_at: { type: string, format: date-time }
     PairingCodeStatus:
       type: object
       required: [code, status, expires_at]
       properties:
-        code: { type: string, minLength: 4, maxLength: 12 }
+        code: { type: string, minLength: 4, maxLength: 64 }
         status: { type: string, enum: [waiting, claimed, expired] }
         expires_at: { type: string, format: date-time }
         claimed_at: { type: [string, 'null'], format: date-time }

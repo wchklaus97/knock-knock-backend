@@ -80,7 +80,7 @@ pub async fn send_alert(
     title: &str,
     body: &str,
     session_id: Option<&str>,
-    voice_script: Option<&str>,
+    _voice_script: Option<&str>,
 ) -> ApiResult<()> {
     if !looks_like_token(token) {
         return Err(ApiError::new(
@@ -102,7 +102,6 @@ pub async fn send_alert(
             "sound": "default",
         },
         "session_id": session_id,
-        "voice_script": voice_script,
     })
     .to_string();
     let headers = Headers::new();

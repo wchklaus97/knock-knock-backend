@@ -47,6 +47,14 @@ grep -q '^SERVICE_VERSION = "REPLACE_WITH_STAGING_RELEASE_VERSION"$' "$STAGING_E
 grep -q '^binding = "R2"$' "$STAGING_EXAMPLE"
 grep -q '^bucket_name = "REPLACE_WITH_STAGING_R2_BUCKET_NAME"$' "$STAGING_EXAMPLE"
 
+grep -q 'BACKUP_BUCKET' "$ROOT/.github/workflows/production-backup.yml"
+grep -q 'BACKUP_PASSPHRASE' "$ROOT/.github/workflows/production-backup.yml"
+grep -q 'gpg' "$ROOT/.github/workflows/production-backup.yml"
+if grep -q 'actions/upload-artifact' "$ROOT/.github/workflows/production-backup.yml"; then
+  echo "production backups must not be retained as plaintext CI artifacts" >&2
+  exit 1
+fi
+
 if grep -q '^CORS_ORIGIN = "\*"$' "$PRODUCTION_EXAMPLE"; then
   echo "production config must not allow wildcard CORS" >&2
   exit 1

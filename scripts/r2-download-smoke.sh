@@ -6,12 +6,20 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:8787}"
 BASE_URL="${BASE_URL%/}"
 BUCKET="${R2_SMOKE_BUCKET:-knock-knock-local}"
 PERSIST_TO="${R2_SMOKE_PERSIST_TO:-.wrangler/state}"
+WRANGLER_CONFIG="${R2_SMOKE_WRANGLER_CONFIG:-${ROOT_DIR}/wrangler.toml}"
+REMOTE="${R2_SMOKE_REMOTE:-false}"
 PASSWORD="${SMOKE_PASSWORD:-password123}"
 EMAIL="${SMOKE_EMAIL:-r2-download-$(date +%s)-$$@local.test}"
 FIXTURE="${ROOT_DIR}/scripts/fixtures/retrieval-download.txt"
 KEY=""
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
+
+if [[ "$REMOTE" == "true" ]]; then
+  STORAGE_ARGS=(--remote)
+else
+  STORAGE_ARGS=(--local --persist-to "$PERSIST_TO")
+fi
 
 json() {
   curl --fail-with-body --silent --show-error \
@@ -27,9 +35,8 @@ user_auth=(-H "authorization: Bearer ${token}")
 KEY="users/${user_id}/retrievals/r2-smoke-${RANDOM}-$$.txt"
 
 wrangler r2 object put "${BUCKET}/${KEY}" \
-  --config "${ROOT_DIR}/wrangler.toml" \
-  --local \
-  --persist-to "${PERSIST_TO}" \
+  --config "${WRANGLER_CONFIG}" \
+  "${STORAGE_ARGS[@]}" \
   --file "${FIXTURE}" \
   --content-type text/plain \
   --force >/dev/null
@@ -81,9 +88,8 @@ other_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
 test "${other_status}" = "404"
 
 wrangler d1 execute DB \
-  --config "${ROOT_DIR}/wrangler.toml" \
-  --local \
-  --persist-to "${PERSIST_TO}" \
+  --config "${WRANGLER_CONFIG}" \
+  "${STORAGE_ARGS[@]}" \
   --command "UPDATE retrieval_items SET retention_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = '${retrieval_id}'" \
   >/dev/null
 curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
@@ -98,18 +104,16 @@ curl --fail-with-body --silent --show-error "${user_auth[@]}" \
   "${BASE_URL}/v1/phone/retrievals/${shared_retrieval_id}/download"
 cmp "${FIXTURE}" "${TMP_DIR}/shared-body"
 if ! wrangler r2 object get "${BUCKET}/${KEY}" \
-  --config "${ROOT_DIR}/wrangler.toml" \
-  --local \
-  --persist-to "${PERSIST_TO}" \
+  --config "${WRANGLER_CONFIG}" \
+  "${STORAGE_ARGS[@]}" \
   --file "${TMP_DIR}/still-referenced" >/dev/null 2>&1; then
   echo 'shared R2 retrieval object was deleted too early' >&2
   exit 1
 fi
 
 wrangler d1 execute DB \
-  --config "${ROOT_DIR}/wrangler.toml" \
-  --local \
-  --persist-to "${PERSIST_TO}" \
+  --config "${WRANGLER_CONFIG}" \
+  "${STORAGE_ARGS[@]}" \
   --command "UPDATE retrieval_items SET retention_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = '${shared_retrieval_id}'" \
   >/dev/null
 curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
@@ -117,9 +121,8 @@ shared_expired_status="$(curl --silent --show-error -o /dev/null -w '%{http_code
   "${user_auth[@]}" "${BASE_URL}/v1/phone/retrievals/${shared_retrieval_id}/download")"
 test "${shared_expired_status}" = "404"
 if wrangler r2 object get "${BUCKET}/${KEY}" \
-  --config "${ROOT_DIR}/wrangler.toml" \
-  --local \
-  --persist-to "${PERSIST_TO}" \
+  --config "${WRANGLER_CONFIG}" \
+  "${STORAGE_ARGS[@]}" \
   --file "${TMP_DIR}/deleted" >/dev/null 2>&1; then
   echo 'expired R2 retrieval object was not deleted' >&2
   exit 1

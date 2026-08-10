@@ -471,9 +471,21 @@ async fn finish_failure(
 ) -> ApiResult<()> {
     let now = db::now_iso();
     let attempt = row.attempts + 1;
-    let retry = failure.retryable() && attempt < MAX_ATTEMPTS;
-    let command_state = if retry { "unknown" } else { "failed" };
-    let outbox_state = if retry { "retrying" } else { "failed" };
+    let retryable = failure.retryable();
+    let retry = retryable && attempt < MAX_ATTEMPTS;
+    // A retryable provider/network result is never converted into a false
+    // terminal failure. After the automatic retry budget is exhausted the
+    // command remains `unknown` and the outbox row becomes a durable
+    // reconciliation/dead-letter record for an operator or a future status
+    // worker. Only validation/business failures become `failed`.
+    let command_state = if retryable { "unknown" } else { "failed" };
+    let outbox_state = if retry {
+        "retrying"
+    } else if retryable {
+        "unknown"
+    } else {
+        "failed"
+    };
     let retry_at = retry.then(|| db::add_seconds_iso(backoff_seconds(row.attempts)));
     let version = command.version + 1;
     let error = failure.error();
@@ -514,8 +526,14 @@ async fn finish_failure(
                 db::text(&new_id("aud")?),
                 db::text(user_id),
                 db::optional_text(command.session_id.as_deref()),
-                db::text(if retry { "command.retrying" } else { "command.failed" }),
-                db::text(&json!({"command_id": command.id, "error_code": error.code, "retryable": retry, "version": version}).to_string()),
+                db::text(if retry {
+                    "command.retrying"
+                } else if retryable {
+                    "command.unknown"
+                } else {
+                    "command.failed"
+                }),
+                db::text(&json!({"command_id": command.id, "error_code": error.code, "retryable": retryable, "auto_retry": retry, "version": version}).to_string()),
                 db::text(&now),
                 db::text(&command.id),
                 db::text(user_id),
@@ -554,7 +572,13 @@ async fn finish_failure(
                 db::text(&command.id),
                 db::text(provider),
                 db::text(&provider_idempotency_key),
-                db::text(if retry { "retrying" } else { "failed" }),
+                db::text(if retry {
+                    "retrying"
+                } else if retryable {
+                    "unknown"
+                } else {
+                    "failed"
+                }),
                 db::text(&command.command_hash),
                 db::number(attempt as i64),
                 db::optional_text(retry_at.as_deref()),
@@ -582,13 +606,20 @@ async fn release_runtime_error(
     error: &ApiError,
 ) -> ApiResult<()> {
     let attempt = row.attempts + 1;
-    let retry = attempt < MAX_ATTEMPTS;
+    let retryable = error.retryable;
+    let retry = retryable && attempt < MAX_ATTEMPTS;
     let now = db::now_iso();
     db::run(
         db,
         "UPDATE outbox_events SET state = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ? AND state = 'running'",
         vec![
-            db::text(if retry { "retrying" } else { "failed" }),
+                db::text(if retry {
+                    "retrying"
+                } else if retryable {
+                    "unknown"
+                } else {
+                    "failed"
+                }),
             db::optional_text(
                 retry
                     .then(|| db::add_seconds_iso(backoff_seconds(row.attempts)))
