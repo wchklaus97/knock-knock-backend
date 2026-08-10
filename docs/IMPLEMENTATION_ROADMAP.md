@@ -6,10 +6,9 @@
 
 ## Execution status — 2026-08-10
 
-The staged implementation through PR #10 and the Backend Phase 4/5 completion
-follow-up PR #11 are merged. PR #11 is merged into `main` but has not been
-deployed as a production release. The current contract-parity follow-up is
-being prepared from that merge base; the current dependency chain is:
+The staged implementation through PR #10, the Backend Phase 4/5 completion
+follow-up PR #11, and the contract-parity follow-up PR #12 are merged. These
+changes are not a production release. The current dependency chain is:
 
 | Stage | Backend | iOS | Status |
 |---|---|---|---|
@@ -33,14 +32,15 @@ The detailed evidence and rollback record is in
 `docs/RELEASE_VERIFICATION_REPORT.md`.
 The numbered release handoff is in `docs/RELEASE_GATE_MATRIX.md`.
 
-### Contract parity follow-up — 2026-08-10
+### Contract parity follow-up — 2026-08-10 — merged PR #12
 
 The post-PR #11 contract follow-up keeps the OpenAPI document aligned with all
 47 executable operations, including the legacy `/v1/health` alias, agent key
 rotation, skills, session detail, and session progress routes. The route parity
 smoke compares the Rust dispatch table with OpenAPI and the local contract
-smoke exercises the newly covered routes. This follow-up must be reviewed and
-merged before any client regenerates its API bindings.
+smoke exercises the newly covered routes. PR #12 was merged as `3dcea11`;
+any client API regeneration must still pass the paired iOS compatibility
+review.
 
 ### Backend follow-up checkpoint — 2026-08-10
 

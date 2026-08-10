@@ -88,6 +88,8 @@ authenticated user and action; the original command key is retained in the
 payload for provider audit. Production keeps both action flags disabled until
 the provider delivery/status endpoints, idempotency behavior, cancellation policy, and credentials are approved. A
 local queued message is never reported as externally delivered.
+The required vendor sandbox contract and promotion checklist are documented in
+[`docs/PROVIDER_SANDBOX_RUNBOOK.md`](docs/PROVIDER_SANDBOX_RUNBOOK.md).
 
 For a safe remote staging Worker, copy `wrangler.staging.toml.example`, create
 a separate D1 database and Supabase project, replace its explicit origin and
