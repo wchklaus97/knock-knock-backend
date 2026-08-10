@@ -10,9 +10,11 @@ mod models;
 mod outbox;
 mod pagination;
 mod phone_operations;
+mod providers;
 mod push;
 mod rate_limits;
 mod realtime;
+mod reminders;
 mod sessions;
 mod skills;
 
@@ -59,7 +61,7 @@ struct ConfirmationRequest {
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let origin = req.headers().get("origin").ok().flatten();
-    let request_id = request_id();
+    let request_id = request_id_for(&req);
     let result = dispatch(req, env.clone()).await;
     let mut response = match result {
         Ok(response) => response,
@@ -83,8 +85,17 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// adapters remain unknown/retryable instead of being reported as success.
 #[event(scheduled)]
 pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    if runtime_configuration(&env).is_err() {
+        return;
+    }
     if let Ok(db) = env.d1("DB") {
-        let _ = outbox::drain(&db).await;
+        let _ = outbox::drain(&db, &env).await;
+        if let Ok(provider_config) = providers::load(&env) {
+            let _ =
+                action_effects::reconcile_external_cancellations(&env, &db, provider_config).await;
+        }
+        let _ = reminders::drain_due(&db, &env).await;
+        let _ = history::purge_expired_all(&db, &env).await;
     }
 }
 
@@ -92,6 +103,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
     let path = req.path();
     let method = req.method();
     runtime_configuration(&env)?;
+    let action_provider_config = providers::load(&env)?;
 
     if method == Method::Options {
         return Ok(Response::empty()?);
@@ -106,16 +118,40 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
                 "push_mode": config_value(&env, "PUSH_MODE", "dev"),
                 "apns_ready": crate::apns::is_ready(&env),
                 "apns_production": config_value(&env, "APNS_PRODUCTION", "false") == "true",
+                "action_provider_mode": action_provider_config.mode().as_str(),
+                "action_provider_ready": providers::ready(&action_provider_config),
+                "action_reminder_enabled": action_provider_config.enabled("create_reminder"),
+                "action_message_enabled": action_provider_config.enabled("send_message"),
             }),
             200,
         );
     }
     if path == "/metrics" && method == Method::Get {
-        return Ok(Response::ok(
+        let provider_ready = if providers::ready(&action_provider_config) {
+            1
+        } else {
+            0
+        };
+        let apns_ready = if crate::apns::is_ready(&env) { 1 } else { 0 };
+        let model_enabled = if config_value(&env, "VOICE_MODEL_ENABLED", "false") == "true" {
+            1
+        } else {
+            0
+        };
+        return Ok(Response::ok(format!(
             "# HELP knock_knock_api_info API runtime information\n\
              # TYPE knock_knock_api_info gauge\n\
-             knock_knock_api_info{runtime=\"cloudflare-worker\",api=\"rust\"} 1\n",
-        )?);
+             knock_knock_api_info{{runtime=\"cloudflare-worker\",api=\"rust\"}} 1\n\
+             # HELP knock_knock_provider_ready Whether the configured action provider is ready\n\
+             # TYPE knock_knock_provider_ready gauge\n\
+             knock_knock_provider_ready {provider_ready}\n\
+             # HELP knock_knock_apns_ready Whether APNs signing configuration is ready\n\
+             # TYPE knock_knock_apns_ready gauge\n\
+             knock_knock_apns_ready {apns_ready}\n\
+             # HELP knock_knock_model_enabled Whether the voice model feature flag is enabled\n\
+             # TYPE knock_knock_model_enabled gauge\n\
+             knock_knock_model_enabled {model_enabled}\n"
+        ))?);
     }
 
     let db = env.d1("DB")?;
@@ -139,6 +175,9 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         }
 
         (Method::Post, ["v1", "pairing", "code"]) => create_pairing_code(&mut req, &env, &db).await,
+        (Method::Get, ["v1", "pairing", "code", code]) => {
+            pairing_status(&req, &env, &db, code).await
+        }
         (Method::Post, ["v1", "pairing", "claim"]) => pairing_claim(&mut req, &env, &db).await,
 
         (Method::Get, ["v1", "skills"]) => list_skills(&req, &env, &db).await,
@@ -192,6 +231,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         (Method::Post, ["v1", "phone", "commands"]) => {
             phone_create_command(&mut req, &env, &db).await
         }
+        (Method::Get, ["v1", "phone", "commands"]) => phone_list_commands(&req, &env, &db).await,
         (Method::Get, ["v1", "phone", "commands", command_id]) => {
             phone_get_command(&req, &env, &db, command_id).await
         }
@@ -207,9 +247,15 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         (Method::Get, ["v1", "phone", "models", model_id]) => {
             phone_model_descriptor(&req, &env, &db, model_id).await
         }
+        (Method::Get, ["v1", "phone", "retrievals", retrieval_id, "download"]) => {
+            phone_retrieval_download(&req, &env, &db, retrieval_id).await
+        }
         (Method::Get, ["v1", "phone", "search"]) => phone_search(&req, &env, &db).await,
         (Method::Post, ["v1", "phone", "pushes", push_id, "read"]) => {
             phone_mark_push_read(&req, &env, &db, push_id).await
+        }
+        (Method::Post, ["v1", "phone", "pushes", push_id, "dismiss"]) => {
+            phone_dismiss_push(&req, &env, &db, push_id).await
         }
         (Method::Post, ["v1", "phone", "pushes", "read-all"]) => {
             phone_mark_all_pushes_read(&req, &env, &db).await
@@ -226,7 +272,17 @@ fn path_segments(path: &str) -> Vec<&str> {
         .collect()
 }
 
-fn request_id() -> String {
+fn request_id_for(request: &Request) -> String {
+    if let Ok(Some(value)) = request.headers().get("x-request-id") {
+        let trimmed = value.trim();
+        if valid_request_id(trimmed) {
+            return trimmed.to_owned();
+        }
+    }
+    new_request_id()
+}
+
+fn new_request_id() -> String {
     let timestamp = worker::Date::now().as_millis();
     let mut entropy = [0_u8; 8];
     if getrandom::fill(&mut entropy).is_err() {
@@ -239,17 +295,20 @@ fn request_id() -> String {
     format!("req_{timestamp:x}_{suffix}")
 }
 
+fn valid_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
 fn rate_limit_identity(request: &Request) -> ApiResult<String> {
+    // Cloudflare's cf-connecting-ip is supplied by the trusted edge. Do not
+    // use a caller-controlled X-Forwarded-For value for abuse controls.
     if let Some(value) = request.headers().get("cf-connecting-ip")? {
         if !value.trim().is_empty() {
             return Ok(format!("edge:{}", value.trim()));
-        }
-    }
-    if let Some(value) = request.headers().get("x-forwarded-for")? {
-        if let Some(first) = value.split(',').next().map(str::trim) {
-            if !first.is_empty() {
-                return Ok(format!("edge:{first}"));
-            }
         }
     }
     Ok("edge:anonymous".into())
@@ -293,10 +352,7 @@ fn query_claim(request: &Request) -> ApiResult<bool> {
 
 fn request_metadata(request: &Request) -> ApiResult<(Option<String>, Option<String>)> {
     let user_agent = request.headers().get("user-agent")?;
-    let ip_address = request
-        .headers()
-        .get("x-forwarded-for")?
-        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string));
+    let ip_address = request.headers().get("cf-connecting-ip")?;
     Ok((user_agent, ip_address))
 }
 
@@ -695,7 +751,7 @@ async fn create_pairing_code(req: &mut Request, env: &Env, db: &D1Database) -> A
     let expires_at = db::add_seconds_iso(ttl);
     db::run(
         db,
-        "INSERT INTO pairing_codes (code, user_id, expires_at, claimed_at, created_at) VALUES (?, ?, ?, NULL, ?)",
+        "INSERT INTO pairing_codes (code, user_id, expires_at, claimed_at, claim_token, created_at) VALUES (?, ?, ?, NULL, NULL, ?)",
         vec![
             db::text(&code),
             db::text(&user.user_id),
@@ -716,24 +772,66 @@ async fn create_pairing_code(req: &mut Request, env: &Env, db: &D1Database) -> A
     json_response(json!({ "code": code, "expires_at": expires_at }), 201)
 }
 
+async fn pairing_status(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    code: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let code = code.trim();
+    if code.len() < 4 || code.len() > 64 {
+        return Err(ApiError::validation("Invalid pairing code"));
+    }
+    let row = db::first::<models::PairingRow>(
+        db,
+        "SELECT user_id, expires_at, claimed_at FROM pairing_codes WHERE code = ? AND user_id = ?",
+        vec![db::text(code), db::text(&user.user_id)],
+    )
+    .await?
+    .ok_or_else(|| ApiError::not_found("Pairing code not found"))?;
+    let status = if row.claimed_at.is_some() {
+        "claimed"
+    } else if db::is_expired(&row.expires_at) {
+        "expired"
+    } else {
+        "waiting"
+    };
+    json_response(
+        json!({
+            "code": code,
+            "status": status,
+            "expires_at": row.expires_at,
+            "claimed_at": row.claimed_at,
+        }),
+        200,
+    )
+}
+
 async fn pairing_claim(req: &mut Request, _env: &Env, db: &D1Database) -> ApiResult<Response> {
     let body: PairingClaimRequest = read_json(req).await?;
     let code = body.code.trim();
     let label = body.label.trim();
-    if code.len() < 4 || code.len() > 12 || label.is_empty() {
+    if code.len() < 4 || code.len() > 64 || label.is_empty() {
         return Err(ApiError::validation("code and label are required"));
     }
     let now = db::now_iso();
     let agent_id = new_id("agt")?;
     let api_key = mint_api_key()?;
+    let claim_token = new_id("claim")?;
     let update = db::prepare(
         db,
-        "UPDATE pairing_codes SET claimed_at = ? WHERE code = ? AND claimed_at IS NULL AND expires_at > ?",
-        vec![db::text(&now), db::text(code), db::text(&now)],
+        "UPDATE pairing_codes SET claimed_at = ?, claim_token = ? WHERE code = ? AND claimed_at IS NULL AND expires_at > ?",
+        vec![
+            db::text(&now),
+            db::text(&claim_token),
+            db::text(code),
+            db::text(&now),
+        ],
     )?;
     let insert = db::prepare(
         db,
-        "INSERT INTO agents (id, user_id, label, host_label, api_key_hash, created_at) SELECT ?, user_id, ?, ?, ?, ? FROM pairing_codes WHERE code = ? AND claimed_at = ?",
+        "INSERT INTO agents (id, user_id, label, host_label, api_key_hash, created_at) SELECT ?, user_id, ?, ?, ?, ? FROM pairing_codes WHERE code = ? AND claim_token = ? AND claimed_at = ?",
         vec![
             db::text(&agent_id),
             db::text(label),
@@ -741,6 +839,7 @@ async fn pairing_claim(req: &mut Request, _env: &Env, db: &D1Database) -> ApiRes
             db::text(&hash_api_key(&api_key)),
             db::text(&now),
             db::text(code),
+            db::text(&claim_token),
             db::text(&now),
         ],
     )?;
@@ -931,7 +1030,7 @@ async fn submit_action_result(
 
 async fn phone_sessions(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
-    history::purge_expired(db, &user.user_id).await?;
+    history::purge_expired(db, env, &user.user_id).await?;
     let before = query_value(req, "before")?;
     json_response(
         history::list_sessions(db, &user.user_id, before.as_deref(), query_limit(req, 50)?).await?,
@@ -1054,6 +1153,15 @@ async fn phone_delete_session(
                 db::text(&now),
             ],
         )?,
+        db::prepare(
+            db,
+            "UPDATE reminders SET status = 'cancelled', notification_state = 'cancelled', last_notification_error = 'session_deleted', updated_at = ? WHERE user_id = ? AND session_id = ? AND status = 'scheduled' AND provider = 'local.reminder'",
+            vec![
+                db::text(&now),
+                db::text(&user.user_id),
+                db::text(session_id),
+            ],
+        )?,
     ];
     let results = db.batch(statements).await?;
     if results.first().map(db::changes).unwrap_or(0) == 0 {
@@ -1081,7 +1189,7 @@ async fn phone_messages(
     session_id: &str,
 ) -> ApiResult<Response> {
     let row = phone_session_for_user(req, env, db, session_id).await?;
-    history::purge_expired(db, &row.user_id).await?;
+    history::purge_expired(db, env, &row.user_id).await?;
     let before = query_value(req, "before")?;
     json_response(
         history::list_messages(
@@ -1103,13 +1211,92 @@ async fn phone_export(
     session_id: &str,
 ) -> ApiResult<Response> {
     let row = phone_session_for_user(req, env, db, session_id).await?;
-    history::purge_expired(db, &row.user_id).await?;
+    history::purge_expired(db, env, &row.user_id).await?;
     json_response(history::export_session(db, &row.user_id, &row).await?, 200)
+}
+
+/// Stream a retrieval payload through an authenticated Worker request. The R2
+/// key never crosses the API boundary and is only resolved after checking the
+/// authenticated user, live session, and retention window in D1.
+async fn phone_retrieval_download(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    retrieval_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let retrieval = history::get_retrieval(db, &user.user_id, retrieval_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Retrieval asset not found"))?;
+    let key = retrieval
+        .r2_key
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::not_found("Retrieval asset is not stored"))?;
+    if !history::is_user_r2_key(&user.user_id, &key) {
+        return Err(ApiError::not_found("Retrieval asset not found"));
+    }
+    let bucket = env.bucket("R2").map_err(|_| {
+        ApiError::new(
+            503,
+            "retrieval_storage_unavailable",
+            "Retrieval storage is not configured for this environment",
+        )
+    })?;
+    let object = bucket
+        .get(key)
+        .execute()
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                502,
+                "retrieval_storage_error",
+                "Retrieval storage could not be read",
+            )
+        })?
+        .ok_or_else(|| ApiError::not_found("Retrieval asset not found"))?;
+    let body = object
+        .body()
+        .ok_or_else(|| {
+            ApiError::new(
+                502,
+                "retrieval_storage_error",
+                "Retrieval asset has no body",
+            )
+        })?
+        .response_body()
+        .map_err(|_| {
+            ApiError::new(
+                502,
+                "retrieval_storage_error",
+                "Retrieval asset could not be streamed",
+            )
+        })?;
+
+    let headers = Headers::new();
+    object.write_http_metadata(headers.clone()).map_err(|_| {
+        ApiError::new(
+            502,
+            "retrieval_storage_error",
+            "Retrieval metadata could not be read",
+        )
+    })?;
+    if headers.get("content-type")?.is_none() {
+        headers.set("content-type", "application/octet-stream")?;
+    }
+    // Retrievals can contain sensitive source material. Do not allow a shared
+    // browser/proxy cache to outlive the authenticated request.
+    headers.set("cache-control", "private, no-store")?;
+    headers.set(
+        "content-disposition",
+        "attachment; filename=\"retrieval.bin\"",
+    )?;
+    headers.set("x-content-type-options", "nosniff")?;
+    Ok(Response::from_body(body)?.with_headers(headers))
 }
 
 async fn phone_search(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
-    history::purge_expired(db, &user.user_id).await?;
+    history::purge_expired(db, env, &user.user_id).await?;
     let query = query_value(req, "q")?.unwrap_or_default();
     json_response(
         history::search(db, &user.user_id, &query, query_limit(req, 50)?).await?,
@@ -1157,13 +1344,7 @@ async fn phone_model_descriptor(
 
     let manifest: Value = serde_json::from_str(&manifest_json)
         .map_err(|_| ApiError::new(503, "model_unavailable", "The model manifest is invalid"))?;
-    let manifest_model_id = manifest
-        .get("model_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::new(503, "model_unavailable", "The model manifest is invalid"))?;
-    if manifest_model_id != model_id {
-        return Err(ApiError::not_found("Model not found"));
-    }
+    validate_model_manifest(&manifest, model_id)?;
 
     let expires_at = config_value(env, "VOICE_MODEL_EXPIRES_AT", "");
     json_response(
@@ -1177,6 +1358,41 @@ async fn phone_model_descriptor(
     )
 }
 
+fn validate_model_manifest(manifest: &Value, model_id: &str) -> ApiResult<()> {
+    let valid = manifest.get("schema_version").and_then(Value::as_i64) == Some(1)
+        && manifest.get("model_id").and_then(Value::as_str) == Some(model_id)
+        && manifest
+            .get("model_version")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        && manifest
+            .get("sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        && manifest
+            .get("signature")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        && manifest
+            .get("size_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0)
+        && manifest
+            .get("minimum_capability")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty() && value.len() <= 64);
+    if !valid {
+        return Err(ApiError::new(
+            503,
+            "model_unavailable",
+            "The model manifest is invalid",
+        ));
+    }
+    Ok(())
+}
+
 async fn phone_mark_push_read(
     req: &Request,
     env: &Env,
@@ -1185,6 +1401,16 @@ async fn phone_mark_push_read(
 ) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
     json_response(push::mark_read(db, &user.user_id, push_id).await?, 200)
+}
+
+async fn phone_dismiss_push(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    push_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    json_response(push::dismiss(db, &user.user_id, push_id).await?, 200)
 }
 
 async fn phone_mark_all_pushes_read(
@@ -1237,7 +1463,7 @@ fn sync_cursor(request: &Request) -> ApiResult<Option<i64>> {
 
 async fn phone_sync(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
-    history::purge_expired(db, &user.user_id).await?;
+    history::purge_expired(db, env, &user.user_id).await?;
     let after = sync_cursor(req)?.unwrap_or(0);
     let limit = crate::realtime::normalize_limit(
         query_value(req, "limit")?.and_then(|value| value.parse::<i64>().ok()),
@@ -1394,11 +1620,16 @@ async fn phone_history(
     if !exists {
         return Err(ApiError::not_found("Session not found"));
     }
-    let entries =
-        audit::list_audit_for_session(db, &user.user_id, session_id, query_limit(req, 100)?)
-            .await?;
+    let before = query_value(req, "before")?;
     json_response(
-        json!({ "entries": entries, "next_cursor": Value::Null, "has_more": false }),
+        audit::list_audit_for_session(
+            db,
+            &user.user_id,
+            session_id,
+            before.as_deref(),
+            query_limit(req, 100)?,
+        )
+        .await?,
         200,
     )
 }
@@ -1464,8 +1695,7 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
         json!({
             "device_id": device_id,
             "platform": body.platform,
-            "device_id": body.device_id,
-            "push_token": body.push_token,
+            "push_token_registered": body.push_token.is_some(),
             "locale": body.locale,
             "timezone": body.timezone,
         }),
@@ -1636,6 +1866,25 @@ async fn phone_get_command(
     json_response(crate::commands::response(&command, None), 200)
 }
 
+async fn phone_list_commands(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let before = query_value(req, "before")?;
+    let state = query_value(req, "state")?;
+    let session_id = query_value(req, "session_id")?;
+    json_response(
+        crate::commands::list_for_user(
+            db,
+            &user.user_id,
+            before.as_deref(),
+            state.as_deref(),
+            session_id.as_deref(),
+            query_limit(req, 50)?,
+        )
+        .await?,
+        200,
+    )
+}
+
 async fn phone_confirm_command(
     req: &mut Request,
     env: &Env,
@@ -1671,7 +1920,7 @@ async fn phone_undo_command(
 ) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
     json_response(
-        crate::commands::undo(db, &user.user_id, command_id).await?,
+        crate::commands::undo(env, db, &user.user_id, command_id, providers::load(env)?).await?,
         202,
     )
 }
@@ -1718,4 +1967,36 @@ fn add_common_headers(
         .headers_mut()
         .set("Referrer-Policy", "no-referrer")?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{valid_request_id, validate_model_manifest};
+    use serde_json::json;
+
+    #[test]
+    fn model_manifest_requires_integrity_and_capability_fields() {
+        let valid = json!({
+            "schema_version": 1,
+            "model_id": "whisperkit-base",
+            "model_version": "1.0.0",
+            "sha256": "a".repeat(64),
+            "signature": "sig-ed25519",
+            "size_bytes": 1024,
+            "minimum_capability": "iphone13"
+        });
+        assert!(validate_model_manifest(&valid, "whisperkit-base").is_ok());
+
+        let mut invalid = valid.clone();
+        invalid["sha256"] = json!("not-a-hash");
+        assert!(validate_model_manifest(&invalid, "whisperkit-base").is_err());
+    }
+
+    #[test]
+    fn request_id_accepts_safe_correlation_values_only() {
+        assert!(valid_request_id("req_mobile-123.abc:1"));
+        assert!(!valid_request_id("req bad"));
+        assert!(!valid_request_id("req\nlog-injection"));
+        assert!(!valid_request_id(&"x".repeat(129)));
+    }
 }

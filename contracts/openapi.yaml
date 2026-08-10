@@ -18,6 +18,30 @@ tags:
 security:
   - bearerAuth: []
 paths:
+  /health:
+    get:
+      tags: [Auth]
+      security: []
+      operationId: getWorkerHealth
+      responses:
+        '200':
+          description: Worker health and provider readiness.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /metrics:
+    get:
+      tags: [Auth]
+      security: []
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Prometheus-compatible runtime readiness gauges.
+          content:
+            text/plain:
+              schema:
+                type: string
   /v1/health:
     get:
       tags: [Auth]
@@ -167,6 +191,75 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/Action'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/pairing/code:
+    post:
+      tags: [Agent]
+      operationId: createPairingCode
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl_sec: { type: integer, minimum: 1, maximum: 3600, default: 600 }
+      responses:
+        '201':
+          description: Short-lived pairing code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairingCode'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/pairing/code/{code}:
+    get:
+      tags: [Agent]
+      operationId: getPairingCodeStatus
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string, minLength: 4, maxLength: 64 }
+      responses:
+        '200':
+          description: Pairing code status for its owner.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairingCodeStatus'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/pairing/claim:
+    post:
+      tags: [Agent]
+      security: []
+      operationId: claimPairingCode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, label]
+              properties:
+                code: { type: string, minLength: 4, maxLength: 64 }
+                label: { type: string, minLength: 1, maxLength: 100 }
+                host_label: { type: [string, 'null'], maxLength: 100 }
+      responses:
+        '201':
+          description: Agent credentials created from the pairing code.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agent_id, api_key]
+                properties:
+                  agent_id: { type: string }
+                  api_key: { type: string }
+                  label: { type: string }
         default:
           $ref: '#/components/responses/Error'
   /v1/sessions:
@@ -451,6 +544,29 @@ paths:
                     items: { $ref: '#/components/schemas/RetrievalItem' }
         default:
           $ref: '#/components/responses/Error'
+  /v1/phone/retrievals/{retrieval_id}/download:
+    get:
+      tags: [Phone]
+      operationId: downloadPhoneRetrieval
+      description: Streams an authorized R2 retrieval payload. The internal R2 key is never returned.
+      parameters:
+        - name: retrieval_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Retrieval payload streamed from the configured R2 bucket.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+            Content-Disposition:
+              schema: { type: string }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        default:
+          $ref: '#/components/responses/Error'
   /v1/phone/sessions/{session_id}/reply:
     post:
       tags: [Compatibility]
@@ -494,6 +610,30 @@ paths:
         default:
           $ref: '#/components/responses/Error'
   /v1/phone/commands:
+    get:
+      tags: [Phone]
+      operationId: listPhoneCommands
+      parameters:
+        - $ref: '#/components/parameters/BeforeCursor'
+        - $ref: '#/components/parameters/PageLimit'
+        - name: state
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/CommandState'
+        - name: session_id
+          in: query
+          required: false
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: User-scoped command activity summaries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandPage'
+        default:
+          $ref: '#/components/responses/Error'
     post:
       tags: [Phone]
       operationId: createPhoneCommand
@@ -631,6 +771,24 @@ paths:
                 $ref: '#/components/schemas/Push'
         default:
           $ref: '#/components/responses/Error'
+  /v1/phone/pushes/{push_id}/dismiss:
+    post:
+      tags: [Phone]
+      operationId: dismissPush
+      parameters:
+        - name: push_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Push dismissed without changing its read state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Push'
+        default:
+          $ref: '#/components/responses/Error'
   /v1/phone/pushes/read-all:
     post:
       tags: [Phone]
@@ -752,6 +910,20 @@ components:
         agent_id: { type: string }
         label: { type: string }
         host_label: { type: [string, 'null'] }
+    PairingCode:
+      type: object
+      required: [code, expires_at]
+      properties:
+        code: { type: string, minLength: 4, maxLength: 64 }
+        expires_at: { type: string, format: date-time }
+    PairingCodeStatus:
+      type: object
+      required: [code, status, expires_at]
+      properties:
+        code: { type: string, minLength: 4, maxLength: 64 }
+        status: { type: string, enum: [waiting, claimed, expired] }
+        expires_at: { type: string, format: date-time }
+        claimed_at: { type: [string, 'null'], format: date-time }
     CreateAgentRequest:
       type: object
       required: [label]
@@ -783,13 +955,16 @@ components:
       type: object
       required: [status, idempotency_key]
       properties:
-        status: { type: string, enum: [needs_user, succeeded, failed] }
+        status: { type: string, enum: [info, needs_user, succeeded, failed] }
         idempotency_key: { type: string, minLength: 1 }
         summary: { type: [string, 'null'] }
         voice_script: { type: [string, 'null'] }
         actions:
           type: array
-          items: { type: string }
+          items:
+            oneOf:
+              - type: string
+              - $ref: '#/components/schemas/ActionInput'
         facts:
           type: object
           additionalProperties: true
@@ -843,7 +1018,7 @@ components:
       enum: [pending, validated, awaiting_confirmation, queued, running, succeeded, failed, expired, cancelled, unknown]
     CommandResponse:
       type: object
-      required: [command_id, state]
+      required: [command_id, state, version, created_at, updated_at]
       properties:
         command_id: { type: string }
         state:
@@ -858,6 +1033,40 @@ components:
           type: [object, 'null']
           additionalProperties: true
         undo_command_id: { type: [string, 'null'] }
+        version: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CommandSummary:
+      type: object
+      required: [command_id, intent, risk_level, needs_confirmation, state, version, created_at, updated_at]
+      properties:
+        command_id: { type: string }
+        session_id: { type: [string, 'null'] }
+        intent: { type: string }
+        risk_level: { type: string, enum: [low, medium, high, destructive] }
+        needs_confirmation: { type: boolean }
+        state:
+          $ref: '#/components/schemas/CommandState'
+        result:
+          type: [object, 'null']
+          additionalProperties: true
+        error:
+          type: [object, 'null']
+          additionalProperties: true
+        expires_at: { type: [string, 'null'], format: date-time }
+        version: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CommandPage:
+      type: object
+      required: [commands, next_cursor, has_more]
+      properties:
+        commands:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommandSummary'
+        next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
     ModelArtifactDescriptor:
       type: object
       additionalProperties: false
@@ -909,9 +1118,35 @@ components:
         title: { type: [string, 'null'] }
         risk: { type: string, enum: [low, medium, high, destructive] }
         confirm_required: { type: boolean }
+        claimed_at: { type: [string, 'null'], format: date-time }
         status: { type: string }
+        cancelled_by_user: { type: boolean }
+        descriptor:
+          $ref: '#/components/schemas/ActionDescriptor'
         expires_at: { type: [string, 'null'], format: date-time }
         result:
+          type: [object, 'null']
+          additionalProperties: true
+    ActionInput:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 128 }
+        risk: { type: [string, 'null'], enum: [low, medium, high, destructive, null] }
+        confirm: { type: [boolean, 'null'] }
+        title: { type: [string, 'null'], maxLength: 200 }
+        payload:
+          type: [object, 'null']
+          additionalProperties: true
+    ActionDescriptor:
+      type: object
+      required: [action_key, title, risk, confirm_required]
+      properties:
+        action_key: { type: string }
+        title: { type: [string, 'null'] }
+        risk: { type: string, enum: [low, medium, high, destructive] }
+        confirm_required: { type: boolean }
+        payload:
           type: [object, 'null']
           additionalProperties: true
     ActionResultRequest:
@@ -939,6 +1174,10 @@ components:
         available_actions:
           type: array
           items: { type: string }
+        available_action_descriptors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActionDescriptor'
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         version: { type: integer, minimum: 0 }
@@ -982,7 +1221,7 @@ components:
         snippet: { type: [string, 'null'] }
         score: { type: [number, 'null'] }
         content_hash: { type: string }
-        r2_key: { type: [string, 'null'] }
+        download_path: { type: string }
         expires_at: { type: [string, 'null'], format: date-time }
     Push:
       type: object
@@ -1010,7 +1249,7 @@ components:
         has_more: { type: boolean, description: Additive pagination hint; absent in the checkpoint response. }
     HistoryPage:
       type: object
-      required: [entries, next_cursor]
+      required: [entries, next_cursor, has_more]
       properties:
         entries:
           type: array
@@ -1018,6 +1257,7 @@ components:
             type: object
             additionalProperties: true
         next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
     SessionPage:
       type: object
       required: [sessions, next_cursor, has_more]
@@ -1100,6 +1340,14 @@ components:
         ok: { type: boolean }
         api: { type: string }
         runtime: { type: string }
+        version: { type: string }
+        push_mode: { type: string, enum: [dev, apns, both] }
+        apns_ready: { type: boolean }
+        apns_production: { type: boolean }
+        action_provider_mode: { type: string, enum: [internal, external, disabled] }
+        action_provider_ready: { type: boolean }
+        action_reminder_enabled: { type: boolean }
+        action_message_enabled: { type: boolean }
     ErrorResponse:
       type: object
       required: [error]

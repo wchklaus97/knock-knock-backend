@@ -12,9 +12,16 @@ cargo check --target wasm32-unknown-unknown
 
 echo "[phase45] contract, migration, configuration, and adversarial checks"
 ./scripts/contract-schema-smoke.sh
+./scripts/contract-breaking-smoke.sh
+./scripts/provider-safety-smoke.sh
 ./scripts/architecture-migration-smoke.sh
 ./scripts/adversarial-data-smoke.sh
 ./scripts/production-config-smoke.sh
+./scripts/backup-restore-smoke.sh
+test -x ./scripts/r2-download-smoke.sh
+test -x ./scripts/provider-lifecycle-smoke.sh
+test -x ./scripts/staging-contract-gate.sh
+bash -n ./scripts/r2-download-smoke.sh ./scripts/provider-lifecycle-smoke.sh ./scripts/staging-contract-gate.sh
 
 echo "[phase45] repository hygiene"
 git diff --check
@@ -29,7 +36,9 @@ fi
 
 cat <<'EOF'
 phase45 static release gate passed.
-Required before production: deployed D1/E2E contract smoke, configured model
+Required before production: deployed D1/E2E contract smoke, configured and
+reviewed provider endpoints/sandbox evidence, configured model
 manifest/public-key rollout, security review, physical iPhone performance and
-voice golden-set evidence, human approval of migration/APNs/model rollout.
+voice golden-set evidence, human approval of migration/APNs/provider/model
+rollout.
 EOF

@@ -1,6 +1,6 @@
 # Knock Knock Release Verification Report
 
-**Date:** 2026-08-09  
+**Date:** 2026-08-10
 **Scope:** current Phase 4/5 completion worktrees based on the merged checkpoint
 and Phase 0–3 integration baseline
 **Production changes:** none
@@ -9,27 +9,69 @@ and Phase 0–3 integration baseline
 
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
-| Backend | `agent/phase45-completion-backend` | `2977322` | pending draft PR |
+| Backend base | `main` | `185b5e9` | merged Phase 4/5 base |
+| Backend follow-up | `agent/phase45-completion-backend` | `446be9a2080d2feec9ef39e57a61e07cd45fc301` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
-The branches are intentionally based on the merged Phase 0–3 integration
-baseline. They are not merged, deployed, or applied to production
-automatically; the paired review and release gates still require human
-approval.
+The follow-up branch is based on merged PR #10. PR #11 is pushed and its
+GitHub Actions Rust backend CI run passed; it is not merged, deployed, or
+applied to production. Paired review and the remaining release gates still
+require human approval. The numbered gate handoff is tracked in
+[`docs/RELEASE_GATE_MATRIX.md`](RELEASE_GATE_MATRIX.md).
 
 ## Implemented baseline
 
 - Canonical D01–D40 architecture decisions with a Chinese summary.
 - OpenAPI 3.1 REST, SSE, error, pagination, and `CommandEnvelope v1` contract.
-- Backend migrations 0003–0010 for commands, confirmation, messages,
+- Backend migrations 0003–0012 for commands, confirmation, messages,
   retrievals, phone changes, outbox, retention/deletion metadata, rate limits,
   compatibility-operation claim fencing, and durable vertical-action effects.
 - Server-side command validation, action registry, idempotency, confirmation,
   undo/cancel routes, retryable unknown outcomes, and outbox execution boundary.
+- Provider cancellation now requires an explicit terminal cancellation state
+  and uses a durable per-operation idempotency fence; exhausted retryable
+  outbox work remains `unknown` instead of being misreported as terminal
+  failure, and scheduled reconciliation can complete pending cancellation
+  without another user request.
 - Durable local reminder and draft effects, an internal queued message effect,
   and provider-idempotency records for the three release vertical actions.
+- Additive command-list, pairing-status, push-dismiss, and rich action-descriptor
+  contracts; race-safe pairing claim tokens and command cursor pagination.
+- Explicit local/external/disabled provider modes, action feature flags,
+  provider-attempt failure states, bounded stale-lease recovery, credential-key
+  rejection in command arguments, and secret-only JWT/APNs signing material.
+- Non-development legacy JWT configuration fails closed without an explicit
+  32-character secret; pairing codes use high-entropy URL-safe tokens with a
+  tighter unauthenticated rate-limit bucket; APNs payloads contain only
+  privacy-light identifiers rather than the full voice script.
+- Request correlation accepts only validated `X-Request-ID` values, rate-limit
+  and audit metadata use the trusted Cloudflare edge IP header, and `/metrics`
+  exposes provider/APNs/model readiness gauges.
+- Secret-authenticated HTTPS provider webhook adapter for reminders and
+  messages, reminder due-time leases/retries, deduplicated reminder pushes,
+  and scheduled message/retrieval retention sweep.
+- Authenticated retrieval download streaming from R2 with user/session/expiry
+  checks, private no-store response headers, no `r2_key` disclosure, and
+  retention cleanup that removes only unreferenced R2 objects before deleting
+  D1 metadata. New object references are restricted to the authenticated
+  user's `users/{user_id}/retrievals/` namespace.
+- Provider lifecycle operations for external reminders/messages: delivery,
+  status lookup, reminder cancellation for Undo, timeout-to-unknown handling,
+  and idempotent status reconciliation without a duplicate provider delivery;
+  provider keys are user/action scoped, the running attempt is persisted before
+  the provider call, and legacy keys remain reconcilable.
+- Outbox idempotency keys are user/operation scoped while the original client
+  `CommandEnvelope.idempotency_key` remains unchanged in the command resource.
+- Local reminder stale leases are bounded by the attempt limit, and a deleted
+  session cannot trigger a local due-time notification.
+- Safe staging Wrangler template with explicit origin/version validation and
+  disabled external effects.
+- OpenAPI compatibility baseline and breaking-change smoke for retained v1
+  routes, methods, required fields, enum values, and the actual `/health` route.
+- Versioned, atomic, idempotent command Undo for local reminder/draft effects.
 - Signed model descriptor endpoint and production fail-closed model
-  configuration checks; the iOS target consumes the official LiteRT-LM 0.12
+  configuration checks, including required manifest integrity/capability
+  fields; the iOS target consumes the official LiteRT-LM 0.12
   C framework without the upstream unsafe SwiftPM linker flags.
 - User-scoped history/retrieval/search/session/push routes and deletion
   tombstones.
@@ -46,13 +88,52 @@ approval.
 
 - `cargo fmt --all -- --check` — passed
 - `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test -q` — 26 passed
+- `cargo test -q` — 42 passed
 - `cargo check --target wasm32-unknown-unknown -q` — passed
+- `worker-build --release` — passed; optimized Worker bundle generated
 - `scripts/architecture-migration-smoke.sh` — passed
 - `scripts/adversarial-data-smoke.sh` — passed for cross-user isolation,
   deleted-resource write barriers, message/retrieval tombstones, lease fencing,
   event idempotency gates, outbox lease recovery, and cursor scope
 - `scripts/contract-schema-smoke.sh` — passed
+- `scripts/contract-breaking-smoke.sh` — passed
+- `scripts/provider-safety-smoke.sh` — passed
+- `scripts/r2-download-smoke.sh` against an isolated local Worker + local D1/R2
+  — passed for authorized streaming, metadata headers, no key disclosure,
+  user-namespaced keys, shared-key retention cleanup, and cross-user isolation.
+- `scripts/r2-download-smoke.sh` now supports the same route/retention/isolation
+  flow against deployed staging with `R2_SMOKE_REMOTE=true` and a materialized
+  staging Wrangler config; that external run remains pending.
+- `scripts/provider-lifecycle-smoke.sh` against an isolated local Worker and
+  mock provider — passed for reminder delivery/cancellation, scheduled
+  cancellation recovery, timeout status reconciliation, and an asynchronous high-risk message moving from provider
+  `accepted` to status `delivered` before the command became `sent`; provider
+  keys remained user/action scoped and no duplicate delivery was observed.
+- `scripts/production-config-smoke.sh` — passed, including the staging
+  template and staging fail-closed checks
+- `scripts/backup-restore-smoke.sh` — passed for encrypted export/decrypt,
+  checksum, SQLite integrity, and schema/data restore
+- `scripts/phase45-release-gate.sh` — passed
+- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31347592328) — passed for commit `446be9a2080d2feec9ef39e57a61e07cd45fc301`
+- Read-only production health probe — passed; deployed version was
+  `2026.08.08-build-25`, so this does not count as PR #11 deployment evidence.
+- `scripts/staging-contract-gate.sh` and manual
+  `.github/workflows/staging-contract-gate.yml` — prepared, not executed;
+  the workflow now materializes a staging Wrangler config and includes the
+  deployed R2 route smoke, but independent staging Worker/D1/R2 resources and
+  UAT credentials do not yet exist.
+- `scripts/contract-smoke.sh` against an isolated local Worker + local D1 —
+  passed, including command list, pairing status, push dismissal, and the
+  existing multi-turn session/action loop, metrics readiness gauges, and
+  validated request-ID propagation.
+- Local `/__scheduled` Outbox smoke — passed for reminder, draft, and message;
+  message result remained `queued` with `external_delivery: not_configured`.
+- Local reminder due-time smoke — passed: a due reminder generated one
+  deduplicated development push across repeated scheduled runs.
+- Local external-provider smoke with a mock HTTPS-boundary adapter — passed
+  for reminder delivery, provider cancellation, timeout reconciliation, and
+  confirmed high-risk message delivery; the message remained `queued`/unknown
+  while only accepted and became `sent` only after status reconciliation.
 - guarded event/outbox/confirmation SQL was prepared and executed against
   SQLite — passed
 - `git diff --check` — passed
@@ -74,28 +155,38 @@ write barriers for sessions and commands, non-atomic event idempotency claims,
 un-fenced compatibility-operation lease takeover, permanently stuck Outbox
 leases, unverified rate-limit identity, discarded structured retry metadata,
 incomplete local tombstone cleanup, a globally writable skill registry, an iOS
-permanent-error retry loop, and non-additive checkpoint response requirements.
+permanent-error retry loop, non-additive checkpoint response requirements,
+cross-user Provider and Outbox idempotency-key collision risk, unscoped R2
+references, shared-key retention deletion, and the provider-call crash window.
+The latter issues are closed in PR #11 for new data; legacy records remain
+reconcilable and still require staged migration evidence.
 
 ## Remaining release gates
 
+The same gates are numbered RG-01–RG-07 in
+[`docs/RELEASE_GATE_MATRIX.md`](RELEASE_GATE_MATRIX.md) so agents cannot
+mistake local verification for production approval.
+
 These are deliberately not marked as passed:
 
-- route-level D1/E2E smoke against deployed bindings;
-- backend GitHub CI, which was still pending at report time;
-- provider-backed executors for reminder delivery and external send-message
-  delivery (the current implementation safely persists/queues these effects
-  and reports external delivery as not configured);
+- independent staging Worker + D1 creation and route-level D1/E2E smoke
+  plus R2 bucket creation and route-level D1/R2/E2E smoke against those
+  deployed bindings;
+- paired PR review for [PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11);
+- production provider selection, provider sandbox/contract evidence, real
+  provider credentials, vendor-specific cancellation/reconciliation policy,
+  and production rollout approval (the generic lifecycle adapter is
+  implemented and locally verified);
 - 20–100 example golden voice dataset, ≥95% accuracy evidence, and zero
   high-risk false execution evidence;
-- physical iPhone 13 audio, memory, thermal, and crash testing;
-- security review, formal breaking-contract diff, and production observability
-  review;
-- human approval for merging stacked PRs, production migrations, APNs changes,
+- physical iPhone 13 audio, memory, thermal, crash, and real APNs testing;
+- formal security review and production observability/alert review;
+- human approval for merging this follow-up PR, production migrations, APNs changes,
   and model rollout.
 
 ## Rollback
 
-Do not merge the completion PRs until the gates above are approved. Revert the
-completion commits or close the draft PRs; no production data or migration has
-been changed. Migration 0010 is additive and requires a separately approved
-rollback plan if it is ever applied.
+Do not merge the follow-up PR until the gates above are approved. Revert the
+follow-up commit (and its documentation handoff) or close the draft PR; no
+production data or migration has been changed. Migrations 0010–0012 are
+additive and require a separately approved rollback plan if applied remotely.

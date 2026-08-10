@@ -90,6 +90,7 @@ pub struct SessionRow {
     pub voice_script: Option<String>,
     pub facts_json: String,
     pub available_actions_json: Option<String>,
+    pub available_action_descriptors_json: Option<String>,
     pub expires_at: String,
     pub created_at: String,
     pub updated_at: String,
@@ -107,6 +108,7 @@ pub struct ActionRow {
     pub title: Option<String>,
     pub risk: String,
     pub confirm_required: i32,
+    pub descriptor_json: Option<String>,
     pub status: String,
     pub result_json: Option<String>,
     pub claimed_at: Option<String>,
@@ -374,6 +376,7 @@ pub struct ProgressRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct InlineAction {
     pub id: String,
     pub risk: Option<String>,

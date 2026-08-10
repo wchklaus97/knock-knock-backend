@@ -13,6 +13,9 @@ NODE_ENV = "development"
 PUSH_MODE = "dev"
 CORS_ORIGIN = "*"
 SERVICE_VERSION = "local-dev"
+ACTION_PROVIDER_MODE = "internal"
+ACTION_REMINDER_ENABLED = "true"
+ACTION_MESSAGE_ENABLED = "true"
 # Set these for real APNs delivery; secrets belong in `wrangler secret put`.
 # PUSH_MODE = "both"
 # APNS_BUNDLE_ID = "hk.knockknock.app"
@@ -23,3 +26,7 @@ binding = "DB"
 database_name = "knock-knock"
 database_id = "REPLACE_WITH_D1_DATABASE_ID"
 migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "REPLACE_WITH_R2_BUCKET_NAME"

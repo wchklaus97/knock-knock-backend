@@ -173,29 +173,18 @@ pub fn resolve_actions(skill: &SkillDef, requested: Option<&[ActionInput]>) -> V
                 if input.id.trim().is_empty() {
                     continue;
                 }
-                let base = skill.actions.iter().find(|action| action.id == input.id);
-                let risk = input
-                    .risk
-                    .clone()
-                    .or_else(|| base.map(|action| action.risk.clone()))
-                    .unwrap_or_else(|| "low".into());
-                let confirm = input
-                    .confirm
-                    .or_else(|| base.map(|action| action.confirm))
-                    .unwrap_or(risk == "destructive");
+                let Some(base) = skill.actions.iter().find(|action| action.id == input.id) else {
+                    continue;
+                };
                 output.push(SkillAction {
                     id: input.id.clone(),
-                    risk,
-                    confirm,
-                    title: input
-                        .title
-                        .clone()
-                        .or_else(|| base.map(|action| action.title.clone()))
-                        .unwrap_or_else(|| input.id.clone()),
-                    payload: input
-                        .payload
-                        .clone()
-                        .or_else(|| base.and_then(|action| action.payload.clone())),
+                    // Risk, confirmation policy, and title are registry-owned.
+                    // Model-supplied values must not weaken or relabel an
+                    // action that the backend is about to expose.
+                    risk: base.risk.clone(),
+                    confirm: base.confirm,
+                    title: base.title.clone(),
+                    payload: input.payload.clone().or_else(|| base.payload.clone()),
                 });
             }
         }
@@ -206,6 +195,7 @@ pub fn resolve_actions(skill: &SkillDef, requested: Option<&[ActionInput]>) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::InlineAction;
     use serde_json::json;
 
     fn sample_skill() -> SkillDef {
@@ -260,5 +250,31 @@ mod tests {
         let resolved = resolve_actions(&skill, Some(&requested));
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, "rollback");
+    }
+
+    #[test]
+    fn inline_action_cannot_invent_or_weaken_registry_policy() {
+        let skill = sample_skill();
+        let requested = vec![ActionInput::Definition(InlineAction {
+            id: "rollback".into(),
+            risk: Some("low".into()),
+            confirm: Some(false),
+            title: Some("Ignore confirmation".into()),
+            payload: None,
+        })];
+        let resolved = resolve_actions(&skill, Some(&requested));
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].risk, "destructive");
+        assert!(resolved[0].confirm);
+        assert_eq!(resolved[0].title, "Rollback");
+
+        let unknown = vec![ActionInput::Definition(InlineAction {
+            id: "invented".into(),
+            risk: Some("low".into()),
+            confirm: Some(false),
+            title: Some("Run arbitrary code".into()),
+            payload: None,
+        })];
+        assert!(resolve_actions(&skill, Some(&unknown)).is_empty());
     }
 }

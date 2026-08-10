@@ -4,10 +4,11 @@
 > The canonical decisions live in `ARCHITECTURE_DECISIONS.md`; this document
 > defines agent boundaries, handoffs, verification, and release gates.
 
-## Execution status — 2026-08-09
+## Execution status — 2026-08-10
 
-The staged implementation is in draft-PR review and has not been merged or
-deployed. The current dependency chain is:
+The staged implementation through PR #10 is merged. The Backend Phase 4/5
+completion follow-up is in draft PR #11; it has passed GitHub Actions CI but is
+not merged or deployed. The current dependency chain is:
 
 | Stage | Backend | iOS | Status |
 |---|---|---|---|
@@ -17,18 +18,62 @@ deployed. The current dependency chain is:
 | Phase 2 | — | [PR #3](https://github.com/wchklaus97/knock-knock-frontend/pull/3) | SQLite/offline implementation complete |
 | Phase 3 | [PR #4](https://github.com/wchklaus97/knock-knock-backend/pull/4), [hardening PR #6](https://github.com/wchklaus97/knock-knock-backend/pull/6) | [PR #4](https://github.com/wchklaus97/knock-knock-frontend/pull/4) | History/retrieval and deletion hardening complete |
 | Phase 4 | — | [PR #5](https://github.com/wchklaus97/knock-knock-frontend/pull/5), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Local voice boundary and command submission complete |
-| Phase 5 | [integrated PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8) | [release PR #6](https://github.com/wchklaus97/knock-knock-frontend/pull/6), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Security/release integration in review |
+| Phase 5 | [integrated PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8), [merged PR #10](https://github.com/wchklaus97/knock-knock-backend/pull/10), [completion PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) | [release PR #6](https://github.com/wchklaus97/knock-knock-frontend/pull/6), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Backend CI passed; paired review and deployment gates remain |
 
-Verified in the current integration branches: OpenAPI and migration smoke,
+Verified in the current integration branches and PR #11: OpenAPI and migration smoke,
 adversarial SQL isolation/deletion/lease tests, Rust unit tests, Rust WASM
 check, strict Clippy, iOS 15 simulator tests, and generic iOS build. Remaining
 human release gates are route-level D1/E2E tests against deployed bindings,
 security review, the 20–100 example golden voice dataset with device
-performance evidence, breaking-contract diff review, and approval of merge,
-production migrations, APNs changes, and model rollout.
+performance evidence, paired review, and approval of merge, production
+migrations, APNs changes, and model rollout.
 
 The detailed evidence and rollback record is in
 `docs/RELEASE_VERIFICATION_REPORT.md`.
+The numbered release handoff is in `docs/RELEASE_GATE_MATRIX.md`.
+
+### Backend follow-up checkpoint — 2026-08-10
+
+The next backend continuation closes four concrete API gaps in one additive
+checkpoint: command list pagination, push dismissal, pairing status, and rich
+action descriptors. It also adds the `0011_command_pairing_action_descriptors`
+migration, claim-token fencing, provider-mode/feature-flag configuration,
+provider attempt failure states, secret-shaped argument rejection, and
+idempotent versioned Undo.
+
+The current local worktree has passed the Rust/WASM/static gates and a real
+local Worker + local D1 contract smoke on an isolated port. It has also run the
+three local vertical effects through `/__scheduled`: reminder and draft become
+durable D1 effects, while message remains explicitly `queued` with
+`external_delivery: not_configured`.
+
+This checkpoint now includes a generic secret-authenticated HTTPS provider
+adapter for reminder/message delivery, a local reminder due-time scanner with
+deduplicated pushes, a scheduled retention sweep, a staging configuration
+template, and a formal contract-breaking compatibility smoke. The adapter now
+requires delivery/status lifecycle endpoints for enabled production actions;
+external reminder Undo calls the provider cancellation endpoint, and timeout
+results are reconciled through provider status. A provider attempt is persisted
+before the external call, so a Worker restart must reconcile the same key
+before retrying. Asynchronous message acceptance remains queued/unknown until
+status reports delivery, while an external reminder without a provider
+identifier fails closed so Undo cannot claim a cancellation it cannot perform.
+It was verified against a local mock provider for delivery, cancellation,
+timeout, asynchronous message status recovery, and user/action-scoped provider
+idempotency keys.
+Cancellation now requires an explicit terminal provider state and a durable
+per-operation fence; retryable Outbox exhaustion remains `unknown` for
+reconciliation instead of becoming a false terminal failure.
+Cancellation fences also recover after a bounded stale lease, so a Worker
+crash cannot leave an Undo operation permanently stuck. Request correlation
+accepts only validated `X-Request-ID` values, rate limiting and audit metadata
+use the trusted Cloudflare edge IP header, and `/metrics` exposes provider,
+APNs, and model readiness gauges.
+The R2 retrieval download route is also implemented and verified with a local
+R2 object plus cross-user isolation. Provider vendor selection, sandbox
+evidence, production credentials, remote staging D1/Worker/R2 E2E, formal
+security/observability review, and human merge/deployment approval remain
+release work.
 
 ### Active Phase 4/5 completion branch
 
@@ -42,7 +87,28 @@ The follow-up branch now extends the earlier staged work with:
   LiteRT-LM 0.12 C-framework Gemma command generator, signed artifact store,
   and rollback-aware manager;
 - a static `scripts/phase45-release-gate.sh` that runs Rust, contract,
-  migration, adversarial, configuration, and secret-hygiene checks.
+  migration, adversarial, provider-safety, configuration, compatibility, and
+  secret-hygiene checks;
+- `migrations/0012_reminder_delivery_state.sql`, a leaseable local reminder
+  notifier, a deduplicated push path, and a scheduled message/retrieval
+  retention sweep;
+- an authenticated `GET /v1/phone/retrievals/{retrieval_id}/download` R2
+  stream with retention/ownership checks, user-namespaced keys, shared-key
+  retention protection, no internal-key disclosure, and a dedicated download
+  rate-limit category;
+- provider delivery/status/cancel endpoints with timeout reconciliation and
+  local dynamic smoke scripts in `scripts/r2-download-smoke.sh` and
+  `scripts/provider-lifecycle-smoke.sh`;
+- high-entropy pairing tokens with a dedicated unauthenticated rate-limit
+  bucket, non-development legacy JWT fail-closed configuration, privacy-light
+  APNs payloads, encrypted private-R2 production backup workflow, and model
+  manifest shape/integrity validation;
+- `wrangler.staging.toml.example`, with staging fail-closed validation and
+  external action flags disabled by default, plus explicit R2 and provider
+  lifecycle placeholders. The staging gate can now run the R2 route smoke
+  remotely after materializing this config.
+- user/operation-scoped Outbox idempotency keys, bounded local reminder stale
+  lease recovery, and a deleted-session barrier for local due notifications.
 
 This does not close release by itself. The official WhisperKit package is not
 linked while the app deployment floor remains iOS 15; a signed model artifact,

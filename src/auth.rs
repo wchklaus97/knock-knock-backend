@@ -108,8 +108,11 @@ pub fn mint_refresh_token() -> ApiResult<String> {
 }
 
 pub fn mint_pairing_code() -> ApiResult<String> {
-    let raw = u32::from_le_bytes(random_bytes::<4>()?);
-    Ok(format!("{:06}", raw % 1_000_000))
+    // Pairing is an unauthenticated claim boundary. Use a high-entropy URL
+    // safe token instead of a six-digit value that can be guessed over the
+    // code's lifetime. The `pair_` prefix also makes accidental API-key or
+    // refresh-token reuse easier to spot in diagnostics.
+    random_token("pair_", 12)
 }
 
 fn env_value(env: &Env, name: &str) -> Option<String> {
@@ -117,6 +120,12 @@ fn env_value(env: &Env, name: &str) -> Option<String> {
         .ok()
         .map(|value| value.to_string())
         .or_else(|| env.secret(name).ok().map(|value| value.to_string()))
+}
+
+/// Read a value only from Wrangler's secret store. Provider credentials and
+/// signing material must not silently fall back to public Worker vars.
+pub fn secret_value(env: &Env, name: &str) -> Option<String> {
+    env.secret(name).ok().map(|value| value.to_string())
 }
 
 pub fn config_value(env: &Env, name: &str, default: &str) -> String {
@@ -171,11 +180,14 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
     let node_env = config_value(env, "NODE_ENV", "development")
         .trim()
         .to_ascii_lowercase();
-    if !matches!(node_env.as_str(), "development" | "test" | "production") {
+    if !matches!(
+        node_env.as_str(),
+        "development" | "test" | "staging" | "production"
+    ) {
         return Err(ApiError::new(
             500,
             "configuration_error",
-            "NODE_ENV must be development, test, or production",
+            "NODE_ENV must be development, test, staging, or production",
         ));
     }
     let auth_provider = config_value(env, "AUTH_PROVIDER", "legacy")
@@ -188,10 +200,50 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
             "AUTH_PROVIDER must be legacy or supabase",
         ));
     }
+    if !matches!(node_env.as_str(), "development" | "test") && auth_provider != "supabase" {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "AUTH_PROVIDER must be supabase outside development",
+        ));
+    }
     if auth_provider == "supabase" {
         validate_supabase_configuration(env)?;
     }
-    if node_env != "production" {
+    if matches!(node_env.as_str(), "development" | "test") {
+        return Ok(());
+    }
+
+    if node_env == "staging" {
+        let cors_origin = config_value(env, "CORS_ORIGIN", "");
+        if cors_origin.trim().is_empty()
+            || cors_origin.trim() == "*"
+            || cors_origin.trim().starts_with("REPLACE_")
+        {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "CORS_ORIGIN must be an explicit staging origin",
+            ));
+        }
+        let service_version = config_value(env, "SERVICE_VERSION", "");
+        if service_version.trim().is_empty() || service_version.trim().starts_with("REPLACE_") {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "SERVICE_VERSION must be supplied for staging",
+            ));
+        }
+        let push_mode = config_value(env, "PUSH_MODE", "")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(push_mode.as_str(), "dev" | "apns" | "both") {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "PUSH_MODE must be dev, apns, or both in staging",
+            ));
+        }
         return Ok(());
     }
 
@@ -248,9 +300,18 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
     }
 
     for (name, value) in [
-        ("APNS_KEY", config_value(env, "APNS_KEY", "")),
-        ("APNS_KEY_ID", config_value(env, "APNS_KEY_ID", "")),
-        ("APNS_TEAM_ID", config_value(env, "APNS_TEAM_ID", "")),
+        (
+            "APNS_KEY",
+            secret_value(env, "APNS_KEY").unwrap_or_default(),
+        ),
+        (
+            "APNS_KEY_ID",
+            secret_value(env, "APNS_KEY_ID").unwrap_or_default(),
+        ),
+        (
+            "APNS_TEAM_ID",
+            secret_value(env, "APNS_TEAM_ID").unwrap_or_default(),
+        ),
         ("APNS_BUNDLE_ID", config_value(env, "APNS_BUNDLE_ID", "")),
     ] {
         if value.trim().is_empty() || value.trim().starts_with("REPLACE_") {
@@ -552,15 +613,23 @@ async fn resolve_supabase_user(
 }
 
 pub fn jwt_secret(env: &Env) -> ApiResult<String> {
-    let value = config_value(env, "JWT_SECRET", "dev-change-me");
-    let node_env = config_value(env, "NODE_ENV", "development");
-    if node_env.trim().eq_ignore_ascii_case("production")
-        && (value == "dev-change-me" || value.len() < 32)
-    {
+    let node_env = config_value(env, "NODE_ENV", "development")
+        .trim()
+        .to_ascii_lowercase();
+    let local_environment = matches!(node_env.as_str(), "development" | "test");
+    let value = if local_environment {
+        config_value(env, "JWT_SECRET", "dev-change-me")
+    } else {
+        // Staging must not silently inherit the development signing key. A
+        // missing secret is a startup/request configuration failure rather
+        // than an authentication fallback.
+        secret_value(env, "JWT_SECRET").unwrap_or_default()
+    };
+    if !local_environment && value.len() < 32 {
         return Err(ApiError::new(
             500,
             "configuration_error",
-            "JWT_SECRET must be a random value of at least 32 characters in production",
+            "JWT_SECRET must be a random value of at least 32 characters outside development",
         ));
     }
     Ok(value)
@@ -880,10 +949,13 @@ mod tests {
 
         assert!(api_key.starts_with("vak_"));
         assert!(refresh_token.starts_with("vbr_"));
-        assert_eq!(pairing_code.len(), 6);
+        assert!(pairing_code.starts_with("pair_"));
+        assert!(pairing_code.len() >= 20);
         assert!(pairing_code
             .chars()
-            .all(|character| character.is_ascii_digit()));
+            .all(|character| character.is_ascii_alphanumeric()
+                || character == '_'
+                || character == '-'));
         assert_ne!(api_key, mint_api_key().unwrap());
     }
 }

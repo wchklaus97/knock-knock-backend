@@ -1,12 +1,14 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use worker::D1Database;
+use worker::{D1Database, Env};
 
 use crate::auth::{new_id, sha256_hex};
 use crate::db;
 use crate::error::{ApiError, ApiResult};
 use crate::models::{CommandEnvelope, CommandRow};
+use crate::pagination;
+use crate::providers::{self, ActionProviderConfig};
 
 #[derive(Debug, Deserialize)]
 struct IdOnly {
@@ -25,6 +27,7 @@ pub enum CommandValidationError {
     MissingTimezone,
     InvalidCommandId,
     InvalidFieldLength,
+    SensitiveArgument,
 }
 
 impl std::fmt::Display for CommandValidationError {
@@ -39,6 +42,7 @@ impl std::fmt::Display for CommandValidationError {
             Self::MissingTimezone => "command timezone is required",
             Self::InvalidCommandId => "command_id is required",
             Self::InvalidFieldLength => "command field exceeds the maximum length",
+            Self::SensitiveArgument => "command arguments cannot contain credentials or secrets",
         };
         formatter.write_str(message)
     }
@@ -110,7 +114,36 @@ pub fn validate_envelope(envelope: &CommandEnvelope) -> Result<(), CommandValida
     if envelope.timezone.trim().is_empty() {
         return Err(CommandValidationError::MissingTimezone);
     }
+    if contains_sensitive_argument(&Value::Object(envelope.args.clone())) {
+        return Err(CommandValidationError::SensitiveArgument);
+    }
     Ok(())
+}
+
+fn contains_sensitive_argument(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase().replace(['-', '.'], "_");
+            let sensitive = matches!(
+                key.as_str(),
+                "api_key"
+                    | "authorization"
+                    | "credential"
+                    | "credentials"
+                    | "password"
+                    | "private_key"
+                    | "refresh_token"
+                    | "secret"
+                    | "token"
+            ) || key.ends_with("_api_key")
+                || key.ends_with("_password")
+                || key.ends_with("_secret")
+                || key.ends_with("_token");
+            sensitive || contains_sensitive_argument(value)
+        }),
+        Value::Array(values) => values.iter().any(contains_sensitive_argument),
+        _ => false,
+    }
 }
 
 /// Backend policy always wins over the model's needs_confirmation value.
@@ -213,6 +246,105 @@ pub async fn get_for_user(
     .await
 }
 
+fn result_value(row: &CommandRow) -> Value {
+    row.result_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn error_value(row: &CommandRow) -> Value {
+    row.error_code
+        .as_ref()
+        .map(|code| {
+            json!({
+                "code": code,
+                "message": code,
+                "retryable": row.state == "unknown",
+            })
+        })
+        .unwrap_or(Value::Null)
+}
+
+/// A command list is intentionally a summary. In particular, it never emits
+/// the one-time confirmation token and does not repeat the full argument
+/// object for every row.
+pub fn summary(row: &CommandRow) -> Value {
+    json!({
+        "command_id": row.id,
+        "session_id": row.session_id,
+        "intent": row.intent,
+        "risk_level": row.risk_level,
+        "needs_confirmation": row.needs_confirmation != 0,
+        "state": row.state,
+        "result": result_value(row),
+        "error": error_value(row),
+        "expires_at": row.expires_at,
+        "version": row.version,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    })
+}
+
+pub async fn list_for_user(
+    db: &D1Database,
+    user_id: &str,
+    before: Option<&str>,
+    state: Option<&str>,
+    session_id: Option<&str>,
+    limit: i32,
+) -> ApiResult<Value> {
+    if let Some(state) = state {
+        if !valid_state(state) {
+            return Err(ApiError::validation("Invalid command state"));
+        }
+    }
+    if let Some(session_id) = session_id {
+        if session_id.trim().is_empty() || session_id.len() > 128 {
+            return Err(ApiError::validation("Invalid session_id"));
+        }
+    }
+
+    let cursor = pagination::decode(before)?;
+    let safe_limit = limit.clamp(1, 50) as i64;
+    let mut sql = format!("{} WHERE user_id = ?", command_select());
+    let mut values = vec![db::text(user_id)];
+    if let Some(cursor) = cursor {
+        sql.push_str(" AND (updated_at < ? OR (updated_at = ? AND id < ?))");
+        values.push(db::text(&cursor.sort_key));
+        values.push(db::text(&cursor.sort_key));
+        values.push(db::text(&cursor.id));
+    }
+    if let Some(state) = state {
+        sql.push_str(" AND state = ?");
+        values.push(db::text(state));
+    }
+    if let Some(session_id) = session_id {
+        sql.push_str(" AND session_id = ?");
+        values.push(db::text(session_id));
+    }
+    sql.push_str(" ORDER BY updated_at DESC, id DESC LIMIT ?");
+    values.push(db::number(safe_limit + 1));
+
+    let rows: Vec<CommandRow> = db::all(db, &sql, values).await?;
+    let has_more = rows.len() as i64 > safe_limit;
+    let rows = rows
+        .into_iter()
+        .take(safe_limit as usize)
+        .collect::<Vec<_>>();
+    let next_cursor = has_more
+        .then(|| {
+            rows.last()
+                .map(|row| pagination::encode(&row.updated_at, &row.id))
+        })
+        .flatten();
+    Ok(json!({
+        "commands": rows.iter().map(summary).collect::<Vec<_>>(),
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }))
+}
+
 fn envelope_from_row(row: &CommandRow) -> CommandEnvelope {
     let args = serde_json::from_str::<Value>(&row.args_json)
         .ok()
@@ -236,25 +368,13 @@ fn envelope_from_row(row: &CommandRow) -> CommandEnvelope {
 }
 
 pub fn response(row: &CommandRow, confirmation_token: Option<&str>) -> Value {
-    let result = row
-        .result_json
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<Value>(value).ok())
-        .unwrap_or(Value::Null);
-    let error = row.error_code.as_ref().map(|code| {
-        json!({
-            "code": code,
-            "message": code,
-            "retryable": row.state == "unknown" || row.state == "failed",
-        })
-    });
     json!({
         "command_id": row.id,
         "state": row.state,
         "command": envelope_from_row(row),
         "confirmation_token": confirmation_token,
-        "result": result,
-        "error": error,
+        "result": result_value(row),
+        "error": error_value(row),
         "undo_command_id": Value::Null,
         "version": row.version,
         "created_at": row.created_at,
@@ -345,6 +465,8 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
     let expires_at = db::add_seconds_iso(900);
     let confirmation_required = requires_confirmation(&envelope, registry_requires);
     let final_version = 2_i64;
+    let outbox_idempotency_key =
+        providers::scoped_idempotency_key(user_id, "command.execute", &envelope.idempotency_key);
     let mut statements = vec![
         db::prepare(
             db,
@@ -415,7 +537,7 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
                 db::text(user_id),
                 db::text(&command_id),
                 db::text(&json!({"command_id": command_id}).to_string()),
-                db::text(&envelope.idempotency_key),
+                db::text(&outbox_idempotency_key),
                 db::text(&now),
                 db::text(&now),
             ],
@@ -518,6 +640,8 @@ pub async fn confirm(
     let now = db::now_iso();
     let next_version = command.version + 1;
     let outbox_id = new_id("out")?;
+    let outbox_idempotency_key =
+        providers::scoped_idempotency_key(user_id, "command.execute.confirm", command_id);
     let mut statements = vec![
         db::prepare(
             db,
@@ -566,7 +690,7 @@ pub async fn confirm(
                 db::text(user_id),
                 db::text(command_id),
                 db::text(&json!({"command_id": command_id}).to_string()),
-                db::text(&format!("confirm:{command_id}")),
+                db::text(&outbox_idempotency_key),
                 db::text(&now),
                 db::text(&now),
                 db::text(command_id),
@@ -667,7 +791,13 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
     Ok(response(&updated, None))
 }
 
-pub async fn undo(db: &D1Database, user_id: &str, command_id: &str) -> ApiResult<Value> {
+pub async fn undo(
+    env: &Env,
+    db: &D1Database,
+    user_id: &str,
+    command_id: &str,
+    provider_config: ActionProviderConfig,
+) -> ApiResult<Value> {
     let command = get_for_user(db, user_id, command_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Command not found"))?;
@@ -679,19 +809,15 @@ pub async fn undo(db: &D1Database, user_id: &str, command_id: &str) -> ApiResult
     {
         return Err(ApiError::conflict("Command is not currently undoable"));
     }
-    let undo = crate::action_effects::undo(db, user_id, &command).await?;
-    Ok(json!({
-        "command_id": command.id,
-        "state": command.state,
-        "command": envelope_from_row(&command),
-        "confirmation_token": Value::Null,
-        "result": undo,
-        "error": Value::Null,
-        "undo_command_id": Value::Null,
-        "version": command.version,
-        "created_at": command.created_at,
-        "updated_at": db::now_iso(),
-    }))
+    let undo = crate::action_effects::undo(env, db, user_id, &command, provider_config).await?;
+    let updated = get_for_user(db, user_id, command_id)
+        .await?
+        .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;
+    let mut payload = response(&updated, None);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("undo_result".to_string(), undo);
+    }
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -771,6 +897,19 @@ mod tests {
         assert_ne!(
             canonical_hash(&first).unwrap(),
             canonical_hash(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn command_arguments_cannot_carry_provider_credentials() {
+        let mut value = envelope();
+        value.args.insert(
+            "provider".to_string(),
+            json!({"api_key": "secret", "recipient": "user@example.com"}),
+        );
+        assert_eq!(
+            validate_envelope(&value),
+            Err(CommandValidationError::SensitiveArgument)
         );
     }
 

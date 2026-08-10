@@ -9,10 +9,12 @@ use crate::db;
 use crate::error::{ApiError, ApiResult};
 use crate::history;
 use crate::models::{CommandRow, OutboxEventRow};
+use crate::providers::{self, ActionProviderConfig};
 
 const BATCH_SIZE: i64 = 20;
 const MAX_ATTEMPTS: i32 = 3;
 const LEASE_SECONDS: i64 = 300;
+const UNKNOWN_RECONCILE_SECONDS: i64 = 300;
 
 #[derive(Debug, Deserialize)]
 struct CommandPayload {
@@ -37,12 +39,13 @@ impl ExecutionFailure {
     }
 }
 
-pub async fn drain(db: &D1Database) -> ApiResult<usize> {
+pub async fn drain(db: &D1Database, env: &worker::Env) -> ApiResult<usize> {
+    let provider_config = providers::load(env)?;
     recover_stale_claims(db).await?;
     let now = db::now_iso();
     let rows: Vec<OutboxEventRow> = db::all(
         db,
-        "SELECT id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, next_attempt_at, last_error, created_at, updated_at FROM outbox_events WHERE state IN ('queued', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
+        "SELECT id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, next_attempt_at, last_error, created_at, updated_at FROM outbox_events WHERE state IN ('queued', 'retrying', 'unknown') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
         vec![db::text(&now), db::number(BATCH_SIZE)],
     )
     .await?;
@@ -51,11 +54,8 @@ pub async fn drain(db: &D1Database) -> ApiResult<usize> {
     for row in rows {
         if claim(db, &row).await? {
             processed += 1;
-            if let Err(error) = process_claimed(db, &row).await {
-                // A failure before the command can be loaded or transitioned
-                // must still release the lease. The command remains queued or
-                // is reconciled by the next scheduled run.
-                release_runtime_error(db, &row, &error).await?;
+            if let Err(error) = process_claimed(db, env, &row, provider_config.clone()).await {
+                settle_processing_error(db, &row, &error).await?;
             }
         }
     }
@@ -86,6 +86,23 @@ async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
         };
         if command.state != "running" {
             settle_orphan(db, &row, "command_claim_not_running").await?;
+            continue;
+        }
+
+        if row.attempts >= MAX_ATTEMPTS {
+            finish_failure(
+                db,
+                &row,
+                user_id,
+                &command,
+                ExecutionFailure::Retryable(ApiError::new(
+                    503,
+                    "worker_lease_exhausted",
+                    "The outbox worker lease expired too many times",
+                )),
+                "running",
+            )
+            .await?;
             continue;
         }
 
@@ -154,14 +171,19 @@ async fn claim(db: &D1Database, row: &OutboxEventRow) -> ApiResult<bool> {
     let now = db::now_iso();
     let result = db::run(
         db,
-        "UPDATE outbox_events SET state = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ? AND state IN ('queued', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
+        "UPDATE outbox_events SET state = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ? AND state IN ('queued', 'retrying', 'unknown') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
         vec![db::text(&now), db::text(&row.id), db::text(&now)],
     )
     .await?;
     Ok(db::changes(&result) == 1)
 }
 
-async fn process_claimed(db: &D1Database, row: &OutboxEventRow) -> ApiResult<()> {
+async fn process_claimed(
+    db: &D1Database,
+    env: &worker::Env,
+    row: &OutboxEventRow,
+    provider_config: ActionProviderConfig,
+) -> ApiResult<()> {
     let Some(user_id) = row.user_id.as_deref() else {
         return settle_orphan(db, row, "missing_user_scope").await;
     };
@@ -206,9 +228,9 @@ async fn process_claimed(db: &D1Database, row: &OutboxEventRow) -> ApiResult<()>
         .await?
         .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;
 
-    match execute_command(db, user_id, &current).await {
+    match execute_command(env, db, user_id, &current, provider_config).await {
         Ok(result) => finish_success(db, row, user_id, &current, result).await,
-        Err(failure) => finish_failure(db, row, user_id, &current, failure).await,
+        Err(failure) => finish_failure(db, row, user_id, &current, failure, "running").await,
     }
 }
 
@@ -323,9 +345,11 @@ async fn settle_deleted_command(
 }
 
 async fn execute_command(
+    env: &worker::Env,
     db: &D1Database,
     user_id: &str,
     command: &CommandRow,
+    provider_config: ActionProviderConfig,
 ) -> Result<Value, ExecutionFailure> {
     let args = serde_json::from_str::<Value>(&command.args_json)
         .ok()
@@ -344,7 +368,7 @@ async fn execute_command(
                 .map_err(classify_error)
         }
         "create_draft" | "create_reminder" | "send_message" => {
-            action_effects::execute(db, user_id, command, &args)
+            action_effects::execute(env, db, user_id, command, &args, provider_config)
                 .await
                 .map_err(classify_error)
         }
@@ -365,7 +389,7 @@ fn string_arg<'a>(args: &'a Map<String, Value>, names: &[&str]) -> Option<&'a st
 }
 
 fn classify_error(error: ApiError) -> ExecutionFailure {
-    if matches!(error.status, 408 | 429 | 500..=599) {
+    if matches!(error.status, 408 | 425 | 429 | 500..=599) {
         ExecutionFailure::Retryable(error)
     } else {
         ExecutionFailure::Permanent(error)
@@ -444,19 +468,38 @@ async fn finish_failure(
     user_id: &str,
     command: &CommandRow,
     failure: ExecutionFailure,
+    expected_state: &str,
 ) -> ApiResult<()> {
     let now = db::now_iso();
     let attempt = row.attempts + 1;
-    let retry = failure.retryable() && attempt < MAX_ATTEMPTS;
-    let command_state = if retry { "unknown" } else { "failed" };
-    let outbox_state = if retry { "retrying" } else { "failed" };
-    let retry_at = retry.then(|| db::add_seconds_iso(backoff_seconds(row.attempts)));
+    let retryable = failure.retryable();
+    let retry = retryable && attempt < MAX_ATTEMPTS;
+    // A retryable provider/network result is never converted into a false
+    // terminal failure. After the automatic retry budget is exhausted the
+    // command remains `unknown` and the outbox row becomes a durable
+    // reconciliation/dead-letter record for an operator or a future status
+    // worker. Only validation/business failures become `failed`.
+    let command_state = if retryable { "unknown" } else { "failed" };
+    let outbox_state = if retry {
+        "retrying"
+    } else if retryable {
+        "unknown"
+    } else {
+        "failed"
+    };
+    let retry_at = if retry {
+        Some(db::add_seconds_iso(backoff_seconds(row.attempts)))
+    } else if retryable {
+        Some(db::add_seconds_iso(UNKNOWN_RECONCILE_SECONDS))
+    } else {
+        None
+    };
     let version = command.version + 1;
     let error = failure.error();
-    let statements = vec![
+    let mut statements = vec![
         db::prepare(
             db,
-            "UPDATE commands SET state = ?, result_json = NULL, error_code = ?, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'running' AND version = ?",
+            "UPDATE commands SET state = ?, result_json = NULL, error_code = ?, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = ? AND version = ?",
             vec![
                 db::text(command_state),
                 db::text(&error.code),
@@ -464,6 +507,7 @@ async fn finish_failure(
                 db::text(&now),
                 db::text(&command.id),
                 db::text(user_id),
+                db::text(expected_state),
                 db::number(command.version),
             ],
         )?,
@@ -489,8 +533,14 @@ async fn finish_failure(
                 db::text(&new_id("aud")?),
                 db::text(user_id),
                 db::optional_text(command.session_id.as_deref()),
-                db::text(if retry { "command.retrying" } else { "command.failed" }),
-                db::text(&json!({"command_id": command.id, "error_code": error.code, "retryable": retry, "version": version}).to_string()),
+                db::text(if retry {
+                    "command.retrying"
+                } else if retryable {
+                    "command.unknown"
+                } else {
+                    "command.failed"
+                }),
+                db::text(&json!({"command_id": command.id, "error_code": error.code, "retryable": retryable, "auto_retry": retry, "version": version}).to_string()),
                 db::text(&now),
                 db::text(&command.id),
                 db::text(user_id),
@@ -514,6 +564,37 @@ async fn finish_failure(
             ],
         )?,
     ];
+    if let Some(provider) = providers::action_attempt_provider(&command.intent) {
+        let provider_idempotency_key = providers::scoped_action_idempotency_key(
+            user_id,
+            &command.intent,
+            &command.idempotency_key,
+        );
+        statements.push(db::prepare(
+            db,
+            "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?) ON CONFLICT(provider, provider_idempotency_key) DO UPDATE SET state = excluded.state, attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at, last_error = excluded.last_error, updated_at = excluded.updated_at",
+            vec![
+                db::text(&new_id("attempt")?),
+                db::text(user_id),
+                db::text(&command.id),
+                db::text(provider),
+                db::text(&provider_idempotency_key),
+                db::text(if retry {
+                    "retrying"
+                } else if retryable {
+                    "unknown"
+                } else {
+                    "failed"
+                }),
+                db::text(&command.command_hash),
+                db::number(attempt as i64),
+                db::optional_text(retry_at.as_deref()),
+                db::text(&error.code),
+                db::text(&now),
+                db::text(&now),
+            ],
+        )?);
+    }
     db.batch(statements).await?;
     Ok(())
 }
@@ -532,18 +613,28 @@ async fn release_runtime_error(
     error: &ApiError,
 ) -> ApiResult<()> {
     let attempt = row.attempts + 1;
-    let retry = attempt < MAX_ATTEMPTS;
+    let retryable = error.retryable;
+    let retry = retryable && attempt < MAX_ATTEMPTS;
+    let next_attempt_at = if retry {
+        Some(db::add_seconds_iso(backoff_seconds(row.attempts)))
+    } else if retryable {
+        Some(db::add_seconds_iso(UNKNOWN_RECONCILE_SECONDS))
+    } else {
+        None
+    };
     let now = db::now_iso();
     db::run(
         db,
         "UPDATE outbox_events SET state = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ? AND state = 'running'",
         vec![
-            db::text(if retry { "retrying" } else { "failed" }),
-            db::optional_text(
-                retry
-                    .then(|| db::add_seconds_iso(backoff_seconds(row.attempts)))
-                    .as_deref(),
-            ),
+                db::text(if retry {
+                    "retrying"
+                } else if retryable {
+                    "unknown"
+                } else {
+                    "failed"
+                }),
+            db::optional_text(next_attempt_at.as_deref()),
             db::text(&error.code),
             db::text(&now),
             db::text(&row.id),
@@ -551,6 +642,37 @@ async fn release_runtime_error(
     )
     .await?;
     Ok(())
+}
+
+/// Reconcile errors that happen before `process_claimed` reaches the normal
+/// command executor. Without this fence a queued command could stay queued
+/// forever while its outbox row is repeatedly retried or eventually failed.
+async fn settle_processing_error(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    error: &ApiError,
+) -> ApiResult<()> {
+    let Some(user_id) = row.user_id.as_deref() else {
+        return release_runtime_error(db, row, error).await;
+    };
+    let Some(command) = commands::get_for_user(db, user_id, &row.aggregate_id).await? else {
+        return release_runtime_error(db, row, error).await;
+    };
+    if matches!(
+        command.state.as_str(),
+        "pending" | "validated" | "queued" | "unknown" | "running"
+    ) {
+        return finish_failure(
+            db,
+            row,
+            user_id,
+            &command,
+            classify_error(error.clone()),
+            &command.state,
+        )
+        .await;
+    }
+    release_runtime_error(db, row, error).await
 }
 
 async fn settle_orphan(db: &D1Database, row: &OutboxEventRow, reason: &str) -> ApiResult<()> {
@@ -588,6 +710,23 @@ mod tests {
     #[test]
     fn only_transient_errors_are_retryable() {
         assert!(classify_error(ApiError::new(503, "timeout", "retry")).retryable());
+        assert!(classify_error(ApiError::new(425, "stale", "retry")).retryable());
         assert!(!classify_error(ApiError::validation("bad input")).retryable());
+    }
+
+    #[test]
+    fn provider_names_are_stable_for_attempt_reconciliation() {
+        assert_eq!(
+            providers::action_attempt_provider("create_reminder"),
+            Some("action.reminder")
+        );
+        assert_eq!(
+            providers::action_attempt_provider("send_message"),
+            Some("action.message")
+        );
+        assert_eq!(
+            providers::action_attempt_provider("create_draft"),
+            Some("local.draft")
+        );
     }
 }

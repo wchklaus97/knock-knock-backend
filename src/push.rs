@@ -23,46 +23,57 @@ pub struct PushDelivery {
 
 pub struct PushRequest<'a> {
     pub user_id: &'a str,
-    pub session_id: &'a str,
+    pub session_id: Option<&'a str>,
     pub title: &'a str,
     pub body: &'a str,
     pub voice_script: Option<&'a str>,
+    pub dedupe_key: Option<&'a str>,
     pub payload: Value,
 }
 
-pub async fn enqueue_push(
-    db: &D1Database,
-    user_id: &str,
-    session_id: &str,
-    title: &str,
-    body: &str,
-    voice_script: Option<&str>,
-    payload: Value,
-) -> ApiResult<Value> {
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PushIdRow {
+    id: String,
+}
+
+async fn enqueue_push(db: &D1Database, request: &PushRequest<'_>) -> ApiResult<Value> {
     let push_id = new_id("push")?;
     let created_at = db::now_iso();
     db::run(
         db,
-        "INSERT INTO pushes (id, user_id, session_id, title, body, voice_script, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO pushes (id, user_id, session_id, title, body, voice_script, payload_json, dedupe_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         vec![
             db::text(&push_id),
-            db::text(user_id),
-            db::text(session_id),
-            db::text(title),
-            db::text(body),
-            db::optional_text(voice_script),
-            db::text(&payload.to_string()),
+            db::text(request.user_id),
+            db::optional_text(request.session_id),
+            db::text(request.title),
+            db::text(request.body),
+            db::optional_text(request.voice_script),
+            db::text(&request.payload.to_string()),
+            db::optional_text(request.dedupe_key),
             db::text(&created_at),
             db::text(&created_at),
         ],
     )
     .await?;
+    let stored_id = if let Some(dedupe_key) = request.dedupe_key {
+        db::first::<PushIdRow>(
+            db,
+            "SELECT id FROM pushes WHERE user_id = ? AND dedupe_key = ?",
+            vec![db::text(request.user_id), db::text(dedupe_key)],
+        )
+        .await?
+        .map(|row| row.id)
+        .ok_or_else(|| ApiError::new(500, "push_error", "Deduplicated push was not persisted"))?
+    } else {
+        push_id
+    };
     Ok(serde_json::json!({
-        "push_id": push_id,
-        "session_id": session_id,
-        "title": title,
-        "body": body,
-        "voice_script": voice_script,
+        "push_id": stored_id,
+        "session_id": request.session_id,
+        "title": request.title,
+        "body": request.body,
+        "voice_script": request.voice_script,
         "created_at": created_at,
     }))
 }
@@ -129,6 +140,29 @@ pub async fn mark_all_read(db: &D1Database, user_id: &str) -> ApiResult<Value> {
     }))
 }
 
+pub async fn dismiss(db: &D1Database, user_id: &str, push_id: &str) -> ApiResult<Value> {
+    let now = db::now_iso();
+    db::run(
+        db,
+        "UPDATE pushes SET dismissed_at = COALESCE(dismissed_at, ?), updated_at = ? WHERE id = ? AND user_id = ?",
+        vec![
+            db::text(&now),
+            db::text(&now),
+            db::text(push_id),
+            db::text(user_id),
+        ],
+    )
+    .await?;
+    let row: Option<PushRow> = db::first(
+        db,
+        "SELECT id, session_id, title, body, voice_script, created_at, read_at, dismissed_at FROM pushes WHERE id = ? AND user_id = ?",
+        vec![db::text(push_id), db::text(user_id)],
+    )
+    .await?;
+    let row = row.ok_or_else(|| ApiError::not_found("Push not found"))?;
+    Ok(push_value(row))
+}
+
 fn push_value(row: PushRow) -> Value {
     serde_json::json!({
         "ok": true,
@@ -177,16 +211,7 @@ pub async fn notify_user(
     let apns_ready = apns::is_ready(env);
     let mut inbox = false;
     if mode == "dev" || mode == "both" || !apns_ready {
-        enqueue_push(
-            db,
-            request.user_id,
-            request.session_id,
-            request.title,
-            request.body,
-            request.voice_script,
-            request.payload.clone(),
-        )
-        .await?;
+        enqueue_push(db, &request).await?;
         inbox = true;
     }
 
@@ -213,16 +238,7 @@ pub async fn notify_user(
     // Keep the existing development phone polling loop alive if APNs is
     // configured but no physical device token was available or delivery failed.
     if !inbox && apns_sent == 0 {
-        enqueue_push(
-            db,
-            request.user_id,
-            request.session_id,
-            request.title,
-            request.body,
-            request.voice_script,
-            request.payload,
-        )
-        .await?;
+        enqueue_push(db, &request).await?;
         inbox = true;
     }
     Ok(PushDelivery {
