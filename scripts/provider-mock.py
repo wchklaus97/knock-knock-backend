@@ -152,6 +152,15 @@ class Handler(BaseHTTPRequestHandler):
         command_id = str(body.get("command_id", "")).strip()
         provider_id = str(body.get("provider_id", "")).strip()
         attempt = self.state.cancel_attempt(key)
+        if command_id.startswith("cmd-cancel-missing-id-"):
+            self.send_json(200, {"state": "cancelled"})
+            return
+        if command_id.startswith("cmd-cancel-mismatch-"):
+            self.send_json(
+                200,
+                {"provider_id": "mock-rem-not-the-requested-resource", "state": "cancelled"},
+            )
+            return
         if command_id.startswith("cmd-cancel-reconcile-") and attempt == 1:
             self.send_json(200, {"provider_id": provider_id, "state": "pending"})
             return
@@ -159,6 +168,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def message_delivery(self, key: str, command_id: str) -> None:
         resource = self.state.resource("message", key, command_id)
+        if command_id.startswith("cmd-message-missing-id-"):
+            self.send_json(200, {"state": "delivered"})
+            return
         self.send_json(
             200,
             {"provider_id": resource["provider_id"], "state": "accepted"},

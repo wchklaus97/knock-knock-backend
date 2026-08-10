@@ -150,7 +150,7 @@ provider resource IDs, and a redacted response fixture for every row.
 | P13 | Worker restart during call | persisted attempt is reconciled before another delivery |
 | P14 | Vendor retention/expiry | expired provider resources remain explicit, not false success |
 
-The complete local equivalent is:
+The deterministic local subset is:
 
 ```bash
 ./scripts/provider-local-gate.sh
@@ -164,6 +164,9 @@ against an already configured Worker, set `BASE_URL` and use
 It also runs `scripts/provider-observability-smoke.sh` to verify readiness
 gauges, request-ID validation, and generated fallback correlation IDs, and
 checks that the local provider token does not appear in Worker/provider logs.
+It covers the stable local equivalents of P01, P02, P04, P05, P06, P07, and
+P08, plus provider-ID fail-closed cases. It does not replace vendor evidence
+for P03, P09–P14 or prove real vendor semantics.
 
 Run the local gate first, then repeat the lifecycle matrix against the selected
 vendor sandbox with fresh test identifiers. Do not place vendor tokens in shell

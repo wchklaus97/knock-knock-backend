@@ -29,3 +29,20 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown
       - name: Run architecture and release preflight
         run: ./scripts/phase45-release-gate.sh
+
+  dynamic-local-smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dynamic smoke dependencies
+        run: |
+          command -v curl
+          command -v jq
+          command -v python3
+          npm install --global wrangler@4.81.1
+      - name: Run isolated contract, R2, and provider gates
+        run: |
+          ./scripts/local-contract-gate.sh
+          ./scripts/provider-local-gate.sh

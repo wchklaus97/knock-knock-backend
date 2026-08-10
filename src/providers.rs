@@ -82,15 +82,18 @@ impl ActionProviderConfig {
         if self.mode != ActionProviderMode::External {
             return self.mode == ActionProviderMode::Internal;
         }
-        ["create_reminder", "send_message"]
-            .into_iter()
-            .filter(|intent| self.enabled(intent))
-            .all(|intent| {
-                self.endpoint(intent).is_some()
+        let mut has_enabled_action = false;
+        let mut all_enabled_actions_ready = true;
+        for intent in ["create_reminder", "send_message"] {
+            if self.enabled(intent) {
+                has_enabled_action = true;
+                all_enabled_actions_ready &= self.endpoint(intent).is_some()
                     && self.status_endpoint(intent).is_some()
                     && self.token(intent).is_some()
-                    && (intent != "create_reminder" || self.cancel_endpoint(intent).is_some())
-            })
+                    && (intent != "create_reminder" || self.cancel_endpoint(intent).is_some());
+            }
+        }
+        has_enabled_action && all_enabled_actions_ready
     }
 }
 
@@ -607,6 +610,23 @@ mod tests {
         assert!(ready(&internal));
         assert!(!ready(&external));
         assert!(!ready(&disabled));
+    }
+
+    #[test]
+    fn external_provider_without_enabled_actions_is_not_reported_ready() {
+        let external = ActionProviderConfig {
+            mode: ActionProviderMode::External,
+            reminder_enabled: false,
+            message_enabled: false,
+            reminder_url: None,
+            message_url: None,
+            reminder_cancel_url: None,
+            reminder_status_url: None,
+            message_status_url: None,
+            reminder_token: None,
+            message_token: None,
+        };
+        assert!(!ready(&external));
     }
 
     #[test]

@@ -24,8 +24,10 @@ test -x ./scripts/provider-lifecycle-smoke.sh
 test -x ./scripts/provider-local-gate.sh
 test -x ./scripts/provider-mock.py
 test -x ./scripts/provider-observability-smoke.sh
+test -x ./scripts/local-contract-gate.sh
 test -x ./scripts/staging-contract-gate.sh
 for script in \
+  ./scripts/local-contract-gate.sh \
   ./scripts/r2-download-smoke.sh \
   ./scripts/provider-lifecycle-smoke.sh \
   ./scripts/provider-local-gate.sh \

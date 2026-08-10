@@ -137,6 +137,9 @@ release gates still require human approval. The numbered gate handoff is tracked
   passed, including command list, pairing status, push dismissal, and the
   existing multi-turn session/action loop, metrics readiness gauges, and
   validated request-ID propagation.
+- `scripts/local-contract-gate.sh` — passed; it started an isolated Worker and
+  exercised the complete local contract, R2 download/retention, and ownership
+  flow in one reproducible gate.
 - Local `/__scheduled` Outbox smoke — passed for reminder, draft, and message;
   message result remained `queued` with `external_delivery: not_configured`.
 - Local reminder due-time smoke — passed: a due reminder generated one
@@ -184,10 +187,11 @@ These are deliberately not marked as passed:
   plus R2 bucket creation and route-level D1/R2/E2E smoke against those
   deployed bindings;
 - paired iOS/backend compatibility review after the merged contract-parity follow-up;
-- production provider selection, provider sandbox/contract evidence, real
+- production provider selection, vendor sandbox/contract evidence, real
   provider credentials, vendor-specific cancellation/reconciliation policy,
-  and production rollout approval (the generic lifecycle adapter is
-  implemented and locally verified);
+  and production rollout approval (the generic lifecycle adapter and a
+  deterministic local subset of P01/P02/P04/P05/P06/P07/P08 are verified;
+  P03/P09–P14 still require vendor evidence);
 - 20–100 example golden voice dataset, ≥95% accuracy evidence, and zero
   high-risk false execution evidence;
 - physical iPhone 13 audio, memory, thermal, crash, and real APNs testing;

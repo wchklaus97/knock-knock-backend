@@ -8,11 +8,14 @@ get() {
   curl --fail-with-body --silent --show-error "$@"
 }
 
+health="$(get "${BASE_URL}/health")"
+expected_provider_ready="$(jq -r 'if .action_provider_ready then 1 else 0 end' <<<"${health}")"
+expected_apns_ready="$(jq -r 'if .apns_ready then 1 else 0 end' <<<"${health}")"
 metrics="$(get "${BASE_URL}/metrics")"
 grep -q 'knock_knock_api_info{runtime="cloudflare-worker",api="rust"} 1' <<<"${metrics}"
-grep -q 'knock_knock_provider_ready ' <<<"${metrics}"
-grep -q 'knock_knock_apns_ready ' <<<"${metrics}"
-grep -q 'knock_knock_model_enabled ' <<<"${metrics}"
+grep -Eq "knock_knock_provider_ready[[:space:]]+${expected_provider_ready}" <<<"${metrics}"
+grep -Eq "knock_knock_apns_ready[[:space:]]+${expected_apns_ready}" <<<"${metrics}"
+grep -Eq 'knock_knock_model_enabled[[:space:]]+[01]' <<<"${metrics}"
 
 expected_request_id="provider-observability-correlation"
 valid_headers="$(curl --fail-with-body --silent --show-error \

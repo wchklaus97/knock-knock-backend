@@ -32,6 +32,13 @@ the full auth/pairing/phone loop and two consecutive decisions on the same
 ./scripts/contract-smoke.sh
 ```
 
+For an isolated dynamic CI-style run covering contract, local R2 retrieval,
+retention, and ownership checks, use:
+
+```sh
+./scripts/local-contract-gate.sh
+```
+
 To run the external-provider lifecycle locally without a vendor account, use
 the isolated mock gate:
 
@@ -176,9 +183,11 @@ enable GitHub Actions and issue notifications for the account/team that should
 receive failures.
 
 The scheduled D1 backup workflow exports the production database daily and
-retains a GitHub Actions artifact for 30 days. Before enabling it, add the
-repository Actions secret `CLOUDFLARE_API_TOKEN` (D1 read access); never put
-that value in this repository. The non-secret repository Actions variables
+retains an encrypted object in the private backup R2 bucket. It does not claim
+remote restore verification; run the approved restore procedure separately.
+Before enabling it, add the repository Actions secret
+`CLOUDFLARE_API_TOKEN` (D1 read access); never put that value in this repository.
+The non-secret repository Actions variables
 `KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID`, `KNOCK_KNOCK_D1_DATABASE_ID`, and
 `KNOCK_KNOCK_CORS_ORIGIN` are non-secret deployment settings used to
 materialize the ignored production Wrangler config during the job. The workflow

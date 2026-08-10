@@ -259,8 +259,12 @@ pub async fn undo(
             .await
             {
                 Ok(response) => {
+                    let provider_id_matches = response.provider_id.as_deref() == Some(provider_id);
                     let state = match response.state {
-                        providers::ProviderDeliveryState::Succeeded => "succeeded",
+                        providers::ProviderDeliveryState::Succeeded if provider_id_matches => {
+                            "succeeded"
+                        }
+                        providers::ProviderDeliveryState::Succeeded => "unknown",
                         providers::ProviderDeliveryState::Pending
                         | providers::ProviderDeliveryState::Unknown => "unknown",
                         providers::ProviderDeliveryState::Failed => "failed",
@@ -275,6 +279,15 @@ pub async fn undo(
                 }
             }
         };
+        if response.state == providers::ProviderDeliveryState::Succeeded
+            && response.provider_id.as_deref() != Some(provider_id)
+        {
+            return Err(ApiError::new(
+                503,
+                "provider_cancel_mismatch",
+                "The provider cancellation did not identify the expected resource",
+            ));
+        }
         if let Some(error) = cancel_state_error(response.state) {
             return Err(error);
         }
@@ -648,6 +661,19 @@ async fn queue_message(
             "queued"
         }
     };
+    if external
+        && provider_state == providers::ProviderDeliveryState::Succeeded
+        && provider_response
+            .as_ref()
+            .and_then(|response| response.provider_id.as_deref())
+            .is_none()
+    {
+        return Err(ApiError::new(
+            503,
+            "provider_missing_id",
+            "External message provider did not return a provider identifier",
+        ));
+    }
     db::run(
         db,
         "INSERT OR IGNORE INTO outbound_messages (id, user_id, command_id, session_id, recipient, body, provider, delivery_state, provider_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

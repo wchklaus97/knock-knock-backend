@@ -42,6 +42,20 @@ smoke exercises the newly covered routes. PR #12 was merged as `3dcea11`;
 any client API regeneration must still pass the paired iOS compatibility
 review.
 
+### Provider sandbox follow-up — open PR #13
+
+PR #13 adds the vendor-neutral provider sandbox runbook, deterministic local
+Provider boundary, isolated local Worker/D1 lifecycle gate, observability
+smoke, and a backend CI dynamic-local-smoke job. The implementation now
+requires provider IDs for successful external effects, matches cancellation
+IDs before marking Undo complete, rejects external readiness when no action is
+enabled, and verifies duplicate reminder/message commands do not create a
+second provider delivery. Local evidence covers the stable subset P01, P02,
+P04, P05, P06, P07, and P08 plus fail-closed provider-ID cases. P03 and P09–P14
+still require a selected vendor, sandbox credentials, and real vendor
+behavior; staging, device/APNs, model, security, and human release gates are
+not closed by local tests.
+
 ### Backend follow-up checkpoint — 2026-08-10
 
 The next backend continuation closes four concrete API gaps in one additive
