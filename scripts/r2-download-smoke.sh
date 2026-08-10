@@ -8,6 +8,8 @@ BUCKET="${R2_SMOKE_BUCKET:-knock-knock-local}"
 PERSIST_TO="${R2_SMOKE_PERSIST_TO:-.wrangler/state}"
 WRANGLER_CONFIG="${R2_SMOKE_WRANGLER_CONFIG:-${ROOT_DIR}/wrangler.toml}"
 REMOTE="${R2_SMOKE_REMOTE:-false}"
+REMOTE_RETENTION_TIMEOUT_SEC="${R2_SMOKE_REMOTE_RETENTION_TIMEOUT_SEC:-120}"
+REMOTE_RETENTION_POLL_SEC="${R2_SMOKE_REMOTE_RETENTION_POLL_SEC:-5}"
 PASSWORD="${SMOKE_PASSWORD:-password123}"
 EMAIL="${SMOKE_EMAIL:-r2-download-$(date +%s)-$$@local.test}"
 FIXTURE="${ROOT_DIR}/scripts/fixtures/retrieval-download.txt"
@@ -24,6 +26,52 @@ fi
 json() {
   curl --fail-with-body --silent --show-error \
     -H 'content-type: application/json' "$@"
+}
+
+wait_for_remote_expired_download() {
+  local download_path="$1"
+  local deadline=$((SECONDS + REMOTE_RETENTION_TIMEOUT_SEC))
+  local response_status
+
+  while (( SECONDS < deadline )); do
+    response_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
+      "${user_auth[@]}" "${BASE_URL}${download_path}")"
+    if [[ "$response_status" == "404" ]]; then
+      return 0
+    fi
+    sleep "$REMOTE_RETENTION_POLL_SEC"
+  done
+
+  echo "remote retention did not expire ${download_path} within ${REMOTE_RETENTION_TIMEOUT_SEC}s" >&2
+  return 1
+}
+
+wait_for_remote_r2_object_deleted() {
+  local object_key="$1"
+  local output_path="$2"
+  local deadline=$((SECONDS + REMOTE_RETENTION_TIMEOUT_SEC))
+
+  while (( SECONDS < deadline )); do
+    if ! wrangler r2 object get "${BUCKET}/${object_key}" \
+      --config "${WRANGLER_CONFIG}" \
+      "${STORAGE_ARGS[@]}" \
+      --file "$output_path" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$REMOTE_RETENTION_POLL_SEC"
+  done
+
+  echo "remote retention did not delete ${object_key} within ${REMOTE_RETENTION_TIMEOUT_SEC}s" >&2
+  return 1
+}
+
+run_scheduled_sweep() {
+  if [[ "$REMOTE" == "true" ]]; then
+    # Deployed Workers receive scheduled events from the Cloudflare cron
+    # trigger. The local /__scheduled test route is unavailable remotely.
+    return 0
+  fi
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
 }
 
 auth="$(json -X POST "${BASE_URL}/v1/auth/register" \
@@ -92,10 +140,14 @@ wrangler d1 execute DB \
   "${STORAGE_ARGS[@]}" \
   --command "UPDATE retrieval_items SET retention_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = '${retrieval_id}'" \
   >/dev/null
-curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
-expired_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
-  "${user_auth[@]}" "${BASE_URL}${download_path}")"
-test "${expired_status}" = "404"
+run_scheduled_sweep
+if [[ "$REMOTE" == "true" ]]; then
+  wait_for_remote_expired_download "$download_path"
+else
+  expired_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
+    "${user_auth[@]}" "${BASE_URL}${download_path}")"
+  test "${expired_status}" = "404"
+fi
 
 # The second retrieval still references the same immutable object, so the
 # first row's retention sweep must not delete it prematurely.
@@ -116,14 +168,21 @@ wrangler d1 execute DB \
   "${STORAGE_ARGS[@]}" \
   --command "UPDATE retrieval_items SET retention_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = '${shared_retrieval_id}'" \
   >/dev/null
-curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
-shared_expired_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
-  "${user_auth[@]}" "${BASE_URL}/v1/phone/retrievals/${shared_retrieval_id}/download")"
-test "${shared_expired_status}" = "404"
-if wrangler r2 object get "${BUCKET}/${KEY}" \
-  --config "${WRANGLER_CONFIG}" \
-  "${STORAGE_ARGS[@]}" \
-  --file "${TMP_DIR}/deleted" >/dev/null 2>&1; then
+run_scheduled_sweep
+shared_download_path="/v1/phone/retrievals/${shared_retrieval_id}/download"
+if [[ "$REMOTE" == "true" ]]; then
+  wait_for_remote_expired_download "$shared_download_path"
+else
+  shared_expired_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
+    "${user_auth[@]}" "${BASE_URL}${shared_download_path}")"
+  test "${shared_expired_status}" = "404"
+fi
+if [[ "$REMOTE" == "true" ]]; then
+  wait_for_remote_r2_object_deleted "${KEY}" "${TMP_DIR}/deleted"
+elif wrangler r2 object get "${BUCKET}/${KEY}" \
+    --config "${WRANGLER_CONFIG}" \
+    "${STORAGE_ARGS[@]}" \
+    --file "${TMP_DIR}/deleted" >/dev/null 2>&1; then
   echo 'expired R2 retrieval object was not deleted' >&2
   exit 1
 fi

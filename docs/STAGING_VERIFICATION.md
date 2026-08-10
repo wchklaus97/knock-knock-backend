@@ -41,6 +41,10 @@ from staging health.
   with an email-confirmed account; login, protected API access, refresh, and
   logout passed against the staging Worker. Its email and password are stored
   only as GitHub environment secrets.
+- Staging Supabase Email auth was enabled and `mailer_autoconfirm` was set to
+  `true`; registration smoke no longer depends on the built-in email provider.
+- The remote R2 smoke now waits for the deployed one-minute Cloudflare cron
+  instead of calling the local-only `/__scheduled` test path.
 - iOS `Staging` configuration was added and built successfully for the iOS
   Simulator. It uses the staging HTTPS Worker URL and the development APNs
   entitlement.
@@ -52,18 +56,19 @@ from staging health.
 
 ## Full gate status
 
-`scripts/staging-contract-gate.sh` is prepared but was not fully completed.
-The dedicated project's email provider still rate-limits disposable sign-up
-accounts used by the contract and R2 smoke scripts:
+`scripts/staging-contract-gate.sh` passed against the deployed staging Worker
+after the staging-only Email auth configuration was corrected:
 
-```text
-over_email_send_rate_limit
-```
+- Supabase auth: login, protected API, refresh, and logout
+- Rust contract: phone routes, command pagination, pairing isolation/expiry,
+  push isolation/dismissal, action descriptors, confirmation, claim, result,
+  and refresh
+- Remote R2: stream, metadata, user namespace, cross-user isolation, shared-key
+  retention, and object deletion
 
-The reusable UAT login/refresh/logout smoke passed, but the full contract gate
-stopped at disposable account registration with HTTP 400. Therefore user
-isolation, phone contract, and remote R2 route retention tests are **not
-declared passed**. No password or token was written to the repository.
+The gate was run locally with the authenticated Wrangler OAuth session for the
+remote D1/R2 smoke. It is not yet a GitHub Actions result because the workflow
+requires a non-interactive Cloudflare API token.
 
 The GitHub environment now contains the staging UAT email/password secrets.
 It still needs one secret before the manual workflow can run:
@@ -75,16 +80,13 @@ was not copied into GitHub Actions.
 
 ## Next controlled steps
 
-1. Set `mailer_autoconfirm=true` for the staging-only Supabase project, or
-   provide an equivalent approved disposable-user provisioning path, so the
-   registration-based smoke scripts do not depend on email delivery.
-2. Add a least-privilege `CLOUDFLARE_API_TOKEN` to the GitHub `staging`
+1. Add a least-privilege `CLOUDFLARE_API_TOKEN` to the GitHub `staging`
    environment; do not reuse the local Wrangler OAuth session.
-3. Run the `Staging contract gate` workflow with the Worker URL.
-4. Build/install the iOS `Staging` configuration on a physical iPhone and
+2. Run the `Staging contract gate` workflow with the Worker URL.
+3. Build/install the iOS `Staging` configuration on a physical iPhone and
    verify login, pairing, inbox refresh, SSE recovery, offline queue recovery,
    and a second device's cursor convergence.
-5. Run the separate APNs sandbox gate with a real device token. Simulator
+4. Run the separate APNs sandbox gate with a real device token. Simulator
    notification banners do not count as APNs evidence.
 
 ## Rollback
