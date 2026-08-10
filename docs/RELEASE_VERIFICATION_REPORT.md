@@ -9,14 +9,14 @@ and Phase 0–3 integration baseline
 
 | Repository | Branch | Commit | Draft PR |
 |---|---|---|---|
-| Backend base | `main` | `185b5e9` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | `446be9a2080d2feec9ef39e57a61e07cd45fc301` | [draft PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
+| Backend base | `main` | `cccd12d` | merged Phase 4/5 base |
+| Backend follow-up | `agent/phase45-completion-backend` | `cccd12d` | [merged PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
 | iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
 
-The follow-up branch is based on merged PR #10. PR #11 is pushed and its
-GitHub Actions Rust backend CI run passed; it is not merged, deployed, or
-applied to production. Paired review and the remaining release gates still
-require human approval. The numbered gate handoff is tracked in
+The follow-up branch is based on merged PR #10. PR #11 passed its GitHub
+Actions Rust backend CI run and is now merged into `main`; it is not deployed
+or applied to production. The contract-parity follow-up is a separate change.
+The remaining release gates still require human approval. The numbered gate handoff is tracked in
 [`docs/RELEASE_GATE_MATRIX.md`](RELEASE_GATE_MATRIX.md).
 
 ## Implemented baseline
@@ -96,6 +96,7 @@ require human approval. The numbered gate handoff is tracked in
   deleted-resource write barriers, message/retrieval tombstones, lease fencing,
   event idempotency gates, outbox lease recovery, and cursor scope
 - `scripts/contract-schema-smoke.sh` — passed
+- `scripts/contract-route-parity-smoke.sh` — passed: 47 executable operations match OpenAPI
 - `scripts/contract-breaking-smoke.sh` — passed
 - `scripts/provider-safety-smoke.sh` — passed
 - `scripts/r2-download-smoke.sh` against an isolated local Worker + local D1/R2
@@ -114,7 +115,7 @@ require human approval. The numbered gate handoff is tracked in
 - `scripts/backup-restore-smoke.sh` — passed for encrypted export/decrypt,
   checksum, SQLite integrity, and schema/data restore
 - `scripts/phase45-release-gate.sh` — passed
-- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31347592328) — passed for commit `446be9a2080d2feec9ef39e57a61e07cd45fc301`
+- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31347710519) — passed for final commit `5b7f59101745c7d3feae3c2c60175f0dc9e5ce35`, then merged as `cccd12d`
 - Read-only production health probe — passed; deployed version was
   `2026.08.08-build-25`, so this does not count as PR #11 deployment evidence.
 - `scripts/staging-contract-gate.sh` and manual
@@ -172,7 +173,7 @@ These are deliberately not marked as passed:
 - independent staging Worker + D1 creation and route-level D1/E2E smoke
   plus R2 bucket creation and route-level D1/R2/E2E smoke against those
   deployed bindings;
-- paired PR review for [PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11);
+- paired PR review for the post-PR #11 contract-parity follow-up;
 - production provider selection, provider sandbox/contract evidence, real
   provider credentials, vendor-specific cancellation/reconciliation policy,
   and production rollout approval (the generic lifecycle adapter is
@@ -181,7 +182,7 @@ These are deliberately not marked as passed:
   high-risk false execution evidence;
 - physical iPhone 13 audio, memory, thermal, crash, and real APNs testing;
 - formal security review and production observability/alert review;
-- human approval for merging this follow-up PR, production migrations, APNs changes,
+- human approval for merging the contract-parity follow-up, production migrations, APNs changes,
   and model rollout.
 
 ## Rollback

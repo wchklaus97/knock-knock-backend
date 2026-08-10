@@ -6,9 +6,10 @@
 
 ## Execution status — 2026-08-10
 
-The staged implementation through PR #10 is merged. The Backend Phase 4/5
-completion follow-up is in draft PR #11; it has passed GitHub Actions CI but is
-not merged or deployed. The current dependency chain is:
+The staged implementation through PR #10 and the Backend Phase 4/5 completion
+follow-up PR #11 are merged. PR #11 is merged into `main` but has not been
+deployed as a production release. The current contract-parity follow-up is
+being prepared from that merge base; the current dependency chain is:
 
 | Stage | Backend | iOS | Status |
 |---|---|---|---|
@@ -18,9 +19,9 @@ not merged or deployed. The current dependency chain is:
 | Phase 2 | — | [PR #3](https://github.com/wchklaus97/knock-knock-frontend/pull/3) | SQLite/offline implementation complete |
 | Phase 3 | [PR #4](https://github.com/wchklaus97/knock-knock-backend/pull/4), [hardening PR #6](https://github.com/wchklaus97/knock-knock-backend/pull/6) | [PR #4](https://github.com/wchklaus97/knock-knock-frontend/pull/4) | History/retrieval and deletion hardening complete |
 | Phase 4 | — | [PR #5](https://github.com/wchklaus97/knock-knock-frontend/pull/5), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Local voice boundary and command submission complete |
-| Phase 5 | [integrated PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8), [merged PR #10](https://github.com/wchklaus97/knock-knock-backend/pull/10), [completion PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) | [release PR #6](https://github.com/wchklaus97/knock-knock-frontend/pull/6), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Backend CI passed; paired review and deployment gates remain |
+| Phase 5 | [integrated PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8), [merged PR #10](https://github.com/wchklaus97/knock-knock-backend/pull/10), [merged completion PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) | [release PR #6](https://github.com/wchklaus97/knock-knock-frontend/pull/6), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Backend CI passed; production and external verification gates remain |
 
-Verified in the current integration branches and PR #11: OpenAPI and migration smoke,
+Verified in the current integration branches and merged PR #11: OpenAPI and migration smoke,
 adversarial SQL isolation/deletion/lease tests, Rust unit tests, Rust WASM
 check, strict Clippy, iOS 15 simulator tests, and generic iOS build. Remaining
 human release gates are route-level D1/E2E tests against deployed bindings,
@@ -31,6 +32,15 @@ migrations, APNs changes, and model rollout.
 The detailed evidence and rollback record is in
 `docs/RELEASE_VERIFICATION_REPORT.md`.
 The numbered release handoff is in `docs/RELEASE_GATE_MATRIX.md`.
+
+### Contract parity follow-up — 2026-08-10
+
+The post-PR #11 contract follow-up keeps the OpenAPI document aligned with all
+47 executable operations, including the legacy `/v1/health` alias, agent key
+rotation, skills, session detail, and session progress routes. The route parity
+smoke compares the Rust dispatch table with OpenAPI and the local contract
+smoke exercises the newly covered routes. This follow-up must be reviewed and
+merged before any client regenerates its API bindings.
 
 ### Backend follow-up checkpoint — 2026-08-10
 

@@ -13,6 +13,7 @@ cargo check --target wasm32-unknown-unknown
 echo "[phase45] contract, migration, configuration, and adversarial checks"
 ./scripts/contract-schema-smoke.sh
 ./scripts/contract-breaking-smoke.sh
+./scripts/contract-route-parity-smoke.sh
 ./scripts/provider-safety-smoke.sh
 ./scripts/architecture-migration-smoke.sh
 ./scripts/adversarial-data-smoke.sh
