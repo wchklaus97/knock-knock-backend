@@ -379,6 +379,7 @@ pub async fn list_messages(
     }))
 }
 
+#[allow(dead_code)]
 pub async fn list_retrieval(
     db: &D1Database,
     user_id: &str,
