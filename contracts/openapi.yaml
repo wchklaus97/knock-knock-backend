@@ -1016,6 +1016,15 @@ components:
     CommandState:
       type: string
       enum: [pending, validated, awaiting_confirmation, queued, running, succeeded, failed, expired, cancelled, unknown]
+    CommandActionMetadata:
+      type: object
+      additionalProperties: false
+      required: [title, risk, confirm_required, reversible]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 128 }
+        risk: { type: string, enum: [low, medium, high, destructive] }
+        confirm_required: { type: boolean }
+        reversible: { type: boolean }
     CommandResponse:
       type: object
       required: [command_id, state, version, created_at, updated_at]
@@ -1025,6 +1034,10 @@ components:
           $ref: '#/components/schemas/CommandState'
         command:
           $ref: '#/components/schemas/CommandEnvelope'
+        action:
+          oneOf:
+            - $ref: '#/components/schemas/CommandActionMetadata'
+            - type: 'null'
         confirmation_token: { type: [string, 'null'] }
         result:
           type: [object, 'null']
