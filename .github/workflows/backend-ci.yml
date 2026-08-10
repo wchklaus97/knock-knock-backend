@@ -36,6 +36,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain for Worker build
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install pinned worker-build
+        run: cargo install worker-build --version 0.8.3 --locked
       - name: Install dynamic smoke dependencies
         run: |
           command -v curl
