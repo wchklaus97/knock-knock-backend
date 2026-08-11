@@ -74,12 +74,16 @@ configured Apple `.p8` key; missing or failed APNs delivery falls back to the
 development inbox when appropriate instead of being reported as a false
 success.
 
-When the Outbox commits a terminal command transition, it initiates one
-best-effort APNs fan-out to that authenticated owner's registered iOS tokens.
-This is a silent background wake-up containing only `aps.content-available`
-and the opaque `command_id`; the phone must fetch the authenticated REST
-command resource for state and result data. A missing token or APNs failure
-never rolls back or changes the durable command outcome.
+When the Outbox commits a supported terminal command transition (success,
+failure, or deleted-session cancellation), it initiates one best-effort APNs
+fan-out to that authenticated owner's registered iOS tokens. This is a silent,
+data-free background wake-up containing only `aps.content-available` and the
+fixed `wake_hint=command`; it contains no command, session, user, result, or
+business identifier. The phone must fetch authenticated REST state. Direct
+cancel/expiry transitions remain recoverable through SSE and resume sync. A
+missing token or APNs failure never rolls back or changes a durable outcome.
+Registering a physical APNs token atomically removes that token from any
+previous account row before binding it to the currently authenticated user.
 
 Local action execution uses `ACTION_PROVIDER_MODE=internal` and may enable the
 reminder/message flags for D1-only testing. The Worker also supports a reviewed

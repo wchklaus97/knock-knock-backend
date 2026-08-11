@@ -445,7 +445,6 @@ async fn settle_deleted_command(
         db,
         env,
         user_id,
-        &command.id,
         "cancelled",
         results.first().map(db::changes).unwrap_or(0),
     )
@@ -585,7 +584,6 @@ async fn finish_success(
         db,
         env,
         user_id,
-        &command.id,
         "succeeded",
         results.first().map(db::changes).unwrap_or(0),
     )
@@ -736,7 +734,6 @@ async fn finish_failure(
         db,
         env,
         user_id,
-        &command.id,
         command_state,
         results.first().map(db::changes).unwrap_or(0),
     )
@@ -745,11 +742,7 @@ async fn finish_failure(
 }
 
 fn should_attempt_command_wakeup(command_state: &str, transition_changes: usize) -> bool {
-    transition_changes == 1
-        && matches!(
-            command_state,
-            "succeeded" | "failed" | "expired" | "cancelled"
-        )
+    transition_changes == 1 && matches!(command_state, "succeeded" | "failed" | "cancelled")
 }
 
 fn command_wakeup_attempt<T>(
@@ -764,12 +757,11 @@ async fn notify_terminal_transition(
     db: &D1Database,
     env: &worker::Env,
     user_id: &str,
-    command_id: &str,
     command_state: &str,
     transition_changes: usize,
 ) {
     if let Some(attempt) = command_wakeup_attempt(command_state, transition_changes, || {
-        attempt_command_wakeup(db, env, user_id, command_id)
+        attempt_command_wakeup(db, env, user_id)
     }) {
         attempt.await;
     }
@@ -779,12 +771,7 @@ fn command_wakeup_token_query() -> &'static str {
     "SELECT push_token FROM devices WHERE user_id = ? AND platform = 'ios' AND push_token IS NOT NULL AND push_token != ''"
 }
 
-async fn attempt_command_wakeup(
-    db: &D1Database,
-    env: &worker::Env,
-    user_id: &str,
-    command_id: &str,
-) {
+async fn attempt_command_wakeup(db: &D1Database, env: &worker::Env, user_id: &str) {
     let push_mode = config_value(env, "PUSH_MODE", "dev");
     if !matches!(push_mode.as_str(), "apns" | "both") || !apns::is_ready(env) {
         return;
@@ -804,7 +791,7 @@ async fn attempt_command_wakeup(
     tokens.dedup();
 
     for token in tokens {
-        let _ = apns::send_command_wakeup(env, &token, command_id).await;
+        let _ = apns::send_command_wakeup(env, &token).await;
     }
 }
 
@@ -954,7 +941,6 @@ mod tests {
 
         assert_eq!(attempts.get(), 1);
         assert!(should_attempt_command_wakeup("failed", 1));
-        assert!(should_attempt_command_wakeup("expired", 1));
         assert!(should_attempt_command_wakeup("cancelled", 1));
         assert!(!should_attempt_command_wakeup("retryable", 1));
         assert!(!should_attempt_command_wakeup("unknown", 1));

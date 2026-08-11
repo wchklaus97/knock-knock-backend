@@ -12,6 +12,7 @@ use crate::sessions;
 const RETENTION_SWEEP_BATCH: i64 = 500;
 const EXPORT_MAX_ITEMS: usize = 10_000;
 const EXPORT_QUERY_LIMIT: i64 = EXPORT_MAX_ITEMS as i64 + 1;
+pub(crate) const SEARCH_QUERY_MAX_CHARACTERS: usize = 200;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ExpiredRetrievalRow {
@@ -488,12 +489,7 @@ pub async fn get_retrieval(
 }
 
 pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> ApiResult<Value> {
-    let query = query.trim();
-    if query.len() < 2 {
-        return Err(ApiError::validation(
-            "Search query must contain at least 2 characters",
-        ));
-    }
+    let query = validate_search_query(query)?;
     let safe_limit = limit.clamp(1, 50) as i64;
     let needle = search_like_pattern(query);
     let sessions: Vec<SessionRow> = db::all(
@@ -546,6 +542,17 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
         "messages": message_values,
         "retrieval_items": retrieval_values,
     }))
+}
+
+fn validate_search_query(query: &str) -> ApiResult<&str> {
+    let query = query.trim();
+    let length = query.chars().count();
+    if length == 0 || length > SEARCH_QUERY_MAX_CHARACTERS {
+        return Err(ApiError::validation(
+            "Search query must contain between 1 and 200 characters",
+        ));
+    }
+    Ok(query)
 }
 
 fn search_like_pattern(query: &str) -> String {
@@ -659,5 +666,13 @@ mod tests {
     #[test]
     fn search_like_pattern_escapes_sql_like_controls() {
         assert_eq!(search_like_pattern(r"a\b%c_d"), r"%a\\b\%c\_d%");
+    }
+
+    #[test]
+    fn search_query_contract_accepts_one_character_and_rejects_blank_or_oversized() {
+        assert_eq!(validate_search_query(" x ").unwrap(), "x");
+        assert_eq!(validate_search_query(" 家 ").unwrap(), "家");
+        assert!(validate_search_query("   ").is_err());
+        assert!(validate_search_query(&"x".repeat(SEARCH_QUERY_MAX_CHARACTERS + 1)).is_err());
     }
 }

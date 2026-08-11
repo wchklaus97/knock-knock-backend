@@ -179,8 +179,8 @@ const SEARCH_HISTORY_FIELDS: &[ActionStringField] = &[ActionStringField {
     canonical: "q",
     compatibility_aliases: &["query", "text"],
     required: true,
-    min_length: 2,
-    max_length: usize::MAX,
+    min_length: 1,
+    max_length: crate::history::SEARCH_QUERY_MAX_CHARACTERS,
 }];
 const CREATE_REMINDER_FIELDS: &[ActionStringField] = &[
     ActionStringField {
@@ -1047,12 +1047,16 @@ fn confirmation_replay_eligible_at(command: &CommandRow, now: &str) -> bool {
             .is_some_and(|expires_at| expires_at > now)
 }
 
+fn confirmation_replay_command_update_sql() -> &'static str {
+    "UPDATE commands SET version = version + 1, updated_at = ? WHERE id = ? AND user_id = ? AND idempotency_key = ? AND command_hash = ? AND version = ? AND state = 'awaiting_confirmation' AND needs_confirmation = 1 AND expires_at IS NOT NULL AND expires_at > ? AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = commands.session_id AND sessions.user_id = commands.user_id AND sessions.deleted_at IS NULL))"
+}
+
 fn confirmation_replay_invalidation_sql() -> &'static str {
-    "UPDATE confirmation_tokens SET used_at = ? WHERE command_id = ? AND user_id = ? AND used_at IS NULL AND EXISTS (SELECT 1 FROM commands AS replay_command WHERE replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > ? AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)))"
+    "UPDATE confirmation_tokens SET used_at = ? WHERE command_id = ? AND user_id = ? AND used_at IS NULL AND changes() = 1 AND EXISTS (SELECT 1 FROM commands AS replay_command WHERE replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > ? AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)))"
 }
 
 fn confirmation_replay_insert_sql() -> &'static str {
-    "INSERT INTO confirmation_tokens (id, command_id, user_id, token_hash, command_hash, expires_at, created_at) SELECT ?, replay_command.id, replay_command.user_id, ?, replay_command.command_hash, MIN(replay_command.expires_at, ?), ? FROM commands AS replay_command WHERE replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > ? AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM confirmation_tokens WHERE confirmation_tokens.command_id = replay_command.id AND confirmation_tokens.user_id = replay_command.user_id AND confirmation_tokens.used_at IS NULL)"
+    "INSERT INTO confirmation_tokens (id, command_id, user_id, token_hash, command_hash, expires_at, created_at) SELECT ?, replay_command.id, replay_command.user_id, ?, replay_command.command_hash, MIN(replay_command.expires_at, ?), ? FROM commands AS replay_command WHERE changes() = 1 AND replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > ? AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM confirmation_tokens WHERE confirmation_tokens.command_id = replay_command.id AND confirmation_tokens.user_id = replay_command.user_id AND confirmation_tokens.used_at IS NULL)"
 }
 
 /// Rotate the write-only confirmation authority for an exact idempotent replay.
@@ -1065,7 +1069,7 @@ async fn reissue_confirmation_token_for_replay(
     idempotency_key: &str,
     command_hash: &str,
     command: &CommandRow,
-) -> ApiResult<Option<String>> {
+) -> ApiResult<Option<(String, i64)>> {
     let now = db::now_iso();
     if command.user_id != user_id
         || command.idempotency_key != idempotency_key
@@ -1079,8 +1083,22 @@ async fn reissue_confirmation_token_for_replay(
     let token_hash = sha256_hex(&token);
     let token_id = new_id("cont")?;
     let token_expires_at = db::add_seconds_iso(CONFIRMATION_TTL_SECONDS);
+    let next_version = command.version + 1;
     let results = db
         .batch(vec![
+            db::prepare(
+                db,
+                confirmation_replay_command_update_sql(),
+                vec![
+                    db::text(&now),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::text(idempotency_key),
+                    db::text(command_hash),
+                    db::number(command.version),
+                    db::text(&now),
+                ],
+            )?,
             db::prepare(
                 db,
                 confirmation_replay_invalidation_sql(),
@@ -1092,7 +1110,7 @@ async fn reissue_confirmation_token_for_replay(
                     db::text(user_id),
                     db::text(idempotency_key),
                     db::text(command_hash),
-                    db::number(command.version),
+                    db::number(next_version),
                     db::text(&now),
                 ],
             )?,
@@ -1108,14 +1126,51 @@ async fn reissue_confirmation_token_for_replay(
                     db::text(user_id),
                     db::text(idempotency_key),
                     db::text(command_hash),
-                    db::number(command.version),
+                    db::number(next_version),
                     db::text(&now),
+                ],
+            )?,
+            db::prepare(
+                db,
+                "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.confirmation_reissued', ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND version = ?)",
+                vec![
+                    db::text(&new_id("aud")?),
+                    db::text(user_id),
+                    db::optional_text(command.session_id.as_deref()),
+                    db::text(
+                        &json!({"command_id": command.id, "version": next_version}).to_string(),
+                    ),
+                    db::text(&now),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::number(next_version),
+                ],
+            )?,
+            db::prepare(
+                db,
+                "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND version = ?)",
+                vec![
+                    db::text(user_id),
+                    db::text(&command.id),
+                    db::optional_text(command.session_id.as_deref()),
+                    db::number(next_version),
+                    db::text(&now),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::number(next_version),
                 ],
             )?,
         ])
         .await?;
 
-    Ok((results.get(1).map(db::changes).unwrap_or(0) == 1).then_some(token))
+    Ok((results.get(2).map(db::changes).unwrap_or(0) == 1).then_some((token, next_version)))
+}
+
+fn replay_token_for_response(
+    issued: Option<(String, i64)>,
+    response_version: i64,
+) -> Option<String> {
+    issued.and_then(|(token, issued_version)| (issued_version == response_version).then_some(token))
 }
 
 pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -> ApiResult<Value> {
@@ -1145,7 +1200,7 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
                 "idempotency_key was already used for a different command",
             ));
         }
-        let token = reissue_confirmation_token_for_replay(
+        let issued = reissue_confirmation_token_for_replay(
             db,
             user_id,
             &envelope.idempotency_key,
@@ -1153,7 +1208,11 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
             &existing,
         )
         .await?;
-        return Ok(response(&existing, token.as_deref()));
+        let replayed = get_for_user(db, user_id, &existing.id)
+            .await?
+            .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;
+        let token = replay_token_for_response(issued, replayed.version);
+        return Ok(response(&replayed, token.as_deref()));
     }
 
     let command_id = envelope.command_id.clone();
@@ -1283,7 +1342,7 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
         .await?
         {
             if existing.command_hash == command_hash {
-                let token = reissue_confirmation_token_for_replay(
+                let issued = reissue_confirmation_token_for_replay(
                     db,
                     user_id,
                     &envelope.idempotency_key,
@@ -1291,7 +1350,11 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
                     &existing,
                 )
                 .await?;
-                return Ok(response(&existing, token.as_deref()));
+                let replayed = get_for_user(db, user_id, &existing.id)
+                    .await?
+                    .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;
+                let token = replay_token_for_response(issued, replayed.version);
+                return Ok(response(&replayed, token.as_deref()));
             }
         }
         return Err(error.into());
@@ -1751,16 +1814,20 @@ mod tests {
 
     #[test]
     fn confirmation_replay_sql_revokes_then_rebinds_with_command_guards() {
+        let update = confirmation_replay_command_update_sql();
         let invalidation = confirmation_replay_invalidation_sql();
         let insert = confirmation_replay_insert_sql();
 
+        assert!(update.starts_with("UPDATE commands SET version = version + 1"));
         assert!(invalidation.starts_with("UPDATE confirmation_tokens SET used_at = ?"));
         assert!(invalidation.contains("command_id = ? AND user_id = ? AND used_at IS NULL"));
+        assert!(invalidation.contains("changes() = 1"));
         assert!(insert.starts_with("INSERT INTO confirmation_tokens"));
         assert!(insert.contains(
             "SELECT ?, replay_command.id, replay_command.user_id, ?, replay_command.command_hash"
         ));
         assert!(insert.contains("MIN(replay_command.expires_at, ?)"));
+        assert!(insert.contains("WHERE changes() = 1"));
         assert!(insert.contains("NOT EXISTS (SELECT 1 FROM confirmation_tokens"));
 
         for guard in [
@@ -1781,6 +1848,19 @@ mod tests {
             );
             assert!(insert.contains(guard), "missing insert guard: {guard}");
         }
+    }
+
+    #[test]
+    fn confirmation_replay_never_returns_a_token_for_a_newer_command_version() {
+        assert_eq!(
+            replay_token_for_response(Some(("ctok_current".to_string(), 8)), 8),
+            Some("ctok_current".to_string())
+        );
+        assert_eq!(
+            replay_token_for_response(Some(("ctok_stale".to_string(), 8)), 9),
+            None
+        );
+        assert_eq!(replay_token_for_response(None, 9), None);
     }
 
     #[test]
@@ -1851,6 +1931,8 @@ mod tests {
     #[test]
     fn search_history_argument_contract_is_fail_closed() {
         for valid in [
+            json!({"q": "x"}),
+            json!({"q": "家"}),
             json!({"q": "history"}),
             json!({"query": "history"}),
             json!({"text": "history"}),
@@ -1860,7 +1942,8 @@ mod tests {
 
         for invalid in [
             json!({}),
-            json!({"q": "x"}),
+            json!({"q": "   "}),
+            json!({"q": "x".repeat(crate::history::SEARCH_QUERY_MAX_CHARACTERS + 1)}),
             json!({"q": 7}),
             json!({"q": "history", "limit": 5}),
             json!({"q": "history", "query": "history"}),
