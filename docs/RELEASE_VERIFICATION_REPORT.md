@@ -87,6 +87,9 @@ Both worktrees were fetched immediately before handoff and matched
 - [x] Empty Xcode environment values no longer override the default local
   Worker URL; the same normalized URL is passed to the fixture process and the
   application process.
+- [x] When a signed model trust key is intentionally absent, the physical app
+  now shows an actionable configuration message instead of an internal Swift
+  error type.
 - [x] Home Today/This Week, drawer, Settings/pairing, destructive confirmation,
   and queued-state flows pass against an isolated local Worker and local D1.
 
@@ -110,8 +113,8 @@ Both worktrees were fetched immediately before handoff and matched
 
 ### iOS Simulator
 
-- Full `VoiceAgentBridgeTests` on iPhone 15 / iOS 17.2 — 113 total:
-  112 passed, 0 failed, 1 intentionally skipped.
+- Full `VoiceAgentBridgeTests` on iPhone 15 / iOS 17.2 — 114 total:
+  113 passed, 0 failed, 1 intentionally skipped.
 - `VoiceAgentBridgeUITests` against isolated local Worker/D1 — 3 passed,
   0 failed.
 - UI evidence captured for Home Today/This Week, drawer, Settings, decision
@@ -128,14 +131,17 @@ Both worktrees were fetched immediately before handoff and matched
 - App installed and launched while the device was unlocked — passed.
 - Full `VoiceAgentBridgeTests` on the physical device — 113 total:
   112 passed, 0 failed, 1 intentionally skipped.
+- This run preceded the user-copy-only signed-model error follow-up. Its final
+  114-test rerun is pending only because the device became locked while the
+  owner was away.
 
 ### Physical iPhone 17 Pro Max
 
 - Device: `Klaus’s iPhone 17 Pro Max`, iPhone 17 Pro Max, paired Xcode device.
 - Staging configuration built, signed, installed, and launched independently
   for `hk.knockknock.app` — passed.
-- Full `VoiceAgentBridgeTests` on the physical device — 113 total:
-  112 passed, 0 failed, 1 intentionally skipped.
+- Full `VoiceAgentBridgeTests` on the physical device at current PR head —
+  114 total: 113 passed, 0 failed, 1 intentionally skipped.
 - Debug UI fixtures were intentionally not run on this phone because their
   isolation contract clears Keychain and local cache. This preserves the
   user's existing Staging login; the same UI workflows passed on the isolated
