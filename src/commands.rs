@@ -67,6 +67,7 @@ const MAX_MODEL_VERSION: usize = 128;
 const MAX_CONFIRMATION_TOKEN: usize = 256;
 const COMMAND_TTL_SECONDS: i64 = 900;
 const CONFIRMATION_TTL_SECONDS: i64 = 600;
+const UNDO_WINDOW_SECONDS: f64 = 600.0;
 const MAX_ACTION_TITLE: usize = 200;
 const MAX_ACTION_RECIPIENT: usize = 320;
 const MAX_ACTION_BODY: usize = 8_000;
@@ -131,6 +132,122 @@ pub fn registry_requires_confirmation(intent: &str) -> Option<bool> {
     registry_policy(intent).map(|policy| policy.requires_confirmation)
 }
 
+/// One semantic string field in an action's fail-closed argument contract.
+/// `canonical` is what new clients should emit; aliases are compatibility-only.
+#[derive(Debug, Clone, Copy)]
+struct ActionStringField {
+    canonical: &'static str,
+    compatibility_aliases: &'static [&'static str],
+    required: bool,
+    min_length: usize,
+    max_length: usize,
+}
+
+impl ActionStringField {
+    fn keys(&self) -> impl Iterator<Item = &'static str> + '_ {
+        std::iter::once(self.canonical).chain(self.compatibility_aliases.iter().copied())
+    }
+
+    fn accepts_key(&self, key: &str) -> bool {
+        self.keys().any(|candidate| candidate == key)
+    }
+
+    fn validates(&self, args: &Map<String, Value>) -> bool {
+        let mut present = self.keys().filter_map(|key| args.get(key));
+        let Some(value) = present.next() else {
+            return !self.required;
+        };
+
+        // More than one name for the same semantic field is ambiguous even
+        // when the values happen to be equal.
+        if present.next().is_some() {
+            return false;
+        }
+
+        let Some(value) = value.as_str() else {
+            return false;
+        };
+        let length = value.trim().chars().count();
+        length >= self.min_length && length <= self.max_length
+    }
+}
+
+// Exact CommandEnvelope v1 argument contracts. Compatibility aliases remain
+// accepted one-at-a-time, but canonical names are the only names new clients
+// should produce.
+const SEARCH_HISTORY_FIELDS: &[ActionStringField] = &[ActionStringField {
+    canonical: "q",
+    compatibility_aliases: &["query", "text"],
+    required: true,
+    min_length: 2,
+    max_length: usize::MAX,
+}];
+const CREATE_REMINDER_FIELDS: &[ActionStringField] = &[
+    ActionStringField {
+        canonical: "title",
+        compatibility_aliases: &["text", "message"],
+        required: true,
+        min_length: 1,
+        max_length: MAX_ACTION_TITLE,
+    },
+    ActionStringField {
+        canonical: "due_at",
+        compatibility_aliases: &["time", "datetime"],
+        required: true,
+        min_length: 1,
+        max_length: MAX_ACTION_DUE_AT,
+    },
+];
+const CREATE_DRAFT_FIELDS: &[ActionStringField] = &[
+    ActionStringField {
+        canonical: "body",
+        compatibility_aliases: &["content", "text"],
+        required: true,
+        min_length: 1,
+        max_length: MAX_ACTION_BODY,
+    },
+    ActionStringField {
+        canonical: "title",
+        compatibility_aliases: &["subject"],
+        required: false,
+        min_length: 0,
+        max_length: MAX_ACTION_TITLE,
+    },
+    ActionStringField {
+        canonical: "recipient",
+        compatibility_aliases: &["to"],
+        required: false,
+        min_length: 0,
+        max_length: MAX_ACTION_RECIPIENT,
+    },
+];
+const SEND_MESSAGE_FIELDS: &[ActionStringField] = &[
+    ActionStringField {
+        canonical: "body",
+        compatibility_aliases: &["message", "text"],
+        required: true,
+        min_length: 1,
+        max_length: MAX_ACTION_BODY,
+    },
+    ActionStringField {
+        canonical: "recipient",
+        compatibility_aliases: &["to", "email", "phone"],
+        required: true,
+        min_length: 1,
+        max_length: MAX_ACTION_RECIPIENT,
+    },
+];
+
+fn action_argument_fields(intent: &str) -> Option<&'static [ActionStringField]> {
+    match intent {
+        "search_history" => Some(SEARCH_HISTORY_FIELDS),
+        "create_reminder" => Some(CREATE_REMINDER_FIELDS),
+        "create_draft" => Some(CREATE_DRAFT_FIELDS),
+        "send_message" => Some(SEND_MESSAGE_FIELDS),
+        _ => None,
+    }
+}
+
 /// Validate the argument shape for a registered action before it can enter
 /// the durable queue. The executor repeats this check immediately before an
 /// effect, so legacy or manually repaired rows cannot bypass the same rules.
@@ -138,67 +255,15 @@ pub fn validate_action_args(
     intent: &str,
     args: &Map<String, Value>,
 ) -> Result<(), CommandValidationError> {
-    let valid = match intent {
-        "search_history" => {
-            valid_required_action_string(args, &["q", "query", "text"], 2, usize::MAX)
-        }
-        "create_reminder" => {
-            valid_required_action_string(args, &["title", "text", "message"], 1, MAX_ACTION_TITLE)
-                && valid_required_action_string(
-                    args,
-                    &["due_at", "time", "datetime"],
-                    1,
-                    MAX_ACTION_DUE_AT,
-                )
-        }
-        "create_draft" => {
-            valid_required_action_string(args, &["body", "content", "text"], 1, MAX_ACTION_BODY)
-                && valid_optional_action_strings(args, &["title", "subject"], MAX_ACTION_TITLE)
-                && valid_optional_action_strings(args, &["recipient", "to"], MAX_ACTION_RECIPIENT)
-        }
-        "send_message" => {
-            valid_required_action_string(args, &["body", "message", "text"], 1, MAX_ACTION_BODY)
-                && valid_required_action_string(
-                    args,
-                    &["recipient", "to", "email", "phone"],
-                    1,
-                    MAX_ACTION_RECIPIENT,
-                )
-        }
-        _ => true,
-    };
+    let fields =
+        action_argument_fields(intent).ok_or(CommandValidationError::InvalidActionArguments)?;
+    let valid = args
+        .keys()
+        .all(|key| fields.iter().any(|field| field.accepts_key(key)))
+        && fields.iter().all(|field| field.validates(args));
     valid
         .then_some(())
         .ok_or(CommandValidationError::InvalidActionArguments)
-}
-
-fn valid_required_action_string(
-    args: &Map<String, Value>,
-    names: &[&str],
-    min_length: usize,
-    max_length: usize,
-) -> bool {
-    names
-        .iter()
-        .find_map(|name| args.get(*name).and_then(Value::as_str))
-        .map(str::trim)
-        .is_some_and(|value| {
-            !value.is_empty() && value.len() >= min_length && value.chars().count() <= max_length
-        })
-}
-
-fn valid_optional_action_strings(
-    args: &Map<String, Value>,
-    names: &[&str],
-    max_length: usize,
-) -> bool {
-    names.iter().all(|name| {
-        args.get(*name)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .map(|value| value.chars().count() <= max_length)
-            .unwrap_or(true)
-    })
 }
 
 /// Check the persisted policy again at the execution boundary. This is a
@@ -696,7 +761,68 @@ fn envelope_from_row(row: &CommandRow) -> CommandEnvelope {
     }
 }
 
-pub fn response(row: &CommandRow, confirmation_token: Option<&str>) -> Value {
+fn command_was_undone(row: &CommandRow) -> bool {
+    result_value(row)
+        .as_object()
+        .is_some_and(|result| result.contains_key("undo"))
+}
+
+fn command_is_reversible_success(row: &CommandRow) -> bool {
+    if row.state != "succeeded"
+        || !registry_policy(&row.intent).is_some_and(|policy| policy.reversible)
+    {
+        return false;
+    }
+
+    let result = result_value(row);
+    let kind = result
+        .as_object()
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str);
+    matches!(
+        (row.intent.as_str(), kind),
+        ("create_reminder", Some("reminder")) | ("create_draft", Some("draft"))
+    )
+}
+
+fn timestamp_millis(timestamp: &str) -> Option<f64> {
+    let millis =
+        worker::js_sys::Date::new(&worker::wasm_bindgen::JsValue::from_str(timestamp)).get_time();
+    (millis.is_finite() && millis >= 0.0).then_some(millis)
+}
+
+fn undo_window_open_at(
+    row: &CommandRow,
+    completed_at_millis: Option<f64>,
+    now_millis: f64,
+) -> bool {
+    if !command_is_reversible_success(row) || command_was_undone(row) || !now_millis.is_finite() {
+        return false;
+    }
+    let Some(completed_at_millis) = completed_at_millis.filter(|value| value.is_finite()) else {
+        return false;
+    };
+    let elapsed_millis = now_millis - completed_at_millis;
+    (0.0..UNDO_WINDOW_SECONDS * 1_000.0).contains(&elapsed_millis)
+}
+
+fn undo_request_allowed_at(
+    row: &CommandRow,
+    completed_at_millis: Option<f64>,
+    now_millis: f64,
+) -> bool {
+    command_is_reversible_success(row)
+        && (command_was_undone(row) || undo_window_open_at(row, completed_at_millis, now_millis))
+}
+
+fn response_at(
+    row: &CommandRow,
+    confirmation_token: Option<&str>,
+    completed_at_millis: Option<f64>,
+    now_millis: f64,
+) -> Value {
+    let undo_command_id =
+        undo_window_open_at(row, completed_at_millis, now_millis).then(|| row.id.clone());
     json!({
         "command_id": row.id,
         "state": row.state,
@@ -706,11 +832,20 @@ pub fn response(row: &CommandRow, confirmation_token: Option<&str>) -> Value {
         "confirmation_token": confirmation_token,
         "result": result_value(row),
         "error": error_value(row),
-        "undo_command_id": Value::Null,
+        "undo_command_id": undo_command_id,
         "version": row.version,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     })
+}
+
+pub fn response(row: &CommandRow, confirmation_token: Option<&str>) -> Value {
+    response_at(
+        row,
+        confirmation_token,
+        timestamp_millis(&row.updated_at),
+        worker::js_sys::Date::now(),
+    )
 }
 
 fn validation_error(error: CommandValidationError) -> ApiError {
@@ -990,6 +1125,7 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
     validate_envelope(&envelope).map_err(validation_error)?;
     let policy =
         registry_policy(&envelope.intent).ok_or_else(|| registry_error(&envelope.intent))?;
+    validate_action_args(&envelope.intent, &envelope.args).map_err(validation_error)?;
     validate_scope(db, user_id, &envelope).await?;
     let authoritative = authoritative_envelope(&envelope, policy);
     let command_hash = canonical_hash(&authoritative)?;
@@ -1019,8 +1155,6 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
         .await?;
         return Ok(response(&existing, token.as_deref()));
     }
-
-    validate_action_args(&envelope.intent, &envelope.args).map_err(validation_error)?;
 
     let command_id = envelope.command_id.clone();
     let now = db::now_iso();
@@ -1422,10 +1556,15 @@ pub async fn undo(
     if let Some(session_id) = command.session_id.as_deref() {
         ensure_session_live(db, user_id, session_id).await?;
     }
-    if command.state != "succeeded"
-        || !matches!(command.intent.as_str(), "create_reminder" | "create_draft")
-    {
+    if !command_is_reversible_success(&command) {
         return Err(ApiError::conflict("Command is not currently undoable"));
+    }
+    if !undo_request_allowed_at(
+        &command,
+        timestamp_millis(&command.updated_at),
+        worker::js_sys::Date::now(),
+    ) {
+        return Err(ApiError::conflict("Command undo window has expired"));
     }
     let undo = crate::action_effects::undo(env, db, user_id, &command, provider_config).await?;
     let updated = get_for_user(db, user_id, command_id)
@@ -1490,6 +1629,21 @@ mod tests {
             created_at: "2026-08-11T00:00:00Z".to_string(),
             updated_at: "2026-08-11T00:00:01Z".to_string(),
         }
+    }
+
+    fn action_args(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap()
+    }
+
+    fn assert_valid_args(intent: &str, value: Value) {
+        assert!(validate_action_args(intent, &action_args(value)).is_ok());
+    }
+
+    fn assert_invalid_args(intent: &str, value: Value) {
+        assert_eq!(
+            validate_action_args(intent, &action_args(value)),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
     }
 
     #[test]
@@ -1695,38 +1849,189 @@ mod tests {
     }
 
     #[test]
-    fn registered_action_arguments_are_validated_before_queueing() {
-        let empty = Map::new();
-        assert_eq!(
-            validate_action_args("send_message", &empty),
-            Err(CommandValidationError::InvalidActionArguments)
+    fn search_history_argument_contract_is_fail_closed() {
+        for valid in [
+            json!({"q": "history"}),
+            json!({"query": "history"}),
+            json!({"text": "history"}),
+        ] {
+            assert_valid_args("search_history", valid);
+        }
+
+        for invalid in [
+            json!({}),
+            json!({"q": "x"}),
+            json!({"q": 7}),
+            json!({"q": "history", "limit": 5}),
+            json!({"q": "history", "query": "history"}),
+        ] {
+            assert_invalid_args("search_history", invalid);
+        }
+        assert_invalid_args("unregistered_intent", json!({}));
+    }
+
+    #[test]
+    fn create_reminder_argument_contract_is_fail_closed() {
+        for valid in [
+            json!({"title": "Pay rent", "due_at": "2099-01-01T09:00:00Z"}),
+            json!({"text": "Pay rent", "time": "2099-01-01T09:00:00Z"}),
+            json!({"message": "Pay rent", "datetime": "2099-01-01T09:00:00Z"}),
+        ] {
+            assert_valid_args("create_reminder", valid);
+        }
+
+        for invalid in [
+            json!({"title": "Pay rent"}),
+            json!({"title": 7, "due_at": "2099-01-01T09:00:00Z"}),
+            json!({"title": "Pay rent", "due_at": false}),
+            json!({"title": "Pay rent", "due_at": "later", "repeat": "daily"}),
+            json!({"title": "Pay rent", "text": "Pay rent", "due_at": "later"}),
+            json!({"title": "Pay rent", "due_at": "later", "time": "later"}),
+        ] {
+            assert_invalid_args("create_reminder", invalid);
+        }
+    }
+
+    #[test]
+    fn create_draft_argument_contract_is_fail_closed() {
+        for valid in [
+            json!({"body": "Hello", "title": "Greeting", "recipient": "user@example.com"}),
+            json!({"content": "Hello", "subject": "Greeting", "to": "user@example.com"}),
+            json!({"text": "Hello"}),
+        ] {
+            assert_valid_args("create_draft", valid);
+        }
+
+        for invalid in [
+            json!({}),
+            json!({"body": "Hello", "format": "markdown"}),
+            json!({"body": "Hello", "content": "Hello"}),
+            json!({"body": "Hello", "title": "Greeting", "subject": "Greeting"}),
+            json!({"body": "Hello", "recipient": "user@example.com", "to": "user@example.com"}),
+            json!({"body": "Hello", "title": 7}),
+            json!({"body": "Hello", "recipient": null}),
+            json!({"body": "x".repeat(MAX_ACTION_BODY + 1)}),
+        ] {
+            assert_invalid_args("create_draft", invalid);
+        }
+    }
+
+    #[test]
+    fn send_message_argument_contract_is_fail_closed() {
+        for valid in [
+            json!({"body": "Hello", "recipient": "+85255550123"}),
+            json!({"message": "Hello", "email": "user@example.com"}),
+            json!({"text": "Hello", "phone": "+85255550123"}),
+            json!({"body": "Hello", "to": "user@example.com"}),
+        ] {
+            assert_valid_args("send_message", valid);
+        }
+
+        for invalid in [
+            json!({}),
+            json!({"body": "Hello", "recipient": 7}),
+            json!({"body": ["Hello"], "recipient": "user@example.com"}),
+            json!({"body": "Hello", "recipient": "user@example.com", "cc": "other@example.com"}),
+            json!({"body": "Hello", "message": "Hello", "recipient": "user@example.com"}),
+            json!({"body": "Hello", "recipient": "user@example.com", "email": "user@example.com"}),
+        ] {
+            assert_invalid_args("send_message", invalid);
+        }
+    }
+
+    #[test]
+    fn undo_window_boundaries_are_deterministic() {
+        let command = command_row(
+            "create_reminder",
+            "succeeded",
+            Some(json!({"kind": "reminder"})),
         );
-        assert!(validate_action_args(
-            "send_message",
-            &serde_json::from_value(json!({
-                "body": "hello",
-                "recipient": "+85255550123"
-            }))
-            .unwrap()
-        )
-        .is_ok());
+        let completed_at = 1_000_000.0;
+        let last_eligible_millisecond = completed_at + (UNDO_WINDOW_SECONDS * 1_000.0) - 1.0;
+        let expires_at = completed_at + (UNDO_WINDOW_SECONDS * 1_000.0);
+
+        assert!(undo_window_open_at(
+            &command,
+            Some(completed_at),
+            completed_at
+        ));
+        assert!(undo_window_open_at(
+            &command,
+            Some(completed_at),
+            last_eligible_millisecond
+        ));
+        assert!(!undo_window_open_at(
+            &command,
+            Some(completed_at),
+            expires_at
+        ));
+        assert!(!undo_window_open_at(
+            &command,
+            Some(completed_at),
+            completed_at - 1.0
+        ));
+        assert!(!undo_window_open_at(&command, None, completed_at));
+    }
+
+    #[test]
+    fn undo_command_id_is_returned_only_while_eligible() {
+        let completed_at = 1_000_000.0;
+        for (intent, kind) in [("create_reminder", "reminder"), ("create_draft", "draft")] {
+            let command = command_row(intent, "succeeded", Some(json!({"kind": kind})));
+            assert_eq!(
+                response_at(&command, None, Some(completed_at), completed_at + 1.0)
+                    ["undo_command_id"],
+                json!("cmd_test")
+            );
+        }
+
+        for command in [
+            command_row(
+                "search_history",
+                "succeeded",
+                Some(json!({"kind": "history_search"})),
+            ),
+            command_row(
+                "send_message",
+                "succeeded",
+                Some(json!({"kind": "message"})),
+            ),
+            command_row(
+                "create_reminder",
+                "failed",
+                Some(json!({"kind": "reminder"})),
+            ),
+            command_row("create_reminder", "succeeded", None),
+        ] {
+            assert_eq!(
+                response_at(&command, None, Some(completed_at), completed_at + 1.0)
+                    ["undo_command_id"],
+                Value::Null
+            );
+        }
+    }
+
+    #[test]
+    fn completed_undo_is_not_advertised_but_replay_remains_idempotent() {
+        let completed_at = 1_000_000.0;
+        let mut command = command_row("create_draft", "succeeded", Some(json!({"kind": "draft"})));
+        command.result_json = Some(
+            json!({
+                "kind": "draft",
+                "undo": {"kind": "undo", "status": "cancelled"}
+            })
+            .to_string(),
+        );
 
         assert_eq!(
-            validate_action_args(
-                "create_draft",
-                &serde_json::from_value(json!({"body": "x".repeat(MAX_ACTION_BODY + 1)})).unwrap()
-            ),
-            Err(CommandValidationError::InvalidActionArguments)
+            response_at(&command, None, Some(completed_at), completed_at + 1.0)["undo_command_id"],
+            Value::Null
         );
-        assert!(validate_action_args(
-            "create_reminder",
-            &serde_json::from_value(json!({
-                "title": "Pay rent",
-                "due_at": "2099-01-01T09:00:00Z"
-            }))
-            .unwrap()
-        )
-        .is_ok());
+        assert!(undo_request_allowed_at(
+            &command,
+            Some(completed_at),
+            completed_at + (UNDO_WINDOW_SECONDS * 10_000.0)
+        ));
     }
 
     #[test]

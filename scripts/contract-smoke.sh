@@ -142,6 +142,25 @@ jq -e '
   )
 ' <<<"$commands" >/dev/null
 
+cross_user_command_status="$(curl --silent --show-error \
+  -o "${TMP_DIR}/cross-user-command.json" -w '%{http_code}' \
+  "${other_auth[@]}" "$BASE_URL/v1/phone/commands/$command_id")"
+test "$cross_user_command_status" = "404"
+jq -e '.error.code == "not_found"' "${TMP_DIR}/cross-user-command.json" >/dev/null
+cross_user_commands="$(get "${other_auth[@]}" "$BASE_URL/v1/phone/commands?limit=50")"
+test "$(jq -r --arg id "$command_id" '[.commands[] | select(.command_id == $id)] | length' <<<"$cross_user_commands")" = "0"
+
+conflicting_command_id="cmd-conflict-$(date +%s%N)"
+idempotency_conflict_status="$(curl --silent --show-error \
+  -o "${TMP_DIR}/command-idempotency-conflict.json" -w '%{http_code}' \
+  "${user_auth[@]}" -H 'content-type: application/json' \
+  -X POST "$BASE_URL/v1/phone/commands" \
+  -d "$(jq -nc --arg id "$conflicting_command_id" --arg key "$command_key" \
+    '{schema_version:1,command_id:$id,intent:"search_history",args:{q:"different history"},risk_level:"low",needs_confirmation:false,idempotency_key:$key,confidence:0.95,locale:"zh-Hans-HK",timezone:"Asia/Hong_Kong"}')")"
+test "$idempotency_conflict_status" = "409"
+jq -e '.error.code == "conflict" and .error.retryable == false' \
+  "${TMP_DIR}/command-idempotency-conflict.json" >/dev/null
+
 # A lost create response must be recoverable without weakening one-time
 # confirmation. Exact idempotent replay rotates the token; the old token is
 # retained as used for audit and can no longer authorize execution.
@@ -350,4 +369,4 @@ test "$(jq -r '.ok' <<<"$logout")" = "true"
 
 BASE_URL="$BASE_URL" "${ROOT_DIR}/scripts/rate-limit-smoke.sh"
 
-printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/chat/multi-turn/phone/export-pagination/command-pagination/pairing-isolation-and-expiry/push-isolation-and-dismissal/action-descriptors/confirm/claim/result/refresh'
+printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/chat/multi-turn/phone/export-pagination/command-isolation-and-idempotency/command-pagination/pairing-isolation-and-expiry/push-isolation-and-dismissal/action-descriptors/confirm/claim/result/refresh'

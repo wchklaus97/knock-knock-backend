@@ -3,7 +3,8 @@ use serde_json::{json, Map, Value};
 use worker::D1Database;
 
 use crate::action_effects;
-use crate::auth::new_id;
+use crate::apns;
+use crate::auth::{config_value, new_id};
 use crate::commands;
 use crate::db;
 use crate::error::{ApiError, ApiResult};
@@ -33,6 +34,11 @@ struct CommandPayload {
     command_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CommandWakeTokenRow {
+    push_token: Option<String>,
+}
+
 #[derive(Debug)]
 enum ExecutionFailure {
     Permanent(ApiError),
@@ -54,7 +60,7 @@ impl ExecutionFailure {
 pub async fn drain(db: &D1Database, env: &worker::Env) -> ApiResult<usize> {
     let provider_config = providers::load(env)?;
     commands::expire_due(db).await?;
-    recover_stale_claims(db).await?;
+    recover_stale_claims(db, env).await?;
     let now = db::now_iso();
     let rows: Vec<OutboxEventRow> = db::all(
         db,
@@ -71,7 +77,7 @@ pub async fn drain(db: &D1Database, env: &worker::Env) -> ApiResult<usize> {
         if let Some(claimed) = claim(db, &row).await? {
             processed += 1;
             if let Err(error) = process_claimed(db, env, &claimed, provider_config.clone()).await {
-                settle_processing_error(db, &claimed, &error).await?;
+                settle_processing_error(db, env, &claimed, &error).await?;
             }
         }
     }
@@ -82,7 +88,7 @@ pub async fn drain(db: &D1Database, env: &worker::Env) -> ApiResult<usize> {
 /// the command. Move leases older than the bounded execution window to the
 /// explicit unknown/retryable state and increment the command version. The
 /// version fence prevents the old invocation from reporting a late success.
-async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
+async fn recover_stale_claims(db: &D1Database, env: &worker::Env) -> ApiResult<()> {
     let cutoff = db::add_seconds_iso(-LEASE_SECONDS);
     let now = db::now_iso();
     let rows: Vec<OutboxEventRow> = db::all(
@@ -112,6 +118,7 @@ async fn recover_stale_claims(db: &D1Database) -> ApiResult<()> {
         if row.attempts >= MAX_ATTEMPTS {
             finish_failure(
                 db,
+                env,
                 &row,
                 user_id,
                 &command,
@@ -257,7 +264,7 @@ async fn process_claimed(
         match commands::ensure_session_live(db, user_id, session_id).await {
             Ok(()) => {}
             Err(error) if error.status == 404 => {
-                return settle_deleted_command(db, row, user_id, &command).await;
+                return settle_deleted_command(db, env, row, user_id, &command).await;
             }
             Err(error) => return Err(error),
         }
@@ -291,15 +298,27 @@ async fn process_claimed(
         ));
     }
 
+    let args = validated_command_args(&command.intent, &command.args_json)?;
+
     start_command(db, user_id, &command).await?;
     let current = commands::get_for_user(db, user_id, &command.id)
         .await?
         .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;
 
-    match execute_command(env, db, user_id, &current, provider_config).await {
-        Ok(result) => finish_success(db, row, user_id, &current, result).await,
-        Err(failure) => finish_failure(db, row, user_id, &current, failure, "running").await,
+    match execute_command(env, db, user_id, &current, &args, provider_config).await {
+        Ok(result) => finish_success(db, env, row, user_id, &current, result).await,
+        Err(failure) => finish_failure(db, env, row, user_id, &current, failure, "running").await,
     }
+}
+
+fn validated_command_args(intent: &str, args_json: &str) -> ApiResult<Map<String, Value>> {
+    let args = serde_json::from_str::<Value>(args_json)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| ApiError::validation("Persisted command arguments must be an object"))?;
+    commands::validate_action_args(intent, &args)
+        .map_err(|error| ApiError::validation(error.to_string()))?;
+    Ok(args)
 }
 
 async fn start_command(db: &D1Database, user_id: &str, command: &CommandRow) -> ApiResult<()> {
@@ -360,6 +379,7 @@ async fn start_command(db: &D1Database, user_id: &str, command: &CommandRow) -> 
 
 async fn settle_deleted_command(
     db: &D1Database,
+    env: &worker::Env,
     row: &OutboxEventRow,
     user_id: &str,
     command: &CommandRow,
@@ -420,7 +440,16 @@ async fn settle_deleted_command(
             ],
         )?,
     ];
-    db.batch(statements).await?;
+    let results = db.batch(statements).await?;
+    notify_terminal_transition(
+        db,
+        env,
+        user_id,
+        &command.id,
+        "cancelled",
+        results.first().map(db::changes).unwrap_or(0),
+    )
+    .await;
     Ok(())
 }
 
@@ -429,15 +458,12 @@ async fn execute_command(
     db: &D1Database,
     user_id: &str,
     command: &CommandRow,
+    args: &Map<String, Value>,
     provider_config: ActionProviderConfig,
 ) -> Result<Value, ExecutionFailure> {
-    let args = serde_json::from_str::<Value>(&command.args_json)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
     match command.intent.as_str() {
         "search_history" => {
-            let query = string_arg(&args, &["q", "query", "text"]).ok_or_else(|| {
+            let query = string_arg(args, &["q", "query", "text"]).ok_or_else(|| {
                 ExecutionFailure::Permanent(ApiError::validation(
                     "search_history requires args.q or args.query",
                 ))
@@ -448,7 +474,7 @@ async fn execute_command(
                 .map_err(classify_error)
         }
         "create_draft" | "create_reminder" | "send_message" => {
-            action_effects::execute(env, db, user_id, command, &args, provider_config)
+            action_effects::execute(env, db, user_id, command, args, provider_config)
                 .await
                 .map_err(classify_error)
         }
@@ -488,6 +514,7 @@ fn command_failure_state(retryable: bool, automatic_retry: bool) -> &'static str
 
 async fn finish_success(
     db: &D1Database,
+    env: &worker::Env,
     row: &OutboxEventRow,
     user_id: &str,
     command: &CommandRow,
@@ -553,12 +580,22 @@ async fn finish_success(
             ],
         )?,
     ];
-    db.batch(statements).await?;
+    let results = db.batch(statements).await?;
+    notify_terminal_transition(
+        db,
+        env,
+        user_id,
+        &command.id,
+        "succeeded",
+        results.first().map(db::changes).unwrap_or(0),
+    )
+    .await;
     Ok(())
 }
 
 async fn finish_failure(
     db: &D1Database,
+    env: &worker::Env,
     row: &OutboxEventRow,
     user_id: &str,
     command: &CommandRow,
@@ -694,8 +731,81 @@ async fn finish_failure(
             ],
         )?);
     }
-    db.batch(statements).await?;
+    let results = db.batch(statements).await?;
+    notify_terminal_transition(
+        db,
+        env,
+        user_id,
+        &command.id,
+        command_state,
+        results.first().map(db::changes).unwrap_or(0),
+    )
+    .await;
     Ok(())
+}
+
+fn should_attempt_command_wakeup(command_state: &str, transition_changes: usize) -> bool {
+    transition_changes == 1
+        && matches!(
+            command_state,
+            "succeeded" | "failed" | "expired" | "cancelled"
+        )
+}
+
+fn command_wakeup_attempt<T>(
+    command_state: &str,
+    transition_changes: usize,
+    attempt: impl FnOnce() -> T,
+) -> Option<T> {
+    should_attempt_command_wakeup(command_state, transition_changes).then(attempt)
+}
+
+async fn notify_terminal_transition(
+    db: &D1Database,
+    env: &worker::Env,
+    user_id: &str,
+    command_id: &str,
+    command_state: &str,
+    transition_changes: usize,
+) {
+    if let Some(attempt) = command_wakeup_attempt(command_state, transition_changes, || {
+        attempt_command_wakeup(db, env, user_id, command_id)
+    }) {
+        attempt.await;
+    }
+}
+
+fn command_wakeup_token_query() -> &'static str {
+    "SELECT push_token FROM devices WHERE user_id = ? AND platform = 'ios' AND push_token IS NOT NULL AND push_token != ''"
+}
+
+async fn attempt_command_wakeup(
+    db: &D1Database,
+    env: &worker::Env,
+    user_id: &str,
+    command_id: &str,
+) {
+    let push_mode = config_value(env, "PUSH_MODE", "dev");
+    if !matches!(push_mode.as_str(), "apns" | "both") || !apns::is_ready(env) {
+        return;
+    }
+
+    let rows: Vec<CommandWakeTokenRow> =
+        match db::all(db, command_wakeup_token_query(), vec![db::text(user_id)]).await {
+            Ok(rows) => rows,
+            Err(_) => return,
+        };
+    let mut tokens = rows
+        .into_iter()
+        .filter_map(|row| row.push_token)
+        .filter(|token| apns::looks_like_token(token))
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+
+    for token in tokens {
+        let _ = apns::send_command_wakeup(env, &token, command_id).await;
+    }
 }
 
 fn backoff_seconds(attempts: i32) -> i64 {
@@ -753,6 +863,7 @@ async fn release_runtime_error(
 /// forever while its outbox row is repeatedly retried or eventually failed.
 async fn settle_processing_error(
     db: &D1Database,
+    env: &worker::Env,
     row: &OutboxEventRow,
     error: &ApiError,
 ) -> ApiResult<()> {
@@ -768,6 +879,7 @@ async fn settle_processing_error(
     ) {
         return finish_failure(
             db,
+            env,
             row,
             user_id,
             &command,
@@ -801,6 +913,7 @@ async fn settle_orphan(db: &D1Database, row: &OutboxEventRow, reason: &str) -> A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn backoff_is_bounded_and_increases() {
@@ -828,6 +941,49 @@ mod tests {
         assert_eq!(command_failure_state(true, true), "retryable");
         assert_eq!(command_failure_state(true, false), "unknown");
         assert_eq!(command_failure_state(false, false), "failed");
+    }
+
+    #[test]
+    fn terminal_transition_attempts_wakeup_exactly_once() {
+        let attempts = Cell::new(0);
+        for transition_changes in [1, 0] {
+            let _ = command_wakeup_attempt("succeeded", transition_changes, || {
+                attempts.set(attempts.get() + 1);
+            });
+        }
+
+        assert_eq!(attempts.get(), 1);
+        assert!(should_attempt_command_wakeup("failed", 1));
+        assert!(should_attempt_command_wakeup("expired", 1));
+        assert!(should_attempt_command_wakeup("cancelled", 1));
+        assert!(!should_attempt_command_wakeup("retryable", 1));
+        assert!(!should_attempt_command_wakeup("unknown", 1));
+    }
+
+    #[test]
+    fn command_wakeup_tokens_are_scoped_to_the_authenticated_owner() {
+        let query = command_wakeup_token_query();
+
+        assert!(query.contains("WHERE user_id = ?"));
+        assert!(query.contains("platform = 'ios'"));
+    }
+
+    #[test]
+    fn persisted_command_arguments_are_revalidated_before_execution() {
+        let valid = json!({"q": "history"}).to_string();
+        assert_eq!(
+            validated_command_args("search_history", &valid).unwrap(),
+            serde_json::from_value::<Map<String, Value>>(json!({"q": "history"})).unwrap()
+        );
+
+        let unexpected = json!({"q": "history", "unexpected": true}).to_string();
+        let error = validated_command_args("search_history", &unexpected).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert_eq!(error.code, "validation_error");
+
+        let error = validated_command_args("search_history", "[]").unwrap_err();
+        assert_eq!(error.status, 400);
+        assert_eq!(error.code, "validation_error");
     }
 
     #[test]

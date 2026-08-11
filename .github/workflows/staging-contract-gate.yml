@@ -28,7 +28,7 @@ jobs:
       STAGING_R2_BUCKET: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
       STAGING_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_STAGING_SUPABASE_URL }}
       STAGING_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_STAGING_CORS_ORIGIN }}
-      STAGING_RELEASE_VERSION: ${{ vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION }}
+      STAGING_RELEASE_VERSION: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
       - name: Install smoke dependencies
