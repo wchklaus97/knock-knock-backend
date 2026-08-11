@@ -1,0 +1,265 @@
+name: Staging deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      staging_url:
+        description: HTTPS URL of the non-production staging Worker to health-check
+        required: true
+        type: string
+      apply_migrations:
+        description: Apply only migrations 0013 and 0014 through the separately gated staging path
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy staging Worker/D1/R2 (no migrations)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+      url: ${{ inputs.staging_url }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
+      STAGING_D1_DATABASE_ID: ${{ vars.KNOCK_KNOCK_STAGING_D1_DATABASE_ID }}
+      STAGING_R2_BUCKET: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
+      STAGING_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_STAGING_SUPABASE_URL }}
+      STAGING_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_STAGING_CORS_ORIGIN }}
+      STAGING_RELEASE_VERSION: ${{ vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION }}
+      STAGING_URL: ${{ inputs.staging_url }}
+    steps:
+      - name: Check out the requested backend revision
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain for the Worker build
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install pinned worker-build
+        run: cargo install worker-build --version 0.8.3 --locked
+
+      - name: Install pinned Wrangler
+        run: npm install --global wrangler@4.81.1
+
+      - name: Verify staging deployment prerequisites
+        run: ./scripts/ci-prerequisites.sh staging
+
+      - name: Materialize staging-only Wrangler config
+        run: |
+          set -euo pipefail
+          umask 077
+
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required in the staging environment}"
+          : "${CLOUDFLARE_ACCOUNT_ID:?KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID is required in the staging environment}"
+          : "${STAGING_D1_DATABASE_ID:?KNOCK_KNOCK_STAGING_D1_DATABASE_ID is required in the staging environment}"
+          : "${STAGING_R2_BUCKET:?KNOCK_KNOCK_STAGING_R2_BUCKET is required in the staging environment}"
+          : "${STAGING_SUPABASE_URL:?KNOCK_KNOCK_STAGING_SUPABASE_URL is required in the staging environment}"
+          : "${STAGING_CORS_ORIGIN:?KNOCK_KNOCK_STAGING_CORS_ORIGIN is required in the staging environment}"
+          : "${STAGING_RELEASE_VERSION:?KNOCK_KNOCK_STAGING_RELEASE_VERSION is required in the staging environment}"
+
+          reject_production_target() {
+            local label="$1"
+            local value="$2"
+            local normalized
+            normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+            case "$normalized" in
+              *production*|*prod-*|*prod.*|*prod/*|*prod_*|*primary*|live|*live-*|*live.*|*live/*)
+                echo "refusing production-looking ${label}" >&2
+                exit 64
+                ;;
+            esac
+          }
+
+          case "$STAGING_URL" in
+            https://*) ;;
+            *) echo 'staging_url must use HTTPS' >&2; exit 64 ;;
+          esac
+          reject_production_target 'staging URL' "$STAGING_URL"
+          reject_production_target 'staging D1 target' "$STAGING_D1_DATABASE_ID"
+          reject_production_target 'staging R2 target' "$STAGING_R2_BUCKET"
+          reject_production_target 'staging Supabase target' "$STAGING_SUPABASE_URL"
+          reject_production_target 'staging CORS origin' "$STAGING_CORS_ORIGIN"
+
+          config="$RUNNER_TEMP/wrangler.staging.toml"
+          sed \
+            -e "s|REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL|${STAGING_SUPABASE_URL}|g" \
+            -e "s|REPLACE_WITH_STAGING_ALLOWED_ORIGIN|${STAGING_CORS_ORIGIN}|g" \
+            -e "s|REPLACE_WITH_STAGING_RELEASE_VERSION|${STAGING_RELEASE_VERSION}|g" \
+            -e "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|${STAGING_D1_DATABASE_ID}|g" \
+            -e "s|REPLACE_WITH_STAGING_R2_BUCKET_NAME|${STAGING_R2_BUCKET}|g" \
+            wrangler.staging.toml.example > "$config"
+
+          test -s "$config"
+          grep -Fqx 'name = "knock-knock-backend-staging"' "$config"
+          grep -Fqx 'NODE_ENV = "staging"' "$config"
+          grep -Fqx 'PUSH_MODE = "both"' "$config"
+          grep -Fqx 'APNS_PRODUCTION = "false"' "$config"
+          grep -Fqx 'ACTION_PROVIDER_MODE = "disabled"' "$config"
+          grep -Fqx 'ACTION_REMINDER_ENABLED = "false"' "$config"
+          grep -Fqx 'ACTION_MESSAGE_ENABLED = "false"' "$config"
+          grep -Fqx "database_id = \"${STAGING_D1_DATABASE_ID}\"" "$config"
+          grep -Fqx "bucket_name = \"${STAGING_R2_BUCKET}\"" "$config"
+          test "$(grep -Fc '[[d1_databases]]' "$config")" -eq 1
+          test "$(grep -Fc '[[r2_buckets]]' "$config")" -eq 1
+
+          for forbidden_binding in kv_namespaces durable_objects queues services vectorize hyperdrive dispatch_namespaces; do
+            if grep -Fq "[[$forbidden_binding]]" "$config"; then
+              echo "staging config contains an unsupported non-staging binding: $forbidden_binding" >&2
+              exit 64
+            fi
+          done
+
+          if grep -Eq 'wrangler\.production\.toml|--env[[:space:]]+production' "$config"; then
+            echo 'staging config contains a production deployment reference' >&2
+            exit 64
+          fi
+
+          # Only the path is exported; config values and secrets are never printed.
+          echo "STAGING_WRANGLER_CONFIG=$config" >> "$GITHUB_ENV"
+
+      - name: Deploy staging Worker with only staging D1/R2 bindings
+        run: |
+          set -euo pipefail
+          test -n "${STAGING_WRANGLER_CONFIG:-}"
+          test ! -e "$GITHUB_WORKSPACE/wrangler.production.toml"
+          # This job intentionally has no `wrangler d1 migrations apply` path.
+          wrangler deploy --config "$STAGING_WRANGLER_CONFIG"
+
+      - name: Verify deployed staging health contract
+        run: |
+          set -euo pipefail
+          staging_url="${STAGING_URL%/}"
+          health="$(curl --fail-with-body --silent --show-error --max-time 20 "${staging_url}/health")"
+          jq -e '
+            (.ok == true) and
+            (.api == "rust") and
+            (.runtime == "cloudflare-worker") and
+            (.push_mode == "both") and
+            (.apns_ready == true) and
+            (.apns_production == false) and
+            (.action_provider_mode == "disabled") and
+            (.action_provider_ready == false) and
+            (.action_reminder_enabled == false) and
+            (.action_message_enabled == false)
+          ' <<<"$health" >/dev/null
+          echo 'staging health contract passed: Rust Worker, APNs sandbox profile, and disabled action provider'
+
+      - name: Remove materialized staging config
+        if: ${{ always() }}
+        run: rm -f -- "${STAGING_WRANGLER_CONFIG:-}"
+
+  apply-migrations:
+    name: Apply staging expand migrations 0013/0014 (explicit opt-in)
+    needs: deploy
+    if: ${{ inputs.apply_migrations == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Protect this environment with required reviewers. The separate job and
+    # boolean input make remote schema changes an explicit approved path.
+    environment:
+      name: staging
+      url: ${{ inputs.staging_url }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
+      STAGING_D1_DATABASE_ID: ${{ vars.KNOCK_KNOCK_STAGING_D1_DATABASE_ID }}
+      STAGING_R2_BUCKET: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
+      STAGING_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_STAGING_SUPABASE_URL }}
+      STAGING_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_STAGING_CORS_ORIGIN }}
+      STAGING_RELEASE_VERSION: ${{ vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION }}
+    steps:
+      - name: Check out the requested backend revision
+        uses: actions/checkout@v4
+
+      - name: Install pinned Wrangler
+        run: npm install --global wrangler@4.81.1
+
+      - name: Materialize staging config and expand-only migration config
+        run: |
+          set -euo pipefail
+          umask 077
+
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required in the staging environment}"
+          : "${CLOUDFLARE_ACCOUNT_ID:?KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID is required in the staging environment}"
+          : "${STAGING_D1_DATABASE_ID:?KNOCK_KNOCK_STAGING_D1_DATABASE_ID is required in the staging environment}"
+          : "${STAGING_R2_BUCKET:?KNOCK_KNOCK_STAGING_R2_BUCKET is required in the staging environment}"
+          : "${STAGING_SUPABASE_URL:?KNOCK_KNOCK_STAGING_SUPABASE_URL is required in the staging environment}"
+          : "${STAGING_CORS_ORIGIN:?KNOCK_KNOCK_STAGING_CORS_ORIGIN is required in the staging environment}"
+          : "${STAGING_RELEASE_VERSION:?KNOCK_KNOCK_STAGING_RELEASE_VERSION is required in the staging environment}"
+
+          reject_production_target() {
+            local label="$1"
+            local value="$2"
+            local normalized
+            normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+            case "$normalized" in
+              *production*|*prod-*|*prod.*|*prod/*|*prod_*|*primary*|live|*live-*|*live.*|*live/*)
+                echo "refusing production-looking ${label}" >&2
+                exit 64
+                ;;
+            esac
+          }
+
+          reject_production_target 'staging D1 target' "$STAGING_D1_DATABASE_ID"
+          reject_production_target 'staging R2 target' "$STAGING_R2_BUCKET"
+          reject_production_target 'staging Supabase target' "$STAGING_SUPABASE_URL"
+
+          config="$RUNNER_TEMP/wrangler.staging.toml"
+          sed \
+            -e "s|REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL|${STAGING_SUPABASE_URL}|g" \
+            -e "s|REPLACE_WITH_STAGING_ALLOWED_ORIGIN|${STAGING_CORS_ORIGIN}|g" \
+            -e "s|REPLACE_WITH_STAGING_RELEASE_VERSION|${STAGING_RELEASE_VERSION}|g" \
+            -e "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|${STAGING_D1_DATABASE_ID}|g" \
+            -e "s|REPLACE_WITH_STAGING_R2_BUCKET_NAME|${STAGING_R2_BUCKET}|g" \
+            wrangler.staging.toml.example > "$config"
+
+          test -s "$config"
+          grep -Fqx 'name = "knock-knock-backend-staging"' "$config"
+          grep -Fqx 'NODE_ENV = "staging"' "$config"
+          grep -Fqx 'PUSH_MODE = "both"' "$config"
+          grep -Fqx 'APNS_PRODUCTION = "false"' "$config"
+          grep -Fqx 'ACTION_PROVIDER_MODE = "disabled"' "$config"
+          grep -Fqx 'ACTION_REMINDER_ENABLED = "false"' "$config"
+          grep -Fqx 'ACTION_MESSAGE_ENABLED = "false"' "$config"
+          grep -Fqx "database_id = \"${STAGING_D1_DATABASE_ID}\"" "$config"
+          grep -Fqx "bucket_name = \"${STAGING_R2_BUCKET}\"" "$config"
+          test "$(grep -Fc '[[d1_databases]]' "$config")" -eq 1
+          test "$(grep -Fc '[[r2_buckets]]' "$config")" -eq 1
+
+          migration_dir="$RUNNER_TEMP/staging-expand-migrations"
+          mkdir -m 700 "$migration_dir"
+          cp -- migrations/0013_retrieval_retention_status.sql "$migration_dir/"
+          cp -- migrations/0014_command_safety.sql "$migration_dir/"
+          test -f "$migration_dir/0013_retrieval_retention_status.sql"
+          test -f "$migration_dir/0014_command_safety.sql"
+          test "$(find "$migration_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 2
+
+          migration_config="$RUNNER_TEMP/wrangler.staging-migrations.toml"
+          sed \
+            -e "s|migrations_dir = \"migrations\"|migrations_dir = \"${migration_dir}\"|" \
+            "$config" > "$migration_config"
+          grep -Fqx "migrations_dir = \"${migration_dir}\"" "$migration_config"
+          echo "STAGING_MIGRATION_CONFIG=$migration_config" >> "$GITHUB_ENV"
+
+      - name: Apply only migrations 0013 and 0014 to staging D1
+        run: |
+          set -euo pipefail
+          test -n "${STAGING_MIGRATION_CONFIG:-}"
+          # The temporary migration directory contains exactly the documented
+          # expand pair; no earlier, later, or production config is available.
+          test "$(grep -Fc "migrations_dir = \"${RUNNER_TEMP}/staging-expand-migrations\"" "$STAGING_MIGRATION_CONFIG")" -eq 1
+          wrangler d1 migrations apply DB --remote --config "$STAGING_MIGRATION_CONFIG"
+
+      - name: Remove materialized staging migration config
+        if: ${{ always() }}
+        run: |
+          rm -f -- "${STAGING_MIGRATION_CONFIG:-}" "${RUNNER_TEMP}/wrangler.staging.toml"
+          rm -f -- "${RUNNER_TEMP}/staging-expand-migrations/0013_retrieval_retention_status.sql" "${RUNNER_TEMP}/staging-expand-migrations/0014_command_safety.sql"
+          rmdir -- "${RUNNER_TEMP}/staging-expand-migrations" 2>/dev/null || true
