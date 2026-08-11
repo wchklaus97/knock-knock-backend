@@ -8,10 +8,10 @@ APNs rollout, provider rollout, or model rollout was performed
 
 ## Completion branches
 
-| Repository | Branch | Base commit | Base state |
+| Repository | Branch | Base commit | Draft PR |
 |---|---|---|---|
-| iOS | `agent/voice-workflow-completion-ios-20260811` | `931c6bf54a328d067759daf1b243e75ae28bddcc` | merged frontend PR #14 `main` |
-| Backend | `agent/voice-workflow-completion-backend-20260811` | `c83b04d6f71dbb0749f8dbaff641509b0d242f08` | merged backend PR #27 `main` |
+| iOS | `agent/voice-workflow-completion-ios-20260811` | `931c6bf54a328d067759daf1b243e75ae28bddcc` | [frontend #16](https://github.com/wchklaus97/knock-knock-frontend/pull/16) |
+| Backend | `agent/voice-workflow-completion-backend-20260811` | `c83b04d6f71dbb0749f8dbaff641509b0d242f08` | [backend #28](https://github.com/wchklaus97/knock-knock-backend/pull/28) |
 
 Both worktrees were fetched immediately before handoff and matched
 `origin/main`. The changes remain unmerged until paired draft PR review.
