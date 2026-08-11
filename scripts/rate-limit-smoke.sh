@@ -48,6 +48,6 @@ jq -e '
   (.error.retry_after == 60) and
   (.error.request_id | type == "string" and length > 0)
 ' <<<"${limited_body}" >/dev/null
-grep -Eq '^Retry-After:[[:space:]]*60' <<<"${limited_headers}"
+grep -Eiq '^Retry-After:[[:space:]]*60' <<<"${limited_headers}"
 
 echo "rate-limit smoke passed: unauthenticated pairing bucket returns a structured 429 with retry metadata and request correlation"
