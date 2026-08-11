@@ -1,6 +1,6 @@
 # Knock Knock Staging Verification
 
-**Last verified:** 2026-08-11 (Asia/Hong_Kong)
+**Last verified:** 2026-08-12 (Asia/Hong_Kong)
 
 **Scope:** Remote staging Worker/D1/R2 deployment for the Phase 4/5 completion
 branch. This document records staging evidence only; it is not production
@@ -41,6 +41,15 @@ rollout remains deferred.
   `apns_ready=true`, and `apns_production=false`, with the action provider
   disabled and no external action readiness.
 - `/metrics` returned the API, provider-readiness, and APNs-readiness gauges.
+- On 2026-08-12, `/metrics` also reported
+  `knock_knock_model_enabled 0`, matching the intentionally disabled staging
+  model rollout.
+- A read-only D1 aggregate found two distinct physical iOS devices with valid
+  64-hex APNs registrations under one user. The oldest and newest registration
+  timestamps were `2026-08-11T18:44:18.224Z` and
+  `2026-08-11T18:45:00.469Z`. No token or identity value was read or printed.
+  This confirms registration/account grouping only; it does not prove APNs
+  delivery, offline recovery, or two-device UI convergence.
 - Remote D1 schema was queried after migration verification; all foundation,
   command, history, retrieval, outbox, rate-limit, and vertical-action tables
   were present.
@@ -58,6 +67,10 @@ rollout remains deferred.
 - iOS `Staging` configuration was added and built successfully for the iOS
   Simulator. It uses the staging HTTPS Worker URL and the development APNs
   entitlement.
+- The exact iOS implementation head `94669e9e` was built and signed with the
+  Staging endpoint, installed, and launched on both the iPhone 13 Pro and
+  iPhone 17 Pro Max. Its full test target passed 126/127 on each phone, with
+  only the intentionally unavailable signed-real-model evaluation skipped.
 - After reclaiming simulator disk space and erasing the affected simulator,
   the iOS regression suite passed with 37 unit tests and 3 UI tests. That
   regression used the local Worker fixture, so it proves the app shell and
@@ -84,11 +97,12 @@ values were not printed or copied into the repository.
 
 1. Review and merge the paired voice-workflow PRs. The changes documented in
    `VOICE_MODEL_RELEASE_RUNBOOK.md` are not deployed by the evidence above.
-2. Build/install that exact iOS `Staging` revision on the connected iPhone 13
-   and verify real microphone/VAD interruptions, cold-launch command recovery,
-   memory, thermal state, and crash count.
-3. When both phones are available, verify same-account cursor, tombstone, and
-   command convergence on two physical devices.
+2. Supply the approved signed model, then verify real microphone/VAD
+   interruptions, cold-launch command recovery, memory, thermal state, and
+   crash count on both phone classes.
+3. Use the two registered same-account phones to verify cursor, tombstone, and
+   command UI convergence while both devices are active; the registration
+   aggregate above is only a prerequisite.
 4. Run the separate APNs sandbox delivery gate with a real device token. Simulator
    notification banners do not count as APNs evidence.
 5. Keep `ACTION_PROVIDER_MODE=disabled` until a selected provider passes its
