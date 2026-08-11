@@ -1,6 +1,6 @@
 # Knock Knock Staging Verification
 
-**Date:** 2026-08-10 (Asia/Hong_Kong)
+**Last verified:** 2026-08-11 (Asia/Hong_Kong)
 
 **Scope:** Remote staging Worker/D1/R2 deployment for the Phase 4/5 completion
 branch. This document records staging evidence only; it is not production
@@ -9,7 +9,7 @@ approval.
 ## Deployed environment
 
 - Worker: `https://knock-knock-backend-staging.wch-klaus.workers.dev`
-- Backend commit: `020d354` (`feat(backend): enforce registry command policy`)
+- Backend commit: `c83b04d` (merged PR #27)
 - Supabase: dedicated `knock-knock-staging` project
 - D1: dedicated `knock-knock-staging` database
 - R2: dedicated private `knock-knock-staging` bucket
@@ -30,7 +30,13 @@ rollout remains deferred.
 
 ## Evidence completed
 
-- Worker deployment succeeded with the current backend bundle.
+- The protected GitHub **Staging deploy** workflow succeeded for `c83b04d`
+  without applying migrations: [run 31496029273](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31496029273).
+- The protected GitHub **Staging contract gate** succeeded for the same commit:
+  [run 31496803603](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31496803603).
+- Twenty consecutive read-only `/health` probes passed on 2026-08-11 with
+  Rust Worker, APNs sandbox signing ready, production APNs disabled, and the
+  external action provider disabled.
 - The current staging `/health` profile is `push_mode=both`,
   `apns_ready=true`, and `apns_production=false`, with the action provider
   disabled and no external action readiness.
@@ -70,28 +76,23 @@ after the staging-only Email auth configuration was corrected:
 - Remote R2: stream, metadata, user namespace, cross-user isolation, shared-key
   retention, and object deletion
 
-The gate was run locally with the authenticated Wrangler OAuth session for the
-remote D1/R2 smoke. It is not yet a GitHub Actions result because the workflow
-requires a non-interactive Cloudflare API token.
-
-The GitHub environment now contains the staging UAT email/password secrets.
-It still needs one secret before the manual workflow can run:
-
-- `CLOUDFLARE_API_TOKEN` — a least-privilege non-interactive Cloudflare token
-
-The local Wrangler OAuth session was used only for the manual deployment and
-was not copied into GitHub Actions.
+The staging GitHub environment now has the scoped non-interactive Cloudflare
+credential and UAT credentials needed by these protected workflows. Secret
+values were not printed or copied into the repository.
 
 ## Next controlled steps
 
-1. Add a least-privilege `CLOUDFLARE_API_TOKEN` to the GitHub `staging`
-   environment; do not reuse the local Wrangler OAuth session.
-2. Run the `Staging contract gate` workflow with the Worker URL.
-3. Build/install the iOS `Staging` configuration on a physical iPhone and
-   verify login, pairing, inbox refresh, SSE recovery, offline queue recovery,
-   and a second device's cursor convergence.
-4. Run the separate APNs sandbox gate with a real device token. Simulator
+1. Review and merge the paired voice-workflow PRs. The changes documented in
+   `VOICE_MODEL_RELEASE_RUNBOOK.md` are not deployed by the evidence above.
+2. Build/install that exact iOS `Staging` revision on the connected iPhone 13
+   and verify real microphone/VAD interruptions, cold-launch command recovery,
+   memory, thermal state, and crash count.
+3. When both phones are available, verify same-account cursor, tombstone, and
+   command convergence on two physical devices.
+4. Run the separate APNs sandbox delivery gate with a real device token. Simulator
    notification banners do not count as APNs evidence.
+5. Keep `ACTION_PROVIDER_MODE=disabled` until a selected provider passes its
+   sandbox contract; `action_provider_ready=false` is expected in staging.
 
 ## Rollback
 
@@ -100,12 +101,13 @@ the previous Cloudflare Worker version; do not delete the staging D1/R2
 resources. The applied migrations are additive and must be rolled back only
 through an approved migration plan.
 
-## Manual staging deployment workflow (prepared, not executed)
+## Protected staging deployment workflow
 
 `.github/workflows/staging-deploy.yml` is a `workflow_dispatch`-only release
-entry point. The workflow itself has not been executed from this branch: this
-PR ran no workflow dispatch, Worker deployment, remote migration, or staging
-contract gate, and changed no Cloudflare state.
+entry point. It was executed successfully for `c83b04d` with
+`apply_migrations=false`; the separate migration job was skipped. This local
+voice completion worktree has not dispatched a workflow, deployed a Worker,
+changed a secret, or applied a remote migration.
 
 Before using it, keep the existing `staging` GitHub environment protected with
 required reviewers and provision only its staging-scoped values: the

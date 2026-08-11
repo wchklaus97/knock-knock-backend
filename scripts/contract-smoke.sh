@@ -125,10 +125,50 @@ test -n "$command_id" && test "$command_id" != "null"
 test "$(jq -r '.state' <<<"$command")" = "queued"
 command_detail="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands/$command_id")"
 jq -e --arg command_id "$command_id" \
-  '(.command_id == $command_id) and (.state == "queued") and (.version | type == "number")' \
+  '(.command_id == $command_id) and (.state == "queued") and (.version | type == "number") and
+   (.presentation.schema_version == 1) and (.presentation.display_text | type == "string")' \
   <<<"$command_detail" >/dev/null
+command_headers="$(curl --fail-with-body --silent --show-error \
+  "${user_auth[@]}" -D - -o /dev/null "$BASE_URL/v1/phone/commands/$command_id")"
+grep -qi '^cache-control: private, no-store' <<<"$command_headers"
 commands="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands?state=queued&limit=50")"
 test "$(jq -r --arg id "$command_id" '[.commands[] | select(.command_id == $id)] | length' <<<"$commands")" = "1"
+jq -e '
+  all(.commands[];
+    (.presentation.schema_version == 1) and
+    (has("result") | not) and
+    (has("error") | not) and
+    (has("command") | not)
+  )
+' <<<"$commands" >/dev/null
+
+# A lost create response must be recoverable without weakening one-time
+# confirmation. Exact idempotent replay rotates the token; the old token is
+# retained as used for audit and can no longer authorize execution.
+confirmation_key="command-confirmation-replay-$(date +%s%N)"
+confirmation_id="cmd-confirmation-replay-$(date +%s%N)"
+confirmation_body="$(jq -nc --arg id "$confirmation_id" --arg key "$confirmation_key" \
+  '{schema_version:1,command_id:$id,intent:"send_message",args:{recipient:"contract-recipient",body:"private contract message"},risk_level:"low",needs_confirmation:false,idempotency_key:$key,confidence:0.99,locale:"en-HK",timezone:"Asia/Hong_Kong"}')"
+confirmation_first="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/commands" \
+  -d "$confirmation_body")"
+test "$(jq -r '.state' <<<"$confirmation_first")" = "awaiting_confirmation"
+confirmation_token_one="$(jq -r '.confirmation_token' <<<"$confirmation_first")"
+test -n "$confirmation_token_one" && test "$confirmation_token_one" != "null"
+confirmation_replay="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/commands" \
+  -d "$confirmation_body")"
+test "$(jq -r '.command_id' <<<"$confirmation_replay")" = "$confirmation_id"
+confirmation_token_two="$(jq -r '.confirmation_token' <<<"$confirmation_replay")"
+test -n "$confirmation_token_two" && test "$confirmation_token_two" != "null"
+test "$confirmation_token_one" != "$confirmation_token_two"
+stale_confirmation_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
+  "${user_auth[@]}" -H 'content-type: application/json' \
+  -X POST "$BASE_URL/v1/phone/commands/$confirmation_id/confirm" \
+  -d "$(jq -nc --arg token "$confirmation_token_one" '{confirmation_token:$token}')")"
+test "$stale_confirmation_status" = "409"
+confirmation_result="$(json "${user_auth[@]}" \
+  -X POST "$BASE_URL/v1/phone/commands/$confirmation_id/confirm" \
+  -d "$(jq -nc --arg token "$confirmation_token_two" '{confirmation_token:$token}')")"
+test "$(jq -r '.state' <<<"$confirmation_result")" = "queued"
 
 command_two="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/commands" \
   -d "$(jq -nc --arg key "command-smoke-two-$(date +%s%N)" \

@@ -475,6 +475,127 @@ fn error_value(row: &CommandRow) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Build the only command text intended for direct UI/TTS presentation.
+/// It deliberately never interpolates command arguments, search results,
+/// recipients, message bodies, provider IDs, URLs, or raw provider errors.
+fn presentation_value(row: &CommandRow) -> Value {
+    let result = result_value(row);
+    let result_object = result.as_object();
+    let was_undone = result_object.is_some_and(|value| value.contains_key("undo"));
+    let result_kind = result_object
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str);
+    let external_delivery = result_object
+        .and_then(|value| value.get("external_delivery"))
+        .and_then(Value::as_str);
+    let delivery_state = result_object
+        .and_then(|value| value.get("delivery_state"))
+        .and_then(Value::as_str);
+
+    let (code, display_text, voice_script, terminal) = match row.state.as_str() {
+        "pending" | "validated" | "queued" => {
+            ("command.queued", "The command is queued.", None, false)
+        }
+        "awaiting_confirmation" => (
+            "command.awaiting_confirmation",
+            "Confirmation is required before this action can run.",
+            Some("Please confirm this action in Knock Knock."),
+            false,
+        ),
+        "running" => ("command.running", "The command is running.", None, false),
+        "retryable" => (
+            "command.retryable",
+            "The backend will retry this command.",
+            None,
+            false,
+        ),
+        "unknown" => (
+            "command.unknown",
+            "Completion could not be verified. Check status before trying again.",
+            None,
+            false,
+        ),
+        "succeeded" if was_undone => (
+            "command.undone",
+            "The action was undone.",
+            Some("The action was undone."),
+            true,
+        ),
+        "succeeded" => match (row.intent.as_str(), result_kind) {
+            ("search_history", Some("history_search")) => (
+                "history_search.completed",
+                "History search completed. Review the results on screen.",
+                Some("History search completed."),
+                true,
+            ),
+            ("create_reminder", Some("reminder")) => (
+                "reminder.created",
+                "Reminder created.",
+                Some("Reminder created."),
+                true,
+            ),
+            ("create_draft", Some("draft")) => {
+                ("draft.saved", "Draft saved.", Some("Draft saved."), true)
+            }
+            ("send_message", Some("message"))
+                if external_delivery == Some("sent") && delivery_state == Some("sent") =>
+            {
+                (
+                    "send_message.sent",
+                    "Message sent.",
+                    Some("Message sent."),
+                    true,
+                )
+            }
+            ("send_message", Some("message")) => (
+                "send_message.queued_locally",
+                "Message saved to the local outbox; external delivery is not confirmed.",
+                Some("Message queued locally."),
+                true,
+            ),
+            _ => (
+                "command.succeeded",
+                "The command completed.",
+                Some("The command completed."),
+                true,
+            ),
+        },
+        "failed" => (
+            "command.failed",
+            "The backend could not complete this command.",
+            Some("The command failed."),
+            true,
+        ),
+        "expired" => (
+            "command.expired",
+            "The command expired before it could complete.",
+            Some("The command expired."),
+            true,
+        ),
+        "cancelled" => (
+            "command.cancelled",
+            "The command was cancelled.",
+            Some("The command was cancelled."),
+            true,
+        ),
+        _ => (
+            "command.reconciling",
+            "The command is being reconciled with the backend.",
+            None,
+            false,
+        ),
+    };
+
+    json!({
+        "schema_version": 1,
+        "code": code,
+        "locale": "en",
+        "display_text": display_text,
+        "voice_script": voice_script,
+        "terminal": terminal,
+    })
+}
+
 /// A command list is intentionally a summary. In particular, it never emits
 /// the one-time confirmation token and does not repeat the full argument
 /// object for every row.
@@ -486,8 +607,7 @@ pub fn summary(row: &CommandRow) -> Value {
         "risk_level": row.risk_level,
         "needs_confirmation": row.needs_confirmation != 0,
         "state": row.state,
-        "result": result_value(row),
-        "error": error_value(row),
+        "presentation": presentation_value(row),
         "expires_at": row.expires_at,
         "version": row.version,
         "created_at": row.created_at,
@@ -582,6 +702,7 @@ pub fn response(row: &CommandRow, confirmation_token: Option<&str>) -> Value {
         "state": row.state,
         "command": envelope_from_row(row),
         "action": action_metadata(&row.intent),
+        "presentation": presentation_value(row),
         "confirmation_token": confirmation_token,
         "result": result_value(row),
         "error": error_value(row),
@@ -782,6 +903,86 @@ pub async fn expire_due(db: &D1Database) -> ApiResult<usize> {
     Ok(expired)
 }
 
+fn confirmation_replay_eligible_at(command: &CommandRow, now: &str) -> bool {
+    command.state == "awaiting_confirmation"
+        && command.needs_confirmation == 1
+        && command
+            .expires_at
+            .as_deref()
+            .is_some_and(|expires_at| expires_at > now)
+}
+
+fn confirmation_replay_invalidation_sql() -> &'static str {
+    "UPDATE confirmation_tokens SET used_at = ? WHERE command_id = ? AND user_id = ? AND used_at IS NULL AND EXISTS (SELECT 1 FROM commands AS replay_command WHERE replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > ? AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)))"
+}
+
+fn confirmation_replay_insert_sql() -> &'static str {
+    "INSERT INTO confirmation_tokens (id, command_id, user_id, token_hash, command_hash, expires_at, created_at) SELECT ?, replay_command.id, replay_command.user_id, ?, replay_command.command_hash, MIN(replay_command.expires_at, ?), ? FROM commands AS replay_command WHERE replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > ? AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM confirmation_tokens WHERE confirmation_tokens.command_id = replay_command.id AND confirmation_tokens.user_id = replay_command.user_id AND confirmation_tokens.used_at IS NULL)"
+}
+
+/// Rotate the write-only confirmation authority for an exact idempotent replay.
+/// D1 marks every previous token used and inserts the replacement sequentially
+/// in one batch transaction, preserving an audit trail while the partial unique
+/// index permits at most one unused token for the command.
+async fn reissue_confirmation_token_for_replay(
+    db: &D1Database,
+    user_id: &str,
+    idempotency_key: &str,
+    command_hash: &str,
+    command: &CommandRow,
+) -> ApiResult<Option<String>> {
+    let now = db::now_iso();
+    if command.user_id != user_id
+        || command.idempotency_key != idempotency_key
+        || command.command_hash != command_hash
+        || !confirmation_replay_eligible_at(command, &now)
+    {
+        return Ok(None);
+    }
+
+    let token = new_id("ctok")?;
+    let token_hash = sha256_hex(&token);
+    let token_id = new_id("cont")?;
+    let token_expires_at = db::add_seconds_iso(CONFIRMATION_TTL_SECONDS);
+    let results = db
+        .batch(vec![
+            db::prepare(
+                db,
+                confirmation_replay_invalidation_sql(),
+                vec![
+                    db::text(&now),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::text(idempotency_key),
+                    db::text(command_hash),
+                    db::number(command.version),
+                    db::text(&now),
+                ],
+            )?,
+            db::prepare(
+                db,
+                confirmation_replay_insert_sql(),
+                vec![
+                    db::text(&token_id),
+                    db::text(&token_hash),
+                    db::text(&token_expires_at),
+                    db::text(&now),
+                    db::text(&command.id),
+                    db::text(user_id),
+                    db::text(idempotency_key),
+                    db::text(command_hash),
+                    db::number(command.version),
+                    db::text(&now),
+                ],
+            )?,
+        ])
+        .await?;
+
+    Ok((results.get(1).map(db::changes).unwrap_or(0) == 1).then_some(token))
+}
+
 pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -> ApiResult<Value> {
     if user_id.trim().is_empty() {
         return Err(ApiError::unauthorized("Authenticated user is required"));
@@ -808,7 +1009,15 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
                 "idempotency_key was already used for a different command",
             ));
         }
-        return Ok(response(&existing, None));
+        let token = reissue_confirmation_token_for_replay(
+            db,
+            user_id,
+            &envelope.idempotency_key,
+            &command_hash,
+            &existing,
+        )
+        .await?;
+        return Ok(response(&existing, token.as_deref()));
     }
 
     validate_action_args(&envelope.intent, &envelope.args).map_err(validation_error)?;
@@ -940,7 +1149,15 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
         .await?
         {
             if existing.command_hash == command_hash {
-                return Ok(response(&existing, None));
+                let token = reissue_confirmation_token_for_replay(
+                    db,
+                    user_id,
+                    &envelope.idempotency_key,
+                    &command_hash,
+                    &existing,
+                )
+                .await?;
+                return Ok(response(&existing, token.as_deref()));
             }
         }
         return Err(error.into());
@@ -1240,6 +1457,175 @@ mod tests {
             device_id: None,
             session_id: None,
             model_version: Some("test".to_string()),
+        }
+    }
+
+    fn command_row(intent: &str, state: &str, result: Option<Value>) -> CommandRow {
+        CommandRow {
+            id: "cmd_test".to_string(),
+            user_id: "usr_test".to_string(),
+            device_id: Some("dev_test".to_string()),
+            session_id: None,
+            schema_version: 1,
+            intent: intent.to_string(),
+            args_json: json!({
+                "body": "private body",
+                "recipient": "private recipient",
+                "q": "private query"
+            })
+            .to_string(),
+            risk_level: "low".to_string(),
+            needs_confirmation: 0,
+            idempotency_key: "idem_test".to_string(),
+            confidence: Some(0.99),
+            locale: "en-HK".to_string(),
+            timezone: "Asia/Hong_Kong".to_string(),
+            state: state.to_string(),
+            command_hash: "hash".to_string(),
+            result_json: result.map(|value| value.to_string()),
+            error_code: None,
+            expires_at: None,
+            model_version: Some("1.0.0".to_string()),
+            version: 7,
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+            updated_at: "2026-08-11T00:00:01Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn presentation_never_interpolates_sensitive_command_or_result_text() {
+        let mut row = command_row(
+            "search_history",
+            "succeeded",
+            Some(json!({
+                "kind": "history_search",
+                "data": {
+                    "query": "private query",
+                    "items": [{"content": "private result"}],
+                }
+            })),
+        );
+        row.locale = "zh-Hans-HK".to_string();
+        let presentation = presentation_value(&row);
+        let rendered = presentation.to_string();
+        assert_eq!(presentation["locale"], json!("en"));
+        assert!(rendered.contains("history_search.completed"));
+        assert!(!rendered.contains("private query"));
+        assert!(!rendered.contains("private result"));
+        assert!(!rendered.contains("private recipient"));
+    }
+
+    #[test]
+    fn command_summary_excludes_raw_result_and_error_text() {
+        let mut row = command_row(
+            "search_history",
+            "failed",
+            Some(json!({
+                "items": [{
+                    "content": "private result text",
+                    "url": "https://private.example/message"
+                }]
+            })),
+        );
+        row.error_code = Some("private provider error text".to_string());
+
+        let value = summary(&row);
+        let serialized = value.to_string();
+        assert!(value.get("presentation").is_some());
+        assert!(value.get("result").is_none());
+        assert!(value.get("error").is_none());
+        assert!(!serialized.contains("private result text"));
+        assert!(!serialized.contains("https://private.example/message"));
+        assert!(!serialized.contains("private provider error text"));
+    }
+
+    #[test]
+    fn message_presentation_distinguishes_external_delivery_from_local_queue() {
+        let delivered = command_row(
+            "send_message",
+            "succeeded",
+            Some(json!({
+                "kind": "message",
+                "delivery_state": "sent",
+                "external_delivery": "sent",
+            })),
+        );
+        let local = command_row(
+            "send_message",
+            "succeeded",
+            Some(json!({
+                "kind": "message",
+                "delivery_state": "sent",
+                "external_delivery": "not_configured",
+            })),
+        );
+
+        assert_eq!(
+            presentation_value(&delivered)["code"],
+            json!("send_message.sent")
+        );
+        assert_eq!(
+            presentation_value(&local)["code"],
+            json!("send_message.queued_locally")
+        );
+        assert_eq!(presentation_value(&local)["terminal"], json!(true));
+    }
+
+    #[test]
+    fn confirmation_replay_requires_live_confirmation_state_and_expiry() {
+        let now = "2026-08-11T00:00:00.000Z";
+        let mut command = command_row("send_message", "awaiting_confirmation", None);
+        command.needs_confirmation = 1;
+        command.expires_at = Some("2026-08-11T00:01:00.000Z".to_string());
+        assert!(confirmation_replay_eligible_at(&command, now));
+
+        for state in ["queued", "succeeded", "failed", "expired", "cancelled"] {
+            command.state = state.to_string();
+            assert!(!confirmation_replay_eligible_at(&command, now));
+        }
+
+        command.state = "awaiting_confirmation".to_string();
+        command.needs_confirmation = 0;
+        assert!(!confirmation_replay_eligible_at(&command, now));
+
+        command.needs_confirmation = 1;
+        command.expires_at = Some(now.to_string());
+        assert!(!confirmation_replay_eligible_at(&command, now));
+        command.expires_at = None;
+        assert!(!confirmation_replay_eligible_at(&command, now));
+    }
+
+    #[test]
+    fn confirmation_replay_sql_revokes_then_rebinds_with_command_guards() {
+        let invalidation = confirmation_replay_invalidation_sql();
+        let insert = confirmation_replay_insert_sql();
+
+        assert!(invalidation.starts_with("UPDATE confirmation_tokens SET used_at = ?"));
+        assert!(invalidation.contains("command_id = ? AND user_id = ? AND used_at IS NULL"));
+        assert!(insert.starts_with("INSERT INTO confirmation_tokens"));
+        assert!(insert.contains(
+            "SELECT ?, replay_command.id, replay_command.user_id, ?, replay_command.command_hash"
+        ));
+        assert!(insert.contains("MIN(replay_command.expires_at, ?)"));
+        assert!(insert.contains("NOT EXISTS (SELECT 1 FROM confirmation_tokens"));
+
+        for guard in [
+            "replay_command.user_id = ?",
+            "replay_command.idempotency_key = ?",
+            "replay_command.command_hash = ?",
+            "replay_command.version = ?",
+            "replay_command.state = 'awaiting_confirmation'",
+            "replay_command.needs_confirmation = 1",
+            "replay_command.expires_at IS NOT NULL",
+            "replay_command.expires_at > ?",
+            "sessions.user_id = replay_command.user_id",
+            "sessions.deleted_at IS NULL",
+        ] {
+            assert!(
+                invalidation.contains(guard),
+                "missing invalidation guard: {guard}"
+            );
+            assert!(insert.contains(guard), "missing insert guard: {guard}");
         }
     }
 
