@@ -168,6 +168,8 @@ fi
 BASE_URL="http://127.0.0.1:${WORKER_PORT}" \
 PROVIDER_RECONCILE_WAIT_SECONDS="${PROVIDER_RECONCILE_WAIT_SECONDS:-6}" \
 PROVIDER_LOG="${TMP_DIR}/provider.log" \
+PROVIDER_PERSIST_TO="${PERSIST_TO}" \
+PROVIDER_ENV_FILE="${TMP_DIR}/provider.env" \
 SMOKE_EMAIL="${SMOKE_EMAIL:-provider-local-$(date +%s)-$$@local.test}" \
   "${ROOT_DIR}/scripts/provider-lifecycle-smoke.sh" || fail "provider lifecycle smoke failed"
 

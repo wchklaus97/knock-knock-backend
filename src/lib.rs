@@ -104,6 +104,7 @@ pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: Schedu
         return;
     }
     if let Ok(db) = env.d1("DB") {
+        let _ = action_effects::reconcile_succeeded_cancellations(&db).await;
         let _ = outbox::drain(&db, &env).await;
         if let Ok(provider_config) = providers::load(&env) {
             let _ =
