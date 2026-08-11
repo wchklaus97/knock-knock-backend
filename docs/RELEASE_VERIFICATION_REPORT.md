@@ -31,8 +31,8 @@ Both worktrees were fetched immediately before handoff and matched
 | 9. Independent backend validation | Auth, ownership, registry risk, confirmation, idempotency, and strict per-intent arguments are enforced at intake and revalidated before execution; cross-user reads and conflicting idempotency are route-smoked. | Proven by tests/local contract |
 | 10. Read-only action | `search_history` is owner-scoped and executes without external side effects. | Proven locally; real voice entry open |
 | 11. Reversible action/Undo | Reminder/draft Undo is authorized, idempotent, provider-fenced, advertised only while eligible, and limited to 600 seconds. | Proven locally; production provider semantics open |
-| 12. One-time high-risk confirmation | Backend forces `send_message` to high risk, stores a token hash, rotates exact replay, and atomically consumes once. | Proven by tests/local contract |
-| 13. REST/SSE/APNs result path | REST/SSE reconciliation exists; terminal command transitions now send a privacy-safe best-effort APNs wake hint, and iOS background delivery triggers REST refresh exactly once. | Implemented/tested; real APNs delivery open |
+| 12. One-time high-risk confirmation | Backend forces `send_message` to high risk, stores a token hash, increments command version while rotating exact replay, suppresses raced stale tokens, and atomically consumes once. | Proven by tests/local contract |
+| 13. REST/SSE/APNs result path | REST/SSE reconciliation exists; supported Outbox terminal outcomes send a data-free best-effort APNs wake hint, and iOS cold-launch background delivery triggers REST refresh exactly once. Direct cancel/expiry still converge through sync/resume. | Implemented/tested; real APNs delivery open |
 | 14. Backend-owned UI/TTS | iOS accepts only validated backend presentation and speaks backend `voice_script` once per version. | Proven by tests; audible real-device UAT open |
 | 15. Raw-audio privacy | Audio buffers feed only on-device Speech and scalar RMS; no app upload or recording persistence API exists. | Source/test evidence; packet/filesystem UAT open |
 
@@ -88,7 +88,10 @@ Both worktrees were fetched immediately before handoff and matched
 - [x] Confirmation tokens are checkpointed before UI consumption.
 - [x] If an awaiting-confirmation response is lost, an exact idempotent replay
   atomically invalidates the previous one-time token and returns a fresh token
-  only after ownership, command hash, state, version, and expiry checks.
+  only after ownership, command hash, state, version, and expiry checks. Token
+  rotation increments command version, and a response never returns a token
+  made stale by a competing rotation. iOS also discards its older authority
+  when it observes a newer awaiting-confirmation version without a token.
 
 ### Backend contract and privacy
 
@@ -99,10 +102,16 @@ Both worktrees were fetched immediately before handoff and matched
 - [x] All four release intents use strict backend argument schemas that reject
   unknown keys, duplicate aliases, non-string values, missing fields, and
   unregistered intents.
+- [x] Direct History search and `search_history` command arguments share the
+  same trimmed 1–200-character contract across OpenAPI, Rust, and iOS.
 - [x] Reversible success responses expose `undo_command_id` only inside a
   600-second window; replay after a completed Undo remains idempotent.
-- [x] Terminal command transitions emit a best-effort silent APNs wake hint
-  containing only the opaque `command_id`; REST remains authoritative.
+- [x] Supported Outbox success/failure/deleted-session terminal outcomes emit
+  a best-effort silent APNs wake containing only `aps.content-available` and a
+  fixed `wake_hint`; it carries no resource or business identifier. REST
+  remains authoritative, including direct cancel/expiry reconciliation.
+- [x] Registering an APNs token atomically transfers it away from rows owned by
+  any prior account before associating it with the authenticated account.
 - [x] Exact command replay and confirmation-token rotation are covered by Rust
   and local contract tests.
 - [x] OpenAPI 3.1, production configuration checks, local Worker/D1/R2 gate,
@@ -122,8 +131,12 @@ Both worktrees were fetched immediately before handoff and matched
   tests; final mirrored-banner visual confirmation waits for Mac unlock.
 - [x] Permanent offline operation failures remain visible with Retry and
   Discard instead of being removed on the initial failed request.
-- [x] Background command/session wake hints trigger REST reconciliation and
-  complete the UIKit fetch callback exactly once, including timeout races.
+- [x] A process-level dispatcher buffers command/session wake hints before any
+  SwiftUI view appears, then triggers REST reconciliation and completes the
+  UIKit fetch callback exactly once with `.newData`, `.noData`, or `.failed`
+  according to the authenticated refresh result, including timeout races.
+- [x] A manual retry requested during an active pending-operation pass queues a
+  deterministic follow-up pass instead of being silently dropped.
 - [x] Home Today/This Week, drawer, Settings/pairing, destructive confirmation,
   and queued-state flows pass against an isolated local Worker and local D1.
 
@@ -132,7 +145,7 @@ Both worktrees were fetched immediately before handoff and matched
 ### Backend
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test --all-targets` — 73 passed, 0 failed.
+- `cargo test --all-targets` — 76 passed, 0 failed.
 - `cargo clippy --all-targets -- -D warnings` — passed.
 - `cargo check --target wasm32-unknown-unknown -q` — passed.
 - `worker-build --release` — passed.
@@ -153,8 +166,8 @@ Both worktrees were fetched immediately before handoff and matched
 
 ### iOS Simulator
 
-- Full `VoiceAgentBridgeTests` on iPhone 15 / iOS 17.2 — 121 total:
-  120 passed, 0 failed, 1 intentionally skipped.
+- Full `VoiceAgentBridgeTests` on iPhone 15 / iOS 17.2 — 127 total:
+  126 passed, 0 failed, 1 intentionally skipped.
 - `VoiceAgentBridgeUITests` against isolated local Worker/D1 — 3 passed,
   0 failed.
 - UI evidence captured for Home Today/This Week, drawer, Settings, decision
@@ -169,16 +182,20 @@ Both worktrees were fetched immediately before handoff and matched
 - Staging endpoint embedded as
   `https://knock-knock-backend-staging.wch-klaus.workers.dev` — verified.
 - App installed and launched while the device was unlocked — passed.
-- Full `VoiceAgentBridgeTests` on the physical device at the integrated source
-  tree — 121 total: 120 passed, 0 failed, 1 intentionally skipped.
+- Full `VoiceAgentBridgeTests` on the physical device at the preceding
+  integrated source revision — 121 total: 120 passed, 0 failed, 1
+  intentionally skipped. The latest concurrency/privacy follow-up is proven
+  on the simulator and still awaits exact-revision physical rerun.
 
 ### Physical iPhone 17 Pro Max
 
 - Device: `Klaus’s iPhone 17 Pro Max`, iPhone 17 Pro Max, paired Xcode device.
 - Staging configuration built, signed, installed, and launched independently
   for `hk.knockknock.app` — passed.
-- Full `VoiceAgentBridgeTests` on the physical device at the integrated source
-  tree — 121 total: 120 passed, 0 failed, 1 intentionally skipped.
+- Full `VoiceAgentBridgeTests` on the physical device at the preceding
+  integrated source revision — 121 total: 120 passed, 0 failed, 1
+  intentionally skipped. The latest concurrency/privacy follow-up is proven
+  on the simulator and still awaits exact-revision physical rerun.
 - Debug UI fixtures were intentionally not run on this phone because their
   isolation contract clears Keychain and local cache. This preserves the
   user's existing Staging login; the same UI workflows passed on the isolated

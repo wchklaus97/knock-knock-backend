@@ -863,7 +863,8 @@ paths:
         - name: q
           in: query
           required: true
-          schema: { type: string, minLength: 1, maxLength: 200 }
+          description: Runtime validation trims surrounding whitespace.
+          schema: { type: string, minLength: 1, maxLength: 200, pattern: '.*\S.*' }
         - $ref: '#/components/parameters/BeforeCursor'
         - $ref: '#/components/parameters/PageLimit'
       responses:
@@ -1158,11 +1159,11 @@ components:
     SearchHistoryCommandArgs:
       type: object
       additionalProperties: false
-      description: Use canonical `q`. Compatibility aliases `query` and `text` are accepted, but exactly one name may be present.
+      description: Use canonical `q`. Runtime validation trims surrounding whitespace and requires at least one character. Compatibility aliases `query` and `text` are accepted, but exactly one name may be present.
       properties:
-        q: { type: string, minLength: 2 }
-        query: { type: string, minLength: 2, deprecated: true }
-        text: { type: string, minLength: 2, deprecated: true }
+        q: { type: string, minLength: 1, maxLength: 200, pattern: '.*\S.*' }
+        query: { type: string, minLength: 1, maxLength: 200, pattern: '.*\S.*', deprecated: true }
+        text: { type: string, minLength: 1, maxLength: 200, pattern: '.*\S.*', deprecated: true }
       oneOf:
         - required: [q]
         - required: [query]

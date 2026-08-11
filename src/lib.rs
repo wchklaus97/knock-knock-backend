@@ -1876,6 +1876,10 @@ async fn phone_history(
     )
 }
 
+fn retire_device_token_from_other_users_sql() -> &'static str {
+    "UPDATE devices SET push_token = NULL, updated_at = ? WHERE push_token = ? AND user_id != ?"
+}
+
 async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
     let body: DeviceRequest = read_json(req).await?;
@@ -1898,24 +1902,44 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
         .await?
     };
     let now = db::now_iso();
+    let push_token = body
+        .push_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut statements = Vec::new();
+    if let Some(push_token) = push_token {
+        // An APNs token identifies one current app installation. Transfer it
+        // away from any previous account before binding it to this owner so a
+        // shared device cannot keep receiving wakeups for an old account.
+        statements.push(db::prepare(
+            db,
+            retire_device_token_from_other_users_sql(),
+            vec![
+                db::text(&now),
+                db::text(push_token),
+                db::text(&user.user_id),
+            ],
+        )?);
+    }
     let device_id = if let Some(existing) = existing {
-        db::run(
+        statements.push(db::prepare(
             db,
             "UPDATE devices SET device_id = COALESCE(?, device_id), push_token = ?, locale = ?, timezone = ?, updated_at = ? WHERE id = ?",
             vec![
                 db::optional_text(body.device_id.as_deref()),
-                db::optional_text(body.push_token.as_deref()),
+                db::optional_text(push_token),
                 db::optional_text(body.locale.as_deref()),
                 db::optional_text(body.timezone.as_deref()),
                 db::text(&now),
                 db::text(&existing._id),
             ],
-        )
-        .await?;
+        )?);
+        db.batch(statements).await?;
         existing._id
     } else {
         let id = new_id("dev")?;
-        db::run(
+        statements.push(db::prepare(
             db,
             "INSERT INTO devices (id, user_id, platform, device_id, push_token, locale, timezone, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
@@ -1923,21 +1947,21 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
                 db::text(&user.user_id),
                 db::text(&body.platform),
                 db::optional_text(body.device_id.as_deref()),
-                db::optional_text(body.push_token.as_deref()),
+                db::optional_text(push_token),
                 db::optional_text(body.locale.as_deref()),
                 db::optional_text(body.timezone.as_deref()),
                 db::text(&now),
                 db::text(&now),
             ],
-        )
-        .await?;
+        )?);
+        db.batch(statements).await?;
         id
     };
     json_response(
         json!({
             "device_id": device_id,
             "platform": body.platform,
-            "push_token_registered": body.push_token.is_some(),
+            "push_token_registered": push_token.is_some(),
             "locale": body.locale,
             "timezone": body.timezone,
         }),
@@ -2214,8 +2238,8 @@ fn add_common_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        phone_change_event_type, valid_model_r2_key, valid_request_id, valid_semantic_version,
-        validate_model_manifest,
+        phone_change_event_type, retire_device_token_from_other_users_sql, valid_model_r2_key,
+        valid_request_id, valid_semantic_version, validate_model_manifest,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
@@ -2300,5 +2324,13 @@ mod tests {
     fn retrieval_changes_require_snapshot_reconciliation() {
         assert_eq!(phone_change_event_type("retrieval"), "sync.required");
         assert_eq!(phone_change_event_type("message"), "message.created");
+    }
+
+    #[test]
+    fn device_registration_transfers_one_apns_token_between_accounts() {
+        let sql = retire_device_token_from_other_users_sql();
+        assert!(sql.contains("SET push_token = NULL"));
+        assert!(sql.contains("WHERE push_token = ?"));
+        assert!(sql.contains("user_id != ?"));
     }
 }

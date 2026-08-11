@@ -93,20 +93,16 @@ pub async fn send_alert(
     send_payload(env, token, &payload, "alert", None).await
 }
 
-fn command_wakeup_payload(command_id: &str) -> String {
+fn command_wakeup_payload() -> String {
     json!({
         "aps": { "content-available": 1 },
-        "command_id": command_id,
+        "wake_hint": "command",
     })
     .to_string()
 }
 
-pub async fn send_command_wakeup(
-    env: &worker::Env,
-    token: &str,
-    command_id: &str,
-) -> ApiResult<()> {
-    let payload = command_wakeup_payload(command_id);
+pub async fn send_command_wakeup(env: &worker::Env, token: &str) -> ApiResult<()> {
+    let payload = command_wakeup_payload();
     send_payload(env, token, &payload, "background", Some("5")).await
 }
 
@@ -167,15 +163,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_wakeup_payload_is_an_opaque_rest_refresh_hint() {
-        let payload: serde_json::Value =
-            serde_json::from_str(&command_wakeup_payload("cmd_opaque_123")).unwrap();
+    fn command_wakeup_payload_is_a_data_free_rest_refresh_hint() {
+        let payload: serde_json::Value = serde_json::from_str(&command_wakeup_payload()).unwrap();
 
         assert_eq!(
             payload,
             json!({
                 "aps": { "content-available": 1 },
-                "command_id": "cmd_opaque_123",
+                "wake_hint": "command",
             })
         );
         let encoded = payload.to_string();
@@ -187,6 +182,7 @@ mod tests {
             "body",
             "session_id",
             "user_id",
+            "command_id",
         ] {
             assert!(!encoded.contains(sensitive_key));
         }
