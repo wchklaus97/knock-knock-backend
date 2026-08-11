@@ -8,10 +8,10 @@ APNs rollout, provider rollout, or model rollout was performed
 
 ## Completion branches
 
-| Repository | Branch | Base commit | Draft PR |
-|---|---|---|---|
-| iOS | `agent/voice-workflow-completion-ios-20260811` | `931c6bf54a328d067759daf1b243e75ae28bddcc` | [frontend #16](https://github.com/wchklaus97/knock-knock-frontend/pull/16) |
-| Backend | `agent/voice-workflow-completion-backend-20260811` | `c83b04d6f71dbb0749f8dbaff641509b0d242f08` | [backend #28](https://github.com/wchklaus97/knock-knock-backend/pull/28) |
+| Repository | Branch | Base commit | Tested implementation head | Draft PR |
+|---|---|---|---|---|
+| iOS | `agent/voice-workflow-completion-ios-20260811` | `931c6bf54a328d067759daf1b243e75ae28bddcc` | `94669e9e97251c301d05fffbac79f237857f5946` | [frontend #16](https://github.com/wchklaus97/knock-knock-frontend/pull/16) |
+| Backend | `agent/voice-workflow-completion-backend-20260811` | `c83b04d6f71dbb0749f8dbaff641509b0d242f08` | `6d98166f0634f47c8a1a03243f0ae7a85eb394f4` | [backend #28](https://github.com/wchklaus97/knock-knock-backend/pull/28) |
 
 Both worktrees were fetched immediately before handoff and matched
 `origin/main`. The changes remain unmerged until paired draft PR review.
@@ -159,6 +159,12 @@ Both worktrees were fetched immediately before handoff and matched
 - Strict command isolation and conflicting-idempotency route smoke — passed.
 - Staging health sampled 20 consecutive times — 20/20 passed. The deployed
   staging revision remains older than this unmerged branch.
+- A 2026-08-12 read-only staging D1 aggregate found two distinct physical iOS
+  registrations with valid 64-hex APNs tokens under one user. Their registration
+  timestamps were `2026-08-11T18:44:18.224Z` and
+  `2026-08-11T18:45:00.469Z`; no token, user ID, or device ID was read or
+  printed. This proves same-account two-device registration only, not APNs
+  delivery or UI convergence.
 - Staging deploy/contract workflows now derive `SERVICE_VERSION` from the
   immutable `github.sha` and require health to match it; this provenance change
   has not been deployed.
@@ -177,25 +183,23 @@ Both worktrees were fetched immediately before handoff and matched
 
 ### Physical iPhone 13 Pro
 
-- Device: `Klaus 的iPhone`, iPhone 13 Pro, iOS 26.6 beta, wired developer mode.
+- Device: `Klaus 的iPhone`, iPhone 13 Pro, iOS 26.6 (`23G71`), wired developer
+  mode.
 - Staging configuration built and signed for `hk.knockknock.app` — passed.
 - Staging endpoint embedded as
   `https://knock-knock-backend-staging.wch-klaus.workers.dev` — verified.
 - App installed and launched while the device was unlocked — passed.
-- Full `VoiceAgentBridgeTests` on the physical device at the preceding
-  integrated source revision — 121 total: 120 passed, 0 failed, 1
-  intentionally skipped. The latest concurrency/privacy follow-up is proven
-  on the simulator and still awaits exact-revision physical rerun.
+- Full `VoiceAgentBridgeTests` at iOS implementation head `94669e9e` — 127
+  total: 126 passed, 0 failed, 1 intentionally skipped real-model gate.
 
 ### Physical iPhone 17 Pro Max
 
-- Device: `Klaus’s iPhone 17 Pro Max`, iPhone 17 Pro Max, paired Xcode device.
+- Device: `Klaus’s iPhone 17 Pro Max`, iPhone 17 Pro Max, iOS 26.6 (`23G71`),
+  paired Xcode device.
 - Staging configuration built, signed, installed, and launched independently
   for `hk.knockknock.app` — passed.
-- Full `VoiceAgentBridgeTests` on the physical device at the preceding
-  integrated source revision — 121 total: 120 passed, 0 failed, 1
-  intentionally skipped. The latest concurrency/privacy follow-up is proven
-  on the simulator and still awaits exact-revision physical rerun.
+- Full `VoiceAgentBridgeTests` at iOS implementation head `94669e9e` — 127
+  total: 126 passed, 0 failed, 1 intentionally skipped real-model gate.
 - Debug UI fixtures were intentionally not run on this phone because their
   isolation contract clears Keychain and local cache. This preserves the
   user's existing Staging login; the same UI workflows passed on the isolated
@@ -207,6 +211,10 @@ The skipped test is
 `VoiceModelGoldenEvaluationTests.testSignedModelMeetsAccuracySafetyAndLatencyGates`.
 It requires an approved real `.litertlm` Gemma artifact, a pinned production
 public key, and signed descriptor inputs. No placeholder model is accepted.
+The repository/artifact audit found no real `.litertlm` file, the exact Staging
+build has a zero-length `KNOCK_MODEL_PUBLIC_KEY_BASE64`, and deployed staging
+reports `knock_knock_model_enabled 0`. The skip is therefore the expected
+fail-closed release boundary, not an unexplained test failure.
 
 - [ ] Approve and publish a real signed `gemma-command` artifact to non-public
   staging R2, then run the 20–100-example golden suite with at least 95%

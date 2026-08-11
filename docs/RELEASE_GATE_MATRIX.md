@@ -1,7 +1,7 @@
 # Backend Release Gate Matrix
 
 This matrix is the handoff checklist for the voice-workflow completion branches
-based on backend `c83b04d` and iOS `931c6bf`. A
+with tested implementation heads backend `6d98166f` and iOS `94669e9e`. A
 local smoke is evidence for code behavior only; it does not substitute for a
 deployed staging resource, a real provider, a physical iPhone, or human
 approval.
@@ -12,7 +12,7 @@ approval.
 | RG-02 | Paired PR review and CI | **Current voice PRs pending** | Backend and iOS voice changes must be committed as paired draft PRs, pass their repository CI, and receive human review. No automatic merge or deployment is allowed. | Human reviewer + paired agents |
 | RG-03 | Production provider contract | **Local adapter passed; vendor pending** | Local mock verifies reminder delivery/cancel, scheduled cancellation recovery, timeout reconciliation, and message `accepted → delivered → sent`. Cancellation now requires an explicit terminal provider state and uses a durable per-operation fence; exhausted retryable outcomes remain `unknown` for scheduled reconciliation. Select a vendor, run sandbox tests, verify its idempotency/cancellation/status semantics, configure Wrangler secrets, then approve rollout. | Backend/Operations + provider credentials |
 | RG-04 | Voice golden set and model gate | **Partial — artifact blocked** | A 32-example English/Chinese/Cantonese fixture, strict structured-output checks, signed release tooling, private-R2 delivery, and rollback tests exist. The official Gemma file is license-gated and has not been supplied; real inference must still prove ≥95% accuracy, zero high-risk false executions, latency, memory, and thermal limits. Follow `VOICE_MODEL_RELEASE_RUNBOOK.md`. | Voice/Verification agent + operator-approved signed artifact |
-| RG-05 | Physical iPhone and APNs gate | **Partial** | The preceding integrated revision passes 120/121 tests on both iPhone 13 Pro and iPhone 17 Pro Max; the current follow-up passes 126/127 on the iOS 17.2 simulator, with only the intentionally unavailable signed-model evaluation skipped. Identifier-free command wakes and cold-launch REST reconciliation are implemented. Exact-current-revision physical reruns, real microphone/VAD/interruption/memory/thermal/crash execution, APNs delivery, and simultaneous two-phone convergence remain separate gates. | iOS/Verification agent + approved model and two phones |
+| RG-05 | Physical iPhone and APNs gate | **Partial** | The current iOS implementation head passes 126/127 tests on both iPhone 13 Pro and iPhone 17 Pro Max, with only the intentionally unavailable signed-model evaluation skipped; the signed Staging app installs and launches on both. A read-only staging D1 aggregate confirms two valid physical APNs registrations under one user. Identifier-free wakes and cold-launch REST reconciliation are implemented. Real microphone/VAD/interruption/memory/thermal/crash execution, APNs delivery, true airplane-mode recovery, and simultaneous two-phone UI convergence remain separate gates. | iOS/Verification agent + approved model and two phones |
 | RG-06 | Security and observability review | **Pending formal review** | Static/adversarial checks pass. Pairing now uses high-entropy tokens and a tighter unauthenticated bucket; non-development legacy JWTs require an explicit 32+ character secret; APNs excludes full voice text; production D1 backups are encrypted before private R2 storage; validated request correlation, trusted-edge rate-limit identity, readiness gauges, and stale cancel-lease recovery are implemented. Review auth revocation, provider secrets, R2 access, redaction, command/provider latency metrics, tracing, alerts, unknown outcomes, backup restore, and dead-letter/reconciliation runbooks. | Security/Operations reviewer |
 | RG-07 | Human release approval | **Pending** | Record approval for PR merge, remote migrations, provider/APNs secrets, feature flags, and model rollout. Keep the rollback plan attached to the release record. | Product owner / release approver |
 
@@ -30,6 +30,10 @@ approval.
   integrity/rollback tests, and 32-example fixture-structure validation
 - request-ID propagation, Prometheus readiness gauges, trusted-edge identity, and stale cancellation lease recovery
 - protected staging deploy and staging contract workflows at `c83b04d`
+- exact-current iOS implementation tests on iPhone 13 Pro and iPhone 17 Pro Max
+  — 126 passed, 0 failed, 1 intentionally skipped on each device
+- read-only staging D1 registration metadata — two tokenized physical iOS
+  devices under one user; this is not delivery or convergence evidence
 
 ## Release rule
 
