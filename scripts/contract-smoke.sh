@@ -103,14 +103,17 @@ skills="$(get "${user_auth[@]}" "$BASE_URL/v1/skills")"
 test "$(jq -r '.skills | length' <<<"$skills")" -ge 1
 
 device_correlation_id="device-contract-$(date +%s%N)"
+device_push_token="contract-smoke-device-token-$(date +%s%N)"
 device="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/devices" \
   -d "$(jq -nc --arg device_id "$device_correlation_id" \
-    '{platform:"ios",push_token:"contract-smoke-device-token",locale:"zh-HK",timezone:"Asia/Hong_Kong",device_id:$device_id}')")"
+    --arg push_token "$device_push_token" \
+    '{platform:"ios",push_token:$push_token,locale:"zh-HK",timezone:"Asia/Hong_Kong",device_id:$device_id}')")"
 jq -e --arg device_id "$device_correlation_id" \
   '(.device_id | type == "string" and length > 0) and (.platform == "ios")' <<<"$device" >/dev/null
 device_again="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/devices" \
   -d "$(jq -nc --arg device_id "$device_correlation_id" \
-    '{platform:"ios",push_token:"contract-smoke-device-token",locale:"zh-HK",timezone:"Asia/Hong_Kong",device_id:$device_id}')")"
+    --arg push_token "$device_push_token" \
+    '{platform:"ios",push_token:$push_token,locale:"zh-HK",timezone:"Asia/Hong_Kong",device_id:$device_id}')")"
 test "$(jq -r '.device_id' <<<"$device_again")" = "$(jq -r '.device_id' <<<"$device")"
 
 command_key="command-smoke-$(date +%s%N)"
