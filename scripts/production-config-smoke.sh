@@ -70,4 +70,12 @@ grep -q 'PUSH_MODE must be dev, apns, or both in staging' "$ROOT/src/auth.rs"
 grep -q 'APNS_PRODUCTION must be false in staging' "$ROOT/src/auth.rs"
 grep -q 'SUPABASE_PUBLISHABLE_KEY must be configured' "$ROOT/src/auth.rs"
 
+grep -Fq 'STAGING_RELEASE_VERSION: ${{ github.sha }}' "$ROOT/.github/workflows/staging-deploy.yml"
+grep -Fq 'STAGING_RELEASE_VERSION: ${{ github.sha }}' "$ROOT/.github/workflows/staging-contract-gate.yml"
+if grep -Fq 'vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION' "$ROOT/.github/workflows/staging-deploy.yml" \
+  || grep -Fq 'vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION' "$ROOT/.github/workflows/staging-contract-gate.yml"; then
+  echo "staging release identity must come from github.sha, not a mutable repository variable" >&2
+  exit 1
+fi
+
 echo "production config smoke passed: local defaults are explicit and production is fail-closed"

@@ -809,6 +809,8 @@ paths:
     post:
       tags: [Phone]
       operationId: undoPhoneCommand
+      description: Idempotently compensates a reversible command. The first Undo request must arrive less than 600 seconds after successful completion; unavailable or expired Undo requests return a conflict.
+      x-undo-window-seconds: 600
       parameters:
         - $ref: '#/components/parameters/CommandId'
       responses:
@@ -1153,9 +1155,101 @@ components:
               score: { type: [number, 'null'] }
               content_hash: { type: string, minLength: 1, maxLength: 256 }
               r2_key: { type: [string, 'null'] }
+    SearchHistoryCommandArgs:
+      type: object
+      additionalProperties: false
+      description: Use canonical `q`. Compatibility aliases `query` and `text` are accepted, but exactly one name may be present.
+      properties:
+        q: { type: string, minLength: 2 }
+        query: { type: string, minLength: 2, deprecated: true }
+        text: { type: string, minLength: 2, deprecated: true }
+      oneOf:
+        - required: [q]
+        - required: [query]
+        - required: [text]
+    CreateReminderCommandArgs:
+      type: object
+      additionalProperties: false
+      description: Use canonical `title` and `due_at`. Compatibility aliases are accepted one-at-a-time for each field.
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        text: { type: string, minLength: 1, maxLength: 200, deprecated: true }
+        message: { type: string, minLength: 1, maxLength: 200, deprecated: true }
+        due_at: { type: string, minLength: 1, maxLength: 64 }
+        time: { type: string, minLength: 1, maxLength: 64, deprecated: true }
+        datetime: { type: string, minLength: 1, maxLength: 64, deprecated: true }
+      allOf:
+        - oneOf:
+            - required: [title]
+            - required: [text]
+            - required: [message]
+        - oneOf:
+            - required: [due_at]
+            - required: [time]
+            - required: [datetime]
+    CreateDraftCommandArgs:
+      type: object
+      additionalProperties: false
+      description: Use canonical `body`, `title`, and `recipient`. The latter two are optional; compatibility aliases are accepted one-at-a-time.
+      properties:
+        body: { type: string, minLength: 1, maxLength: 8000 }
+        content: { type: string, minLength: 1, maxLength: 8000, deprecated: true }
+        text: { type: string, minLength: 1, maxLength: 8000, deprecated: true }
+        title: { type: string, maxLength: 200 }
+        subject: { type: string, maxLength: 200, deprecated: true }
+        recipient: { type: string, maxLength: 320 }
+        to: { type: string, maxLength: 320, deprecated: true }
+      allOf:
+        - oneOf:
+            - required: [body]
+            - required: [content]
+            - required: [text]
+        - not:
+            required: [title, subject]
+        - not:
+            required: [recipient, to]
+    SendMessageCommandArgs:
+      type: object
+      additionalProperties: false
+      description: Use canonical `body` and `recipient`. Compatibility aliases are accepted one-at-a-time for each field.
+      properties:
+        body: { type: string, minLength: 1, maxLength: 8000 }
+        message: { type: string, minLength: 1, maxLength: 8000, deprecated: true }
+        text: { type: string, minLength: 1, maxLength: 8000, deprecated: true }
+        recipient: { type: string, minLength: 1, maxLength: 320 }
+        to: { type: string, minLength: 1, maxLength: 320, deprecated: true }
+        email: { type: string, minLength: 1, maxLength: 320, deprecated: true }
+        phone: { type: string, minLength: 1, maxLength: 320, deprecated: true }
+      allOf:
+        - oneOf:
+            - required: [body]
+            - required: [message]
+            - required: [text]
+        - oneOf:
+            - required: [recipient]
+            - required: [to]
+            - required: [email]
+            - required: [phone]
     CommandEnvelope:
       type: object
       additionalProperties: false
+      oneOf:
+        - title: Search history command
+          properties:
+            intent: { const: search_history }
+            args: { $ref: '#/components/schemas/SearchHistoryCommandArgs' }
+        - title: Create reminder command
+          properties:
+            intent: { const: create_reminder }
+            args: { $ref: '#/components/schemas/CreateReminderCommandArgs' }
+        - title: Create draft command
+          properties:
+            intent: { const: create_draft }
+            args: { $ref: '#/components/schemas/CreateDraftCommandArgs' }
+        - title: Send message command
+          properties:
+            intent: { const: send_message }
+            args: { $ref: '#/components/schemas/SendMessageCommandArgs' }
       required:
         - schema_version
         - command_id
@@ -1170,10 +1264,12 @@ components:
       properties:
         schema_version: { type: integer, const: 1 }
         command_id: { type: string, minLength: 1, maxLength: 128 }
-        intent: { type: string, minLength: 1, maxLength: 128 }
+        intent:
+          type: string
+          enum: [search_history, create_reminder, create_draft, send_message]
         args:
           type: object
-          additionalProperties: true
+          description: Strictly validated according to `intent`; unknown keys, duplicate aliases, and non-string values are rejected.
         risk_level:
           type: string
           enum: [low, medium, high, destructive]
@@ -1210,7 +1306,7 @@ components:
         terminal: { type: boolean }
     CommandResponse:
       type: object
-      required: [command_id, state, presentation, version, created_at, updated_at]
+      required: [command_id, state, presentation, undo_command_id, version, created_at, updated_at]
       properties:
         command_id: { type: string }
         state:
@@ -1230,7 +1326,12 @@ components:
         error:
           type: [object, 'null']
           additionalProperties: true
-        undo_command_id: { type: [string, 'null'] }
+        undo_command_id:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: Equal to `command_id` only for a succeeded reversible command whose first Undo window is still open; null after 600 seconds, after Undo, or whenever Undo is unavailable.
+          x-undo-window-seconds: 600
         version: { type: integer, minimum: 0 }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }

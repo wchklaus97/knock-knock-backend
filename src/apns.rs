@@ -82,6 +82,41 @@ pub async fn send_alert(
     session_id: Option<&str>,
     _voice_script: Option<&str>,
 ) -> ApiResult<()> {
+    let payload = json!({
+        "aps": {
+            "alert": { "title": title, "body": body },
+            "sound": "default",
+        },
+        "session_id": session_id,
+    })
+    .to_string();
+    send_payload(env, token, &payload, "alert", None).await
+}
+
+fn command_wakeup_payload(command_id: &str) -> String {
+    json!({
+        "aps": { "content-available": 1 },
+        "command_id": command_id,
+    })
+    .to_string()
+}
+
+pub async fn send_command_wakeup(
+    env: &worker::Env,
+    token: &str,
+    command_id: &str,
+) -> ApiResult<()> {
+    let payload = command_wakeup_payload(command_id);
+    send_payload(env, token, &payload, "background", Some("5")).await
+}
+
+async fn send_payload(
+    env: &worker::Env,
+    token: &str,
+    payload: &str,
+    push_type: &str,
+    priority: Option<&str>,
+) -> ApiResult<()> {
     if !looks_like_token(token) {
         return Err(ApiError::new(
             400,
@@ -96,26 +131,21 @@ pub async fn send_alert(
     };
     let url = worker::Url::parse(&format!("https://{host}/3/device/{token}"))
         .map_err(|error| ApiError::new(500, "apns_error", error.to_string()))?;
-    let payload = json!({
-        "aps": {
-            "alert": { "title": title, "body": body },
-            "sound": "default",
-        },
-        "session_id": session_id,
-    })
-    .to_string();
     let headers = Headers::new();
     headers.set("authorization", &format!("bearer {}", signed_token(env)?))?;
     headers.set(
         "apns-topic",
         &config_value(env, "APNS_BUNDLE_ID", "hk.knockknock.app"),
     )?;
-    headers.set("apns-push-type", "alert")?;
+    headers.set("apns-push-type", push_type)?;
+    if let Some(priority) = priority {
+        headers.set("apns-priority", priority)?;
+    }
     headers.set("content-type", "application/json")?;
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
-        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&payload)));
+        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(payload)));
     let request = Request::new_with_init(url.as_str(), &init)?;
     let mut response = Fetch::Request(request).send().await?;
     if response.status_code() != 200 {
@@ -130,4 +160,35 @@ pub async fn send_alert(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_wakeup_payload_is_an_opaque_rest_refresh_hint() {
+        let payload: serde_json::Value =
+            serde_json::from_str(&command_wakeup_payload("cmd_opaque_123")).unwrap();
+
+        assert_eq!(
+            payload,
+            json!({
+                "aps": { "content-available": 1 },
+                "command_id": "cmd_opaque_123",
+            })
+        );
+        let encoded = payload.to_string();
+        for sensitive_key in [
+            "args",
+            "result",
+            "error",
+            "title",
+            "body",
+            "session_id",
+            "user_id",
+        ] {
+            assert!(!encoded.contains(sensitive_key));
+        }
+    }
 }

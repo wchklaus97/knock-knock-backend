@@ -16,6 +16,26 @@ APNs rollout, provider rollout, or model rollout was performed
 Both worktrees were fetched immediately before handoff and matched
 `origin/main`. The changes remain unmerged until paired draft PR review.
 
+## Fifteen-step workflow evidence
+
+| Step | Current evidence | Release status |
+|---|---|---|
+| 1. Hold push-to-talk | Production gesture wiring and controller lifecycle tests pass. | Implemented; real touch/microphone UAT open |
+| 2. Foreground-only recording | Capture now synchronously rejects an already-inactive app and also aborts on later inactive/background transitions. | Implemented and unit-tested |
+| 3. VAD speech/trailing silence | Sustained speech, trailing silence, no-speech, noise, and maximum-duration tests pass. | Implemented and unit-tested; acoustic tuning UAT open |
+| 4. On-device STT | Apple Speech requires on-device recognition and has no cloud fallback. | Implemented; real microphone/transcription evidence open |
+| 5. Local Gemma intent model | LiteRT-LM runtime, signed download, verification, activation, and rollback pass synthetic tests. | Runtime implemented; approved real model/key absent |
+| 6. Strict iOS envelope validation | Strict JSON, duplicate-key rejection, allowlisted intent arguments, and app-owned policy tests pass. | Proven by tests |
+| 7. Clarification | The production controller now maps low confidence, ambiguity, unsupported intent, and invalid model output to clarification without POST. | Proven by tests |
+| 8. Backend submission | Crash-safe checkpoint precedes POST; exact idempotent replay and canonical GET reconciliation pass. | Proven by tests/local contract |
+| 9. Independent backend validation | Auth, ownership, registry risk, confirmation, idempotency, and strict per-intent arguments are enforced at intake and revalidated before execution; cross-user reads and conflicting idempotency are route-smoked. | Proven by tests/local contract |
+| 10. Read-only action | `search_history` is owner-scoped and executes without external side effects. | Proven locally; real voice entry open |
+| 11. Reversible action/Undo | Reminder/draft Undo is authorized, idempotent, provider-fenced, advertised only while eligible, and limited to 600 seconds. | Proven locally; production provider semantics open |
+| 12. One-time high-risk confirmation | Backend forces `send_message` to high risk, stores a token hash, rotates exact replay, and atomically consumes once. | Proven by tests/local contract |
+| 13. REST/SSE/APNs result path | REST/SSE reconciliation exists; terminal command transitions now send a privacy-safe best-effort APNs wake hint, and iOS background delivery triggers REST refresh exactly once. | Implemented/tested; real APNs delivery open |
+| 14. Backend-owned UI/TTS | iOS accepts only validated backend presentation and speaks backend `voice_script` once per version. | Proven by tests; audible real-device UAT open |
+| 15. Raw-audio privacy | Audio buffers feed only on-device Speech and scalar RMS; no app upload or recording persistence API exists. | Source/test evidence; packet/filesystem UAT open |
+
 ## Implemented checklist
 
 ### iOS voice and command boundary
@@ -37,6 +57,8 @@ Both worktrees were fetched immediately before handoff and matched
   always high risk and always requires confirmation.
 - [x] Low-confidence or ambiguous output produces clarification and never a
   guessed date, person, amount, or side effect.
+- [x] Capture refuses to start if the application is already inactive, closing
+  the lifecycle-notification race before the audio session is activated.
 
 ### Signed model supply chain
 
@@ -74,6 +96,13 @@ Both worktrees were fetched immediately before handoff and matched
   use `private, no-store` and do not expose internal R2 keys.
 - [x] Command summaries and presentation responses omit raw command payload,
   result, error, recipient, and body data.
+- [x] All four release intents use strict backend argument schemas that reject
+  unknown keys, duplicate aliases, non-string values, missing fields, and
+  unregistered intents.
+- [x] Reversible success responses expose `undo_command_id` only inside a
+  600-second window; replay after a completed Undo remains idempotent.
+- [x] Terminal command transitions emit a best-effort silent APNs wake hint
+  containing only the opaque `command_id`; REST remains authoritative.
 - [x] Exact command replay and confirmation-token rotation are covered by Rust
   and local contract tests.
 - [x] OpenAPI 3.1, production configuration checks, local Worker/D1/R2 gate,
@@ -91,6 +120,10 @@ Both worktrees were fetched immediately before handoff and matched
   the failure to an actionable configuration message and sanitizes every
   unknown model-preparation error. The mapping passes simulator and iPhone 17
   tests; final mirrored-banner visual confirmation waits for Mac unlock.
+- [x] Permanent offline operation failures remain visible with Retry and
+  Discard instead of being removed on the initial failed request.
+- [x] Background command/session wake hints trigger REST reconciliation and
+  complete the UIKit fetch callback exactly once, including timeout races.
 - [x] Home Today/This Week, drawer, Settings/pairing, destructive confirmation,
   and queued-state flows pass against an isolated local Worker and local D1.
 
@@ -99,7 +132,7 @@ Both worktrees were fetched immediately before handoff and matched
 ### Backend
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -q` — 63 passed, 0 failed.
+- `cargo test --all-targets` — 73 passed, 0 failed.
 - `cargo clippy --all-targets -- -D warnings` — passed.
 - `cargo check --target wasm32-unknown-unknown -q` — passed.
 - `worker-build --release` — passed.
@@ -110,12 +143,18 @@ Both worktrees were fetched immediately before handoff and matched
 - Provider observability, rate-limit, lifecycle, production-config,
   adversarial data, backup/restore, retention, and log-sanitization gates —
   passed.
+- Strict command isolation and conflicting-idempotency route smoke — passed.
+- Staging health sampled 20 consecutive times — 20/20 passed. The deployed
+  staging revision remains older than this unmerged branch.
+- Staging deploy/contract workflows now derive `SERVICE_VERSION` from the
+  immutable `github.sha` and require health to match it; this provenance change
+  has not been deployed.
 - `git diff --check` — passed.
 
 ### iOS Simulator
 
-- Full `VoiceAgentBridgeTests` on iPhone 15 / iOS 17.2 — 114 total:
-  113 passed, 0 failed, 1 intentionally skipped.
+- Full `VoiceAgentBridgeTests` on iPhone 15 / iOS 17.2 — 121 total:
+  120 passed, 0 failed, 1 intentionally skipped.
 - `VoiceAgentBridgeUITests` against isolated local Worker/D1 — 3 passed,
   0 failed.
 - UI evidence captured for Home Today/This Week, drawer, Settings, decision
@@ -130,19 +169,16 @@ Both worktrees were fetched immediately before handoff and matched
 - Staging endpoint embedded as
   `https://knock-knock-backend-staging.wch-klaus.workers.dev` — verified.
 - App installed and launched while the device was unlocked — passed.
-- Full `VoiceAgentBridgeTests` on the physical device — 113 total:
-  112 passed, 0 failed, 1 intentionally skipped.
-- This run preceded the user-copy-only signed-model error follow-up. Its final
-  114-test rerun is pending only because the device became locked while the
-  owner was away.
+- Full `VoiceAgentBridgeTests` on the physical device at the integrated source
+  tree — 121 total: 120 passed, 0 failed, 1 intentionally skipped.
 
 ### Physical iPhone 17 Pro Max
 
 - Device: `Klaus’s iPhone 17 Pro Max`, iPhone 17 Pro Max, paired Xcode device.
 - Staging configuration built, signed, installed, and launched independently
   for `hk.knockknock.app` — passed.
-- Full `VoiceAgentBridgeTests` on the physical device at current PR head —
-  114 total: 113 passed, 0 failed, 1 intentionally skipped.
+- Full `VoiceAgentBridgeTests` on the physical device at the integrated source
+  tree — 121 total: 120 passed, 0 failed, 1 intentionally skipped.
 - Debug UI fixtures were intentionally not run on this phone because their
   isolation contract clears Keychain and local cache. This preserves the
   user's existing Staging login; the same UI workflows passed on the isolated
