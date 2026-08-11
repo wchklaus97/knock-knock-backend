@@ -21,6 +21,7 @@ echo "[phase45] contract, migration, configuration, and adversarial checks"
 ./scripts/production-config-smoke.sh
 ./scripts/backup-restore-smoke.sh
 ./scripts/ci-log-sanitization-smoke.sh
+./scripts/voice-model-release-smoke.sh
 test -x ./scripts/local-contract-gate.sh
 test -x ./scripts/r2-download-smoke.sh
 test -x ./scripts/provider-lifecycle-smoke.sh
@@ -29,6 +30,9 @@ test -x ./scripts/provider-observability-smoke.sh
 test -x ./scripts/provider-mock.py
 test -x ./scripts/rate-limit-smoke.sh
 test -x ./scripts/staging-contract-gate.sh
+test -x ./scripts/voice-model-release.sh
+test -x ./scripts/voice-model-release-smoke.sh
+test -x ./scripts/voice-model-r2-smoke.sh
 bash -n \
   ./scripts/ci-log-sanitize.sh \
   ./scripts/ci-log-sanitization-smoke.sh \
@@ -38,7 +42,10 @@ bash -n \
   ./scripts/provider-local-gate.sh \
   ./scripts/provider-observability-smoke.sh \
   ./scripts/rate-limit-smoke.sh \
-  ./scripts/staging-contract-gate.sh
+  ./scripts/staging-contract-gate.sh \
+  ./scripts/voice-model-release.sh \
+  ./scripts/voice-model-release-smoke.sh \
+  ./scripts/voice-model-r2-smoke.sh
 python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("scripts/provider-mock.py").read_text())'
 
 echo "[phase45] repository hygiene"

@@ -94,12 +94,43 @@ ACTION_REMINDER_ENABLED=true
 ACTION_MESSAGE_ENABLED=true
 EOF
 
+MODEL_ID="gemma-command"
+MODEL_R2_KEY="models/${MODEL_ID}/local-contract-1.0.0.litertlm"
+MODEL_ARTIFACT="${TMP_DIR}/${MODEL_ID}.litertlm"
+MODEL_PRIVATE_KEY="${TMP_DIR}/voice-model-signing-private.pem"
+MODEL_RELEASE_DIR="${TMP_DIR}/voice-model-release"
+printf 'local contract model artifact bytes\n' >"${MODEL_ARTIFACT}"
+openssl genpkey -algorithm ED25519 -out "${MODEL_PRIVATE_KEY}" >/dev/null 2>&1
+"${ROOT_DIR}/scripts/voice-model-release.sh" \
+  --artifact "${MODEL_ARTIFACT}" \
+  --private-key "${MODEL_PRIVATE_KEY}" \
+  --model-version 1.0.0 \
+  --output-dir "${MODEL_RELEASE_DIR}" \
+  --model-id "${MODEL_ID}" \
+  --minimum-capability cpu-v1 >/dev/null
+MODEL_MANIFEST_JSON="$(jq -c . "${MODEL_RELEASE_DIR}/manifest.json")"
+cat >>"${TMP_DIR}/local.env" <<EOF
+VOICE_MODEL_ENABLED=true
+VOICE_MODEL_R2_KEY=${MODEL_R2_KEY}
+VOICE_MODEL_MANIFEST_JSON=${MODEL_MANIFEST_JSON}
+EOF
+
 if ! wrangler d1 migrations apply DB --local \
   --persist-to "${PERSIST_TO}" \
   --config "${ROOT_DIR}/wrangler.toml" \
   --env-file "${TMP_DIR}/local.env" \
   >"${TMP_DIR}/migrations.log" 2>&1; then
   fail "local D1 migrations failed"
+fi
+
+if ! wrangler r2 object put "knock-knock-local/${MODEL_R2_KEY}" \
+  --local \
+  --persist-to "${PERSIST_TO}" \
+  --config "${ROOT_DIR}/wrangler.toml" \
+  --file "${MODEL_ARTIFACT}" \
+  --content-type application/octet-stream \
+  --force >"${TMP_DIR}/model-r2.log" 2>&1; then
+  fail "local voice model R2 upload failed"
 fi
 
 wrangler dev --local --port "${WORKER_PORT}" --test-scheduled \
@@ -127,4 +158,10 @@ R2_SMOKE_BUCKET="knock-knock-local" \
 SMOKE_EMAIL="${R2_SMOKE_EMAIL:-local-r2-$(date +%s)-$$@local.test}" \
   "${ROOT_DIR}/scripts/r2-download-smoke.sh"
 
-echo "local-contract-gate passed: isolated Worker/D1/R2 contract, readiness, correlation, retention, and isolation smokes"
+BASE_URL="http://127.0.0.1:${WORKER_PORT}" \
+MODEL_ID="${MODEL_ID}" \
+EXPECTED_MODEL_ARTIFACT="${MODEL_ARTIFACT}" \
+SMOKE_EMAIL="${MODEL_SMOKE_EMAIL:-local-model-$(date +%s)-$$@local.test}" \
+  "${ROOT_DIR}/scripts/voice-model-r2-smoke.sh"
+
+echo "local-contract-gate passed: isolated Worker/D1/R2 contract, readiness, correlation, retention, model streaming, and isolation smokes"

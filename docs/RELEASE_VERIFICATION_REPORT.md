@@ -1,193 +1,176 @@
 # Knock Knock Release Verification Report
 
-**Date:** 2026-08-10
-**Scope:** current Phase 4/5 completion worktrees based on the merged checkpoint
-and Phase 0–3 integration baseline
-**Production changes:** none
+**Date:** 2026-08-12
+**Scope:** on-device voice workflow completion, command safety, signed model
+supply chain, crash-safe command recovery, and paired iOS/backend UAT
+**Production changes:** none; no deployment, remote migration, secret change,
+APNs rollout, provider rollout, or model rollout was performed
 
 ## Completion branches
 
-| Repository | Branch | Commit | Draft PR |
+| Repository | Branch | Base commit | Base state |
 |---|---|---|---|
-| Backend base | `main` | `cccd12d` | merged Phase 4/5 base |
-| Backend follow-up | `agent/phase45-completion-backend` | `cccd12d` | [merged PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) |
-| iOS | `agent/phase45-completion-ios` | `e31101c` | pending draft PR |
+| iOS | `agent/voice-workflow-completion-ios-20260811` | `931c6bf54a328d067759daf1b243e75ae28bddcc` | merged frontend PR #14 `main` |
+| Backend | `agent/voice-workflow-completion-backend-20260811` | `c83b04d6f71dbb0749f8dbaff641509b0d242f08` | merged backend PR #27 `main` |
 
-The follow-up branch is based on merged PR #10. PR #11 passed its GitHub
-Actions Rust backend CI run and is now merged into `main`; it is not deployed
-or applied to production. The contract-parity follow-up is a separate change.
-The remaining release gates still require human approval. The numbered gate handoff is tracked in
-[`docs/RELEASE_GATE_MATRIX.md`](RELEASE_GATE_MATRIX.md).
+Both worktrees were fetched immediately before handoff and matched
+`origin/main`. The changes remain unmerged until paired draft PR review.
 
-## Implemented baseline
+## Implemented checklist
 
-- Canonical D01–D40 architecture decisions with a Chinese summary.
-- OpenAPI 3.1 REST, SSE, error, pagination, and `CommandEnvelope v1` contract.
-- Backend migrations 0003–0012 for commands, confirmation, messages,
-  retrievals, phone changes, outbox, retention/deletion metadata, rate limits,
-  compatibility-operation claim fencing, and durable vertical-action effects.
-- Server-side command validation, action registry, idempotency, confirmation,
-  undo/cancel routes, retryable unknown outcomes, and outbox execution boundary.
-- Provider cancellation now requires an explicit terminal cancellation state
-  and uses a durable per-operation idempotency fence; exhausted retryable
-  outbox work remains `unknown` instead of being misreported as terminal
-  failure, and scheduled reconciliation can complete pending cancellation
-  without another user request.
-- Durable local reminder and draft effects, an internal queued message effect,
-  and provider-idempotency records for the three release vertical actions.
-- Additive command-list, pairing-status, push-dismiss, and rich action-descriptor
-  contracts; race-safe pairing claim tokens and command cursor pagination.
-- Explicit local/external/disabled provider modes, action feature flags,
-  provider-attempt failure states, bounded stale-lease recovery, credential-key
-  rejection in command arguments, and secret-only JWT/APNs signing material.
-- Non-development legacy JWT configuration fails closed without an explicit
-  32-character secret; pairing codes use high-entropy URL-safe tokens with a
-  tighter unauthenticated rate-limit bucket; APNs payloads contain only
-  privacy-light identifiers rather than the full voice script.
-- Request correlation accepts only validated `X-Request-ID` values, rate-limit
-  and audit metadata use the trusted Cloudflare edge IP header, and `/metrics`
-  exposes provider/APNs/model readiness gauges.
-- Secret-authenticated HTTPS provider webhook adapter for reminders and
-  messages, reminder due-time leases/retries, deduplicated reminder pushes,
-  and scheduled message/retrieval retention sweep.
-- Authenticated retrieval download streaming from R2 with user/session/expiry
-  checks, private no-store response headers, no `r2_key` disclosure, and
-  retention cleanup that removes only unreferenced R2 objects before deleting
-  D1 metadata. New object references are restricted to the authenticated
-  user's `users/{user_id}/retrievals/` namespace.
-- Provider lifecycle operations for external reminders/messages: delivery,
-  status lookup, reminder cancellation for Undo, timeout-to-unknown handling,
-  and idempotent status reconciliation without a duplicate provider delivery;
-  provider keys are user/action scoped, the running attempt is persisted before
-  the provider call, and legacy keys remain reconcilable.
-- Outbox idempotency keys are user/operation scoped while the original client
-  `CommandEnvelope.idempotency_key` remains unchanged in the command resource.
-- Local reminder stale leases are bounded by the attempt limit, and a deleted
-  session cannot trigger a local due-time notification.
-- Safe staging Wrangler template with explicit origin/version validation and
-  disabled external effects.
-- OpenAPI compatibility baseline and breaking-change smoke for retained v1
-  routes, methods, required fields, enum values, and the actual `/health` route.
-- Versioned, atomic, idempotent command Undo for local reminder/draft effects.
-- Signed model descriptor endpoint and production fail-closed model
-  configuration checks, including required manifest integrity/capability
-  fields; the iOS target consumes the official LiteRT-LM 0.12
-  C framework without the upstream unsafe SwiftPM linker flags.
-- User-scoped history/retrieval/search/session/push routes and deletion
-  tombstones.
-- Cursor-based sync and notification-only SSE semantics.
-- iOS 15-compatible SQLite cache, pending queue, cursor persistence, serialized
-  SSE reconciliation, retry metadata handling, and message/retrieval tombstone
-  convergence.
-- Push-to-talk/VAD voice boundary, strict local command-envelope decoding,
-  signed model manifest verification, and backend-only command submission.
+### iOS voice and command boundary
+
+- [x] Push-to-talk capture with sustained-speech VAD, no-speech timeout,
+  maximum-duration cutoff, and graceful final-transcript drain.
+- [x] Capture, inference, and API submission are cancellable as a workflow;
+  backgrounding, audio interruption, route loss, and media-service reset abort
+  without automatic resume or command submission.
+- [x] Audio category/options and TTS state are restored after capture.
+- [x] Model output first decodes into an untrusted DTO. Duplicate JSON keys,
+  unknown fields, aliases that collide, invalid types, unsupported intents,
+  missing parameters, and out-of-policy lengths fail closed.
+- [x] A local authoritative policy derives risk and confirmation requirements.
+  The model cannot select identity, command ID, session, locale, timezone,
+  model version, risk, or permission policy.
+- [x] Supported release intents are exactly `search_history`,
+  `create_reminder`, `create_draft`, and `send_message`; `send_message` is
+  always high risk and always requires confirmation.
+- [x] Low-confidence or ambiguous output produces clarification and never a
+  guessed date, person, amount, or side effect.
+
+### Signed model supply chain
+
+- [x] Domain-separated Ed25519 signing payload binds manifest schema, model
+  ID/version, artifact SHA-256, byte size, and minimum capability.
+- [x] Release script and Swift verifier use the same deterministic payload.
+- [x] Descriptor ID and signed manifest ID must both match the requested
+  `gemma-command` model.
+- [x] Semantic-version precedence, active/rollback persistence, relaunch
+  re-verification, streamed download, 2 GiB ceiling, exact-origin redirect
+  fencing, HTTPS-only policy, hash/size/signature checks, and rollback are
+  implemented.
+- [x] LiteRT-LM creates a fresh conversation for each command and releases the
+  response/conversation on every return path.
+- [x] Model preparation is coalesced into one task and cancelled at logout.
+
+### Crash-safe command lifecycle
+
+- [x] SQLite stores a single active command checkpoint scoped by canonical API
+  origin and authenticated stable user ID before the POST is issued.
+- [x] Cold-start recovery reuses the exact envelope and idempotency key and
+  rejects command-ID/version regressions.
+- [x] Presentation text is backend-owned. Missing or invalid presentation is
+  shown generically and is never synthesized from raw command arguments.
+- [x] Terminal presentation persists until mounted and TTS speaks at most once
+  for each backend command version.
+- [x] Confirmation tokens are checkpointed before UI consumption.
+- [x] If an awaiting-confirmation response is lost, an exact idempotent replay
+  atomically invalidates the previous one-time token and returns a fresh token
+  only after ownership, command hash, state, version, and expiry checks.
+
+### Backend contract and privacy
+
+- [x] Authenticated model descriptor and user-authorized private R2 streaming
+  use `private, no-store` and do not expose internal R2 keys.
+- [x] Command summaries and presentation responses omit raw command payload,
+  result, error, recipient, and body data.
+- [x] Exact command replay and confirmation-token rotation are covered by Rust
+  and local contract tests.
+- [x] OpenAPI 3.1, production configuration checks, local Worker/D1/R2 gate,
+  voice-model signing smoke, route parity, retention, isolation, correlation,
+  rate limiting, provider lifecycle, and log sanitization are included in the
+  release gate.
+
+### UI regression harness
+
+- [x] Each UI test creates its own authenticated local fixture.
+- [x] Empty Xcode environment values no longer override the default local
+  Worker URL; the same normalized URL is passed to the fixture process and the
+  application process.
+- [x] Home Today/This Week, drawer, Settings/pairing, destructive confirmation,
+  and queued-state flows pass against an isolated local Worker and local D1.
 
 ## Verification executed
 
 ### Backend
 
-- `cargo fmt --all -- --check` — passed
-- `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test -q` — 42 passed
-- `cargo check --target wasm32-unknown-unknown -q` — passed
-- `worker-build --release` — passed; optimized Worker bundle generated
-- `scripts/architecture-migration-smoke.sh` — passed
-- `scripts/adversarial-data-smoke.sh` — passed for cross-user isolation,
-  deleted-resource write barriers, message/retrieval tombstones, lease fencing,
-  event idempotency gates, outbox lease recovery, and cursor scope
-- `scripts/contract-schema-smoke.sh` — passed
-- `scripts/contract-route-parity-smoke.sh` — passed: 47 executable operations match OpenAPI
-- `scripts/contract-breaking-smoke.sh` — passed
-- `scripts/provider-safety-smoke.sh` — passed
-- `scripts/r2-download-smoke.sh` against an isolated local Worker + local D1/R2
-  — passed for authorized streaming, metadata headers, no key disclosure,
-  user-namespaced keys, shared-key retention cleanup, and cross-user isolation.
-- `scripts/r2-download-smoke.sh` now supports the same route/retention/isolation
-  flow against deployed staging with `R2_SMOKE_REMOTE=true` and a materialized
-  staging Wrangler config; that external run remains pending.
-- `scripts/provider-lifecycle-smoke.sh` against an isolated local Worker and
-  mock provider — passed for reminder delivery/cancellation, scheduled
-  cancellation recovery, timeout status reconciliation, and an asynchronous high-risk message moving from provider
-  `accepted` to status `delivered` before the command became `sent`; provider
-  keys remained user/action scoped and no duplicate delivery was observed.
-- `scripts/production-config-smoke.sh` — passed, including the staging
-  template and staging fail-closed checks
-- `scripts/backup-restore-smoke.sh` — passed for encrypted export/decrypt,
-  checksum, SQLite integrity, and schema/data restore
-- `scripts/phase45-release-gate.sh` — passed
-- [PR #11 GitHub Actions Rust backend CI](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31347710519) — passed for final commit `5b7f59101745c7d3feae3c2c60175f0dc9e5ce35`, then merged as `cccd12d`
-- Read-only production health probe — passed; deployed version was
-  `2026.08.08-build-25`, so this does not count as PR #11 deployment evidence.
-- `scripts/staging-contract-gate.sh` and manual
-  `.github/workflows/staging-contract-gate.yml` — prepared, not executed;
-  the workflow now materializes a staging Wrangler config and includes the
-  deployed R2 route smoke, but independent staging Worker/D1/R2 resources and
-  UAT credentials do not yet exist.
-- `scripts/contract-smoke.sh` against an isolated local Worker + local D1 —
-  passed, including command list, pairing status, push dismissal, and the
-  existing multi-turn session/action loop, metrics readiness gauges, and
-  validated request-ID propagation.
-- Local `/__scheduled` Outbox smoke — passed for reminder, draft, and message;
-  message result remained `queued` with `external_delivery: not_configured`.
-- Local reminder due-time smoke — passed: a due reminder generated one
-  deduplicated development push across repeated scheduled runs.
-- Local external-provider smoke with a mock HTTPS-boundary adapter — passed
-  for reminder delivery, provider cancellation, timeout reconciliation, and
-  confirmed high-risk message delivery; the message remained `queued`/unknown
-  while only accepted and became `sent` only after status reconciliation.
-- guarded event/outbox/confirmation SQL was prepared and executed against
-  SQLite — passed
-- `git diff --check` — passed
+- `cargo fmt --all -- --check` — passed.
+- `cargo test -q` — 63 passed, 0 failed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo check --target wasm32-unknown-unknown -q` — passed.
+- `worker-build --release` — passed.
+- `scripts/phase45-release-gate.sh` — passed.
+- `scripts/local-contract-gate.sh` — passed against isolated Worker/D1/R2.
+- OpenAPI route parity — 48 executable operations matched.
+- Voice-model release/signature and authenticated R2 smokes — passed.
+- Provider observability, rate-limit, lifecycle, production-config,
+  adversarial data, backup/restore, retention, and log-sanitization gates —
+  passed.
+- `git diff --check` — passed.
 
-### iOS
+### iOS Simulator
 
-- iOS Simulator `VoiceAgentBridgeTests` — 33 passed, 0 failed
-- Generic unsigned Release iOS device build with iOS 15 deployment target — passed
-- Full UI test target — compiled, but the three E2E tests stopped at the login
-  screen because the deployed Worker/`needs_user` fixture was not configured
-  for this local run; this is an explicit release gate, not a passing result.
-- `git diff --check` — passed
+- Full `VoiceAgentBridgeTests` on iPhone 15 / iOS 17.2 — 113 total:
+  112 passed, 0 failed, 1 intentionally skipped.
+- `VoiceAgentBridgeUITests` against isolated local Worker/D1 — 3 passed,
+  0 failed.
+- UI evidence captured for Home Today/This Week, drawer, Settings, decision
+  detail, destructive confirmation, and queued state.
+- Generic signed Release arm64 build with iOS 15 deployment floor — passed.
+- `git diff --check` — passed.
 
-## Review findings addressed
+### Physical iPhone 13 Pro
 
-The adversarial review identified and the integrated branches addressed the
-following high-risk issues: sibling migration drift, incomplete deleted-session
-write barriers for sessions and commands, non-atomic event idempotency claims,
-un-fenced compatibility-operation lease takeover, permanently stuck Outbox
-leases, unverified rate-limit identity, discarded structured retry metadata,
-incomplete local tombstone cleanup, a globally writable skill registry, an iOS
-permanent-error retry loop, non-additive checkpoint response requirements,
-cross-user Provider and Outbox idempotency-key collision risk, unscoped R2
-references, shared-key retention deletion, and the provider-call crash window.
-The latter issues are closed in PR #11 for new data; legacy records remain
-reconcilable and still require staged migration evidence.
+- Device: `Klaus 的iPhone`, iPhone 13 Pro, iOS 26.6 beta, wired developer mode.
+- Staging configuration built and signed for `hk.knockknock.app` — passed.
+- Staging endpoint embedded as
+  `https://knock-knock-backend-staging.wch-klaus.workers.dev` — verified.
+- App installed and launched while the device was unlocked — passed.
+- Full `VoiceAgentBridgeTests` on the physical device — 113 total:
+  112 passed, 0 failed, 1 intentionally skipped.
 
-## Remaining release gates
+### Physical iPhone 17 Pro Max
 
-The same gates are numbered RG-01–RG-07 in
-[`docs/RELEASE_GATE_MATRIX.md`](RELEASE_GATE_MATRIX.md) so agents cannot
-mistake local verification for production approval.
+- Device: `Klaus’s iPhone 17 Pro Max`, iPhone 17 Pro Max, paired Xcode device.
+- Staging configuration built, signed, installed, and launched independently
+  for `hk.knockknock.app` — passed.
+- Full `VoiceAgentBridgeTests` on the physical device — 113 total:
+  112 passed, 0 failed, 1 intentionally skipped.
+- Debug UI fixtures were intentionally not run on this phone because their
+  isolation contract clears Keychain and local cache. This preserves the
+  user's existing Staging login; the same UI workflows passed on the isolated
+  simulator instead.
 
-These are deliberately not marked as passed:
+## Intentionally open release gates
 
-- independent staging Worker + D1 creation and route-level D1/E2E smoke
-  plus R2 bucket creation and route-level D1/R2/E2E smoke against those
-  deployed bindings;
-- paired PR review for the post-PR #11 contract-parity follow-up;
-- production provider selection, provider sandbox/contract evidence, real
-  provider credentials, vendor-specific cancellation/reconciliation policy,
-  and production rollout approval (the generic lifecycle adapter is
-  implemented and locally verified);
-- 20–100 example golden voice dataset, ≥95% accuracy evidence, and zero
-  high-risk false execution evidence;
-- physical iPhone 13 audio, memory, thermal, crash, and real APNs testing;
-- formal security review and production observability/alert review;
-- human approval for merging the contract-parity follow-up, production migrations, APNs changes,
-  and model rollout.
+The skipped test is
+`VoiceModelGoldenEvaluationTests.testSignedModelMeetsAccuracySafetyAndLatencyGates`.
+It requires an approved real `.litertlm` Gemma artifact, a pinned production
+public key, and signed descriptor inputs. No placeholder model is accepted.
 
-## Rollback
+- [ ] Approve and publish a real signed `gemma-command` artifact to non-public
+  staging R2, then run the 20–100-example golden suite with at least 95%
+  intent accuracy and zero high-risk false execution.
+- [ ] Run real microphone → STT → Gemma → CommandEnvelope → backend → TTS UAT
+  on iPhone 13 Pro, including Chinese, English, and Cantonese locale labels.
+- [ ] Measure physical-device latency, peak memory, thermal state, battery
+  impact, cancellation during inference, and repeated-session crash behavior.
+- [ ] Verify real APNs delivery rather than configuration readiness only.
+- [ ] Verify true airplane-mode cached display/recovery and simultaneous
+  same-account convergence on two physical devices.
+- [ ] Approve an external action provider and its credentials. Staging remains
+  intentionally fail-closed while `action_provider_ready=false`.
+- [ ] Complete paired human review, security/observability review, and explicit
+  approvals for merge, production migration, APNs, provider, and model rollout.
 
-Do not merge the follow-up PR until the gates above are approved. Revert the
-follow-up commit (and its documentation handoff) or close the draft PR; no
-production data or migration has been changed. Migrations 0010–0012 are
-additive and require a separately approved rollback plan if applied remotely.
+LiteRT-LM 0.12 exposes a synchronous native send call. Task cancellation
+prevents backend submission immediately, but the native call itself cannot be
+preempted; its conversation is released when the call returns. This limitation
+must be included in physical latency and lifecycle UAT.
+
+## Release decision and rollback
+
+The implementation is ready for paired draft PR review, not production
+release. Rollback is to revert/close the paired PRs. No remote schema, object,
+secret, APNs configuration, production provider, or production data was
+changed by this work.

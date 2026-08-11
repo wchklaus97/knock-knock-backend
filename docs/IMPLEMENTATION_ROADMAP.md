@@ -4,43 +4,39 @@
 > The canonical decisions live in `ARCHITECTURE_DECISIONS.md`; this document
 > defines agent boundaries, handoffs, verification, and release gates.
 
-## Execution status — 2026-08-10
+## Execution status — 2026-08-11
 
-The staged implementation through PR #10 and the Backend Phase 4/5 completion
-follow-up PR #11 are merged. PR #11 is merged into `main` but has not been
-deployed as a production release. The current contract-parity follow-up is
-being prepared from that merge base; the current dependency chain is:
+The architecture, data, sync, history, command-safety, staging, and UI
+checkpoints are merged. The only bases for the current paired voice work are:
 
-| Stage | Backend | iOS | Status |
+| Repository | Merged base | Current completion branch | Status |
 |---|---|---|---|
-| Checkpoint | [PR #1](https://github.com/wchklaus97/knock-knock-backend/pull/1) | [PR #1](https://github.com/wchklaus97/knock-knock-frontend/pull/1) | Baseline, human merge required |
-| Phase 0 | [PR #2](https://github.com/wchklaus97/knock-knock-backend/pull/2) | [PR #2](https://github.com/wchklaus97/knock-knock-frontend/pull/2) | Documents and contract complete |
-| Phase 1 | [PR #3](https://github.com/wchklaus97/knock-knock-backend/pull/3) | — | Foundation implementation complete |
-| Phase 2 | — | [PR #3](https://github.com/wchklaus97/knock-knock-frontend/pull/3) | SQLite/offline implementation complete |
-| Phase 3 | [PR #4](https://github.com/wchklaus97/knock-knock-backend/pull/4), [hardening PR #6](https://github.com/wchklaus97/knock-knock-backend/pull/6) | [PR #4](https://github.com/wchklaus97/knock-knock-frontend/pull/4) | History/retrieval and deletion hardening complete |
-| Phase 4 | — | [PR #5](https://github.com/wchklaus97/knock-knock-frontend/pull/5), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Local voice boundary and command submission complete |
-| Phase 5 | [integrated PR #8](https://github.com/wchklaus97/knock-knock-backend/pull/8), [merged PR #10](https://github.com/wchklaus97/knock-knock-backend/pull/10), [merged completion PR #11](https://github.com/wchklaus97/knock-knock-backend/pull/11) | [release PR #6](https://github.com/wchklaus97/knock-knock-frontend/pull/6), [command API PR #7](https://github.com/wchklaus97/knock-knock-frontend/pull/7) | Backend CI passed; production and external verification gates remain |
+| Backend | `c83b04d` ([PR #27](https://github.com/wchklaus97/knock-knock-backend/pull/27)) | `agent/voice-workflow-completion-backend-20260811` | Local implementation and verification in progress; not deployed |
+| iOS | `931c6bf` ([PR #14](https://github.com/wchklaus97/knock-knock-frontend/pull/14)) | `agent/voice-workflow-completion-ios-20260811` | Local implementation and verification in progress; not distributed |
 
-Verified in the current integration branches and merged PR #11: OpenAPI and migration smoke,
-adversarial SQL isolation/deletion/lease tests, Rust unit tests, Rust WASM
-check, strict Clippy, iOS 15 simulator tests, and generic iOS build. Remaining
-human release gates are route-level D1/E2E tests against deployed bindings,
-security review, the 20–100 example golden voice dataset with device
-performance evidence, paired review, and approval of merge, production
-migrations, APNs changes, and model rollout.
+The protected staging deploy and contract workflows passed for backend
+`c83b04d`, and 20 consecutive health probes passed. The current voice branches
+add strict app-owned command canonicalization, backend-owned presentation,
+crash-safe pre-POST SQLite checkpoint/replay, one-time confirmation-token
+rotation, lightweight command summaries, authenticated private-R2 model
+delivery, signed release tooling, and a 32-example multilingual golden fixture.
+
+Remaining external gates are an operator-licensed and signed Gemma artifact,
+real-model ≥95%/zero-high-risk-false-execution evidence, exact-current-revision
+iPhone 13 microphone/memory/thermal/crash UAT, real APNs delivery, simultaneous
+two-physical-device convergence, provider sandbox approval, paired PR review,
+and human approval of deployment, secrets, migrations, and model rollout.
 
 The detailed evidence and rollback record is in
 `docs/RELEASE_VERIFICATION_REPORT.md`.
 The numbered release handoff is in `docs/RELEASE_GATE_MATRIX.md`.
 
-### Contract parity follow-up — 2026-08-10
+### Contract parity checkpoint
 
-The post-PR #11 contract follow-up keeps the OpenAPI document aligned with all
-47 executable operations, including the legacy `/v1/health` alias, agent key
-rotation, skills, session detail, and session progress routes. The route parity
-smoke compares the Rust dispatch table with OpenAPI and the local contract
-smoke exercises the newly covered routes. This follow-up must be reviewed and
-merged before any client regenerates its API bindings.
+Merged PR #12 aligned OpenAPI with the 47 executable operations at that point.
+The current private model-artifact route is the 48th operation; the same parity
+smoke covers it. The paired voice PRs must be reviewed before any generated
+client treats `CommandPresentation` as required.
 
 ### Backend follow-up checkpoint — 2026-08-10
 
@@ -96,6 +92,18 @@ The follow-up branch now extends the earlier staged work with:
 - an iOS 15 system on-device STT path, push-to-talk controller, the official
   LiteRT-LM 0.12 C-framework Gemma command generator, signed artifact store,
   and rollback-aware manager;
+- an authenticated same-origin `GET /v1/phone/models/{model_id}/artifact`
+  private-R2 stream, disk-backed Wi-Fi-safe iOS download, Ed25519 release
+  script, and `docs/VOICE_MODEL_RELEASE_RUNBOOK.md`;
+- strict model-draft canonicalization that replaces model-owned IDs, locale,
+  timezone, device, and model version with trusted app context before POST;
+- a 32-example English, Chinese, and Cantonese golden fixture including
+  ambiguity and prompt-injection cases, with opt-in signed real-model metrics;
+- backend-only `CommandPresentation` for privacy-safe UI/TTS, command-list
+  summaries without raw results/errors, and an iOS SQLite checkpoint written
+  before POST for crash-safe replay and monotonic REST reconciliation;
+- exact idempotent high-risk create replay that rotates the one active
+  confirmation token while retaining invalidated token audit records;
 - a static `scripts/phase45-release-gate.sh` that runs Rust, contract,
   migration, adversarial, provider-safety, configuration, compatibility, and
   secret-hygiene checks;
@@ -121,9 +129,11 @@ The follow-up branch now extends the earlier staged work with:
   lease recovery, and a deleted-session barrier for local due notifications.
 
 This does not close release by itself. The official WhisperKit package is not
-linked while the app deployment floor remains iOS 15; a signed model artifact,
-the pinned iOS public key, deployed D1/E2E checks, real-device voice evidence,
-security review, and human approval are still explicit gates.
+linked while the app deployment floor remains iOS 15; the current default STT
+is Apple's on-device Speech framework. A human must accept the Gemma license
+and supply the signed artifact and pinned iOS public key. Real-model,
+real-device voice, APNs/two-device, provider, security, paired review, and
+human rollout approval remain explicit gates.
 
 ## Operating rules
 

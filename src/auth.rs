@@ -294,9 +294,13 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
 
     if config_value(env, "VOICE_MODEL_ENABLED", "false") == "true" {
         let model_url = config_value(env, "VOICE_MODEL_URL", "");
+        let model_r2_key = config_value(env, "VOICE_MODEL_R2_KEY", "");
         let manifest = config_value(env, "VOICE_MODEL_MANIFEST_JSON", "");
-        if !model_url.starts_with("https://")
-            || model_url.starts_with("https://REPLACE_")
+        let has_secure_url =
+            model_url.starts_with("https://") && !model_url.starts_with("https://REPLACE_");
+        let has_private_r2_key =
+            !model_r2_key.trim().is_empty() && !model_r2_key.trim().starts_with("REPLACE_");
+        if (!has_secure_url && !has_private_r2_key)
             || manifest.trim().is_empty()
             || manifest.trim().starts_with("REPLACE_")
             || serde_json::from_str::<Value>(&manifest).is_err()
@@ -304,7 +308,7 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
             return Err(ApiError::new(
                 500,
                 "configuration_error",
-                "VOICE_MODEL_URL and VOICE_MODEL_MANIFEST_JSON must be configured for model rollout",
+                "VOICE_MODEL_URL or VOICE_MODEL_R2_KEY, plus VOICE_MODEL_MANIFEST_JSON, must be configured for model rollout",
             ));
         }
     }

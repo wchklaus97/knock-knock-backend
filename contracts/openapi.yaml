@@ -835,6 +835,24 @@ paths:
                 $ref: '#/components/schemas/ModelArtifactDescriptor'
         default:
           $ref: '#/components/responses/Error'
+  /v1/phone/models/{model_id}/artifact:
+    get:
+      tags: [Phone]
+      operationId: downloadPhoneModelArtifact
+      description: Streams an authenticated signed model from private R2. The storage key is never returned.
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      responses:
+        '200':
+          description: Signed model artifact bytes. The client must verify the manifest before activation.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        default:
+          $ref: '#/components/responses/Error'
   /v1/phone/search:
     get:
       tags: [Phone]
@@ -1179,9 +1197,20 @@ components:
         risk: { type: string, enum: [low, medium, high, destructive] }
         confirm_required: { type: boolean }
         reversible: { type: boolean }
+    CommandPresentation:
+      type: object
+      additionalProperties: false
+      required: [schema_version, code, locale, display_text, voice_script, terminal]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        code: { type: string, minLength: 1, maxLength: 128 }
+        locale: { type: string, minLength: 2, maxLength: 32 }
+        display_text: { type: string, minLength: 1, maxLength: 512 }
+        voice_script: { type: [string, 'null'], maxLength: 512 }
+        terminal: { type: boolean }
     CommandResponse:
       type: object
-      required: [command_id, state, version, created_at, updated_at]
+      required: [command_id, state, presentation, version, created_at, updated_at]
       properties:
         command_id: { type: string }
         state:
@@ -1192,6 +1221,8 @@ components:
           oneOf:
             - $ref: '#/components/schemas/CommandActionMetadata'
             - type: 'null'
+        presentation:
+          $ref: '#/components/schemas/CommandPresentation'
         confirmation_token: { type: [string, 'null'] }
         result:
           type: [object, 'null']
@@ -1205,7 +1236,8 @@ components:
         updated_at: { type: string, format: date-time }
     CommandSummary:
       type: object
-      required: [command_id, intent, risk_level, needs_confirmation, state, version, created_at, updated_at]
+      description: Lightweight command-list item. Full command arguments, raw results, and raw errors are detail-only.
+      required: [command_id, intent, risk_level, needs_confirmation, state, presentation, version, created_at, updated_at]
       properties:
         command_id: { type: string }
         session_id: { type: [string, 'null'] }
@@ -1214,12 +1246,8 @@ components:
         needs_confirmation: { type: boolean }
         state:
           $ref: '#/components/schemas/CommandState'
-        result:
-          type: [object, 'null']
-          additionalProperties: true
-        error:
-          type: [object, 'null']
-          additionalProperties: true
+        presentation:
+          $ref: '#/components/schemas/CommandPresentation'
         expires_at: { type: [string, 'null'], format: date-time }
         version: { type: integer, minimum: 0 }
         created_at: { type: string, format: date-time }
@@ -1239,7 +1267,9 @@ components:
       additionalProperties: false
       required: [model_id, manifest, download_url]
       properties:
-        model_id: { type: string }
+        model_id:
+          type: string
+          description: Must exactly equal manifest.model_id.
         manifest:
           $ref: '#/components/schemas/ModelManifest'
         download_url: { type: string, format: uri }
@@ -1251,10 +1281,17 @@ components:
       properties:
         schema_version: { type: integer, const: 1 }
         model_id: { type: string, minLength: 1, maxLength: 128 }
-        model_version: { type: string, pattern: '^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$' }
+        model_version:
+          type: string
+          maxLength: 128
+          pattern: '^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)([.](0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?([+]([0-9A-Za-z-]+([.][0-9A-Za-z-]+)*))?$'
         sha256: { type: string, pattern: '^[0-9a-fA-F]{64}$' }
-        signature: { type: string, minLength: 1 }
-        size_bytes: { type: integer, minimum: 1 }
+        signature:
+          type: string
+          minLength: 88
+          maxLength: 88
+          description: Base64 Ed25519 signature over the deterministic com.knockknock.voice-model-manifest.ed25519.v1 payload documented in the release runbook.
+        size_bytes: { type: integer, minimum: 1, maximum: 2147483648 }
         minimum_capability: { type: string, minLength: 1, maxLength: 64 }
     ConfirmationRequest:
       type: object
