@@ -87,9 +87,10 @@ Both worktrees were fetched immediately before handoff and matched
 - [x] Empty Xcode environment values no longer override the default local
   Worker URL; the same normalized URL is passed to the fixture process and the
   application process.
-- [x] When a signed model trust key is intentionally absent, the physical app
-  now shows an actionable configuration message instead of an internal Swift
-  error type.
+- [x] When a signed model trust key is intentionally absent, AppStore now maps
+  the failure to an actionable configuration message and sanitizes every
+  unknown model-preparation error. The mapping passes simulator and iPhone 17
+  tests; final mirrored-banner visual confirmation waits for Mac unlock.
 - [x] Home Today/This Week, drawer, Settings/pairing, destructive confirmation,
   and queued-state flows pass against an isolated local Worker and local D1.
 
