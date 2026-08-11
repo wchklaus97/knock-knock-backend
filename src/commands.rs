@@ -67,11 +67,14 @@ const MAX_MODEL_VERSION: usize = 128;
 const MAX_CONFIRMATION_TOKEN: usize = 256;
 const COMMAND_TTL_SECONDS: i64 = 900;
 const CONFIRMATION_TTL_SECONDS: i64 = 600;
+const SQLITE_EXECUTION_TIME_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 const UNDO_WINDOW_SECONDS: f64 = 600.0;
 const MAX_ACTION_TITLE: usize = 200;
 const MAX_ACTION_RECIPIENT: usize = 320;
 const MAX_ACTION_BODY: usize = 8_000;
 const MAX_ACTION_DUE_AT: usize = 64;
+pub const RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL: &str = "EXISTS (SELECT 1 FROM action_attempts AS recovery_attempt WHERE recovery_attempt.command_id = commands.id AND recovery_attempt.user_id = commands.user_id AND recovery_attempt.state IN ('succeeded', 'running', 'unknown', 'retrying'))";
+pub const ACTION_EFFECT_MAY_HAVE_STARTED_SQL: &str = "EXISTS (SELECT 1 FROM action_attempts AS started_attempt WHERE started_attempt.command_id = commands.id AND started_attempt.user_id = commands.user_id AND (started_attempt.state = 'succeeded' OR (started_attempt.state IN ('running', 'unknown', 'retrying') AND started_attempt.attempts >= 1)))";
 #[allow(dead_code)]
 const STATES: [&str; 11] = [
     "pending",
@@ -248,10 +251,156 @@ fn action_argument_fields(intent: &str) -> Option<&'static [ActionStringField]> 
     }
 }
 
-/// Validate the argument shape for a registered action before it can enter
-/// the durable queue. The executor repeats this check immediately before an
-/// effect, so legacy or manually repaired rows cannot bypass the same rules.
-pub fn validate_action_args(
+fn decimal(bytes: &[u8]) -> Option<u32> {
+    (!bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit)).then(|| {
+        bytes
+            .iter()
+            .fold(0, |value, digit| value * 10 + u32::from(digit - b'0'))
+    })
+}
+
+fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+fn days_in_month(year: u32, month: u32) -> Option<u32> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 => Some(if is_leap_year(year) { 29 } else { 28 }),
+        _ => None,
+    }
+}
+
+// Howard Hinnant's civil-date conversion, shifted to the Unix epoch.
+fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+// RFC3339 constrained to ordinary seconds and millisecond precision, matching
+// the execution clock used for the strict-future comparison.
+fn parse_reminder_due_at_millis(timestamp: &str) -> Option<i64> {
+    let bytes = timestamp.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+
+    let year = decimal(&bytes[0..4])?;
+    let month = decimal(&bytes[5..7])?;
+    let day = decimal(&bytes[8..10])?;
+    let hour = decimal(&bytes[11..13])?;
+    let minute = decimal(&bytes[14..16])?;
+    let second = decimal(&bytes[17..19])?;
+    if day == 0 || day > days_in_month(year, month)? || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+
+    let mut cursor = 19;
+    let mut milliseconds = 0_u32;
+    let mut fractional_digits = 0_usize;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let fraction_start = cursor;
+        while let Some(digit) = bytes.get(cursor).filter(|digit| digit.is_ascii_digit()) {
+            if fractional_digits >= 3 {
+                return None;
+            }
+            milliseconds = milliseconds * 10 + u32::from(*digit - b'0');
+            fractional_digits += 1;
+            cursor += 1;
+        }
+        if cursor == fraction_start {
+            return None;
+        }
+        for _ in fractional_digits..3 {
+            milliseconds *= 10;
+        }
+    }
+
+    let offset_seconds = match bytes.get(cursor).copied()? {
+        b'Z' | b'z' if cursor + 1 == bytes.len() => 0_i64,
+        sign @ (b'+' | b'-') if cursor + 6 == bytes.len() && bytes[cursor + 3] == b':' => {
+            let offset_hour = decimal(&bytes[cursor + 1..cursor + 3])?;
+            let offset_minute = decimal(&bytes[cursor + 4..cursor + 6])?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            let magnitude = i64::from(offset_hour * 3_600 + offset_minute * 60);
+            if sign == b'+' {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+        _ => return None,
+    };
+
+    let unix_seconds = days_from_civil(year, month, day) * 86_400
+        + i64::from(hour * 3_600 + minute * 60 + second)
+        - offset_seconds;
+    unix_seconds
+        .checked_mul(1_000)?
+        .checked_add(i64::from(milliseconds))
+}
+
+fn current_unix_millis() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        worker::js_sys::Date::now() as i64
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+            Err(error) => -i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX),
+        }
+    }
+}
+
+fn reminder_due_at(args: &Map<String, Value>) -> Option<&str> {
+    let field = CREATE_REMINDER_FIELDS
+        .iter()
+        .find(|field| field.canonical == "due_at")?;
+    let mut present = field.keys().filter_map(|key| args.get(key));
+    let due_at = present.next()?.as_str()?;
+    present.next().is_none().then_some(due_at)
+}
+
+fn validate_action_args_at(
+    intent: &str,
+    args: &Map<String, Value>,
+    now_millis: i64,
+) -> Result<(), CommandValidationError> {
+    validate_action_args_shape(intent, args)?;
+    let valid = intent != "create_reminder"
+        || reminder_due_at(args)
+            .and_then(parse_reminder_due_at_millis)
+            .is_some_and(|due_at_millis| due_at_millis > now_millis);
+    valid
+        .then_some(())
+        .ok_or(CommandValidationError::InvalidActionArguments)
+}
+
+/// Validate the immutable argument contract without applying a time-relative
+/// execution rule. Durable recovery uses this after a provider has already
+/// confirmed success, because an elapsed reminder deadline must not turn a
+/// completed external effect into a local failure.
+pub fn validate_action_args_shape(
     intent: &str,
     args: &Map<String, Value>,
 ) -> Result<(), CommandValidationError> {
@@ -260,10 +409,24 @@ pub fn validate_action_args(
     let valid = args
         .keys()
         .all(|key| fields.iter().any(|field| field.accepts_key(key)))
-        && fields.iter().all(|field| field.validates(args));
+        && fields.iter().all(|field| field.validates(args))
+        && (intent != "create_reminder"
+            || reminder_due_at(args)
+                .and_then(parse_reminder_due_at_millis)
+                .is_some());
     valid
         .then_some(())
         .ok_or(CommandValidationError::InvalidActionArguments)
+}
+
+/// Validate the argument shape for a registered action before it can enter
+/// the durable queue. The executor repeats this check immediately before an
+/// effect, so legacy or manually repaired rows cannot bypass the same rules.
+pub fn validate_action_args(
+    intent: &str,
+    args: &Map<String, Value>,
+) -> Result<(), CommandValidationError> {
+    validate_action_args_at(intent, args, current_unix_millis())
 }
 
 /// Check the persisted policy again at the execution boundary. This is a
@@ -908,6 +1071,42 @@ fn expirable_state(state: &str) -> bool {
     )
 }
 
+fn command_ttl_expiration_condition() -> String {
+    format!(
+        "expires_at IS NOT NULL AND expires_at <= ? AND NOT {}",
+        RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
+    )
+}
+
+fn confirmation_token_expiration_condition() -> String {
+    format!(
+        "state = 'awaiting_confirmation' AND EXISTS (SELECT 1 FROM confirmation_tokens WHERE command_id = commands.id AND user_id = commands.user_id AND used_at IS NULL AND expires_at <= ?) AND NOT {}",
+        RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
+    )
+}
+
+fn expire_due_candidates_sql() -> String {
+    format!(
+        "SELECT id, user_id FROM commands WHERE (state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable', 'unknown') AND {}) OR ({}) ORDER BY updated_at ASC LIMIT 50",
+        command_ttl_expiration_condition(),
+        confirmation_token_expiration_condition()
+    )
+}
+
+async fn has_recoverable_action_attempt(
+    db: &D1Database,
+    user_id: &str,
+    command_id: &str,
+) -> ApiResult<bool> {
+    Ok(db::first::<IdOnly>(
+        db,
+        "SELECT command_id AS id FROM action_attempts WHERE command_id = ? AND user_id = ? AND state IN ('succeeded', 'running', 'unknown', 'retrying') LIMIT 1",
+        vec![db::text(command_id), db::text(user_id)],
+    )
+    .await?
+    .is_some())
+}
+
 /// Persist an expiration transition exactly once. The `changes()` fences make
 /// audit, sync, and outbox cleanup conditional on the command update that won
 /// the race; a second sweeper or request is therefore a no-op.
@@ -924,9 +1123,9 @@ async fn mark_expired(
     let now = db::now_iso();
     let next_version = command.version + 1;
     let condition = if confirmation_token_expired {
-        "state = 'awaiting_confirmation' AND EXISTS (SELECT 1 FROM confirmation_tokens WHERE command_id = commands.id AND user_id = commands.user_id AND used_at IS NULL AND expires_at <= ?)"
+        confirmation_token_expiration_condition()
     } else {
-        "expires_at IS NOT NULL AND expires_at <= ?"
+        command_ttl_expiration_condition()
     };
     let statements = vec![
         db::prepare(
@@ -984,34 +1183,14 @@ async fn mark_expired(
     Ok(results.first().map(db::changes).unwrap_or(0) == 1)
 }
 
-/// Expire an active command before a read/confirm/cancel operation can act on
-/// stale authorization or queue work that is no longer valid.
-pub async fn expire_if_due(
-    db: &D1Database,
-    user_id: &str,
-    command_id: &str,
-) -> ApiResult<Option<CommandRow>> {
-    let Some(command) = get_for_user(db, user_id, command_id).await? else {
-        return Ok(None);
-    };
-    if expirable_state(&command.state) && command.expires_at.as_deref().is_some_and(db::is_expired)
-    {
-        let _ = mark_expired(db, user_id, &command, "command_expired", false).await?;
-    }
-    get_for_user(db, user_id, command_id).await
-}
-
 /// Scheduled workers call this bounded sweep before claiming outbox work. It
 /// also closes an awaiting-confirmation command when its one-time token ages
 /// out, preventing an otherwise permanent `awaiting_confirmation` record.
 pub async fn expire_due(db: &D1Database) -> ApiResult<usize> {
     let now = db::now_iso();
-    let rows: Vec<CommandScopeRow> = db::all(
-        db,
-        "SELECT id, user_id FROM commands WHERE (state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable', 'unknown') AND expires_at IS NOT NULL AND expires_at <= ?) OR (state = 'awaiting_confirmation' AND EXISTS (SELECT 1 FROM confirmation_tokens WHERE command_id = commands.id AND user_id = commands.user_id AND used_at IS NULL AND expires_at <= ?)) ORDER BY updated_at ASC LIMIT 50",
-        vec![db::text(&now), db::text(&now)],
-    )
-    .await?;
+    let query = expire_due_candidates_sql();
+    let rows: Vec<CommandScopeRow> =
+        db::all(db, &query, vec![db::text(&now), db::text(&now)]).await?;
     let mut expired = 0;
     for scope in rows {
         let Some(command) = get_for_user(db, &scope.user_id, &scope.id).await? else {
@@ -1038,31 +1217,30 @@ pub async fn expire_due(db: &D1Database) -> ApiResult<usize> {
     Ok(expired)
 }
 
-fn confirmation_replay_eligible_at(command: &CommandRow, now: &str) -> bool {
+fn confirmation_replay_command_candidate(command: &CommandRow) -> bool {
     command.state == "awaiting_confirmation"
         && command.needs_confirmation == 1
-        && command
-            .expires_at
-            .as_deref()
-            .is_some_and(|expires_at| expires_at > now)
+        && command.expires_at.is_some()
 }
 
 fn confirmation_replay_command_update_sql() -> &'static str {
-    "UPDATE commands SET version = version + 1, updated_at = ? WHERE id = ? AND user_id = ? AND idempotency_key = ? AND command_hash = ? AND version = ? AND state = 'awaiting_confirmation' AND needs_confirmation = 1 AND expires_at IS NOT NULL AND expires_at > ? AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = commands.session_id AND sessions.user_id = commands.user_id AND sessions.deleted_at IS NULL))"
+    "UPDATE commands SET version = version + 1, updated_at = ? WHERE id = ? AND user_id = ? AND idempotency_key = ? AND command_hash = ? AND version = ? AND state = 'awaiting_confirmation' AND needs_confirmation = 1 AND expires_at IS NOT NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND EXISTS (SELECT 1 FROM confirmation_tokens AS replay_token WHERE replay_token.command_id = commands.id AND replay_token.user_id = commands.user_id AND replay_token.command_hash = commands.command_hash AND replay_token.used_at IS NULL AND replay_token.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = commands.session_id AND sessions.user_id = commands.user_id AND sessions.deleted_at IS NULL))"
 }
 
 fn confirmation_replay_invalidation_sql() -> &'static str {
-    "UPDATE confirmation_tokens SET used_at = ? WHERE command_id = ? AND user_id = ? AND used_at IS NULL AND changes() = 1 AND EXISTS (SELECT 1 FROM commands AS replay_command WHERE replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > ? AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)))"
+    "UPDATE confirmation_tokens SET used_at = ? WHERE command_id = ? AND user_id = ? AND command_hash = ? AND used_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND changes() = 1 AND EXISTS (SELECT 1 FROM commands AS replay_command WHERE replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)))"
 }
 
-fn confirmation_replay_insert_sql() -> &'static str {
-    "INSERT INTO confirmation_tokens (id, command_id, user_id, token_hash, command_hash, expires_at, created_at) SELECT ?, replay_command.id, replay_command.user_id, ?, replay_command.command_hash, MIN(replay_command.expires_at, ?), ? FROM commands AS replay_command WHERE changes() = 1 AND replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > ? AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM confirmation_tokens WHERE confirmation_tokens.command_id = replay_command.id AND confirmation_tokens.user_id = replay_command.user_id AND confirmation_tokens.used_at IS NULL)"
+fn confirmation_replay_insert_sql() -> String {
+    format!(
+        "INSERT INTO confirmation_tokens (id, command_id, user_id, token_hash, command_hash, expires_at, created_at) SELECT ?, replay_command.id, replay_command.user_id, ?, replay_command.command_hash, MIN(replay_command.expires_at, strftime('%Y-%m-%dT%H:%M:%fZ','now','+{CONFIRMATION_TTL_SECONDS} seconds')), ? FROM commands AS replay_command WHERE changes() = 1 AND replay_command.id = ? AND replay_command.user_id = ? AND replay_command.idempotency_key = ? AND replay_command.command_hash = ? AND replay_command.version = ? AND replay_command.state = 'awaiting_confirmation' AND replay_command.needs_confirmation = 1 AND replay_command.expires_at IS NOT NULL AND replay_command.expires_at > {SQLITE_EXECUTION_TIME_SQL} AND (replay_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = replay_command.session_id AND sessions.user_id = replay_command.user_id AND sessions.deleted_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM confirmation_tokens WHERE confirmation_tokens.command_id = replay_command.id AND confirmation_tokens.user_id = replay_command.user_id AND confirmation_tokens.used_at IS NULL)"
+    )
 }
 
 /// Rotate the write-only confirmation authority for an exact idempotent replay.
-/// D1 marks every previous token used and inserts the replacement sequentially
-/// in one batch transaction, preserving an audit trail while the partial unique
-/// index permits at most one unused token for the command.
+/// D1 first proves the exact existing token is live, then marks only that token
+/// used and inserts the replacement sequentially in one batch transaction.
+/// The partial unique index permits at most one unused token per command hash.
 async fn reissue_confirmation_token_for_replay(
     db: &D1Database,
     user_id: &str,
@@ -1070,20 +1248,21 @@ async fn reissue_confirmation_token_for_replay(
     command_hash: &str,
     command: &CommandRow,
 ) -> ApiResult<Option<(String, i64)>> {
-    let now = db::now_iso();
     if command.user_id != user_id
         || command.idempotency_key != idempotency_key
         || command.command_hash != command_hash
-        || !confirmation_replay_eligible_at(command, &now)
+        || !confirmation_replay_command_candidate(command)
     {
         return Ok(None);
     }
 
+    // Metadata only; D1 evaluates expiry at statement execution.
+    let now = db::now_iso();
     let token = new_id("ctok")?;
     let token_hash = sha256_hex(&token);
     let token_id = new_id("cont")?;
-    let token_expires_at = db::add_seconds_iso(CONFIRMATION_TTL_SECONDS);
     let next_version = command.version + 1;
+    let replacement_sql = confirmation_replay_insert_sql();
     let results = db
         .batch(vec![
             db::prepare(
@@ -1096,7 +1275,6 @@ async fn reissue_confirmation_token_for_replay(
                     db::text(idempotency_key),
                     db::text(command_hash),
                     db::number(command.version),
-                    db::text(&now),
                 ],
             )?,
             db::prepare(
@@ -1106,28 +1284,26 @@ async fn reissue_confirmation_token_for_replay(
                     db::text(&now),
                     db::text(&command.id),
                     db::text(user_id),
+                    db::text(command_hash),
                     db::text(&command.id),
                     db::text(user_id),
                     db::text(idempotency_key),
                     db::text(command_hash),
                     db::number(next_version),
-                    db::text(&now),
                 ],
             )?,
             db::prepare(
                 db,
-                confirmation_replay_insert_sql(),
+                &replacement_sql,
                 vec![
                     db::text(&token_id),
                     db::text(&token_hash),
-                    db::text(&token_expires_at),
                     db::text(&now),
                     db::text(&command.id),
                     db::text(user_id),
                     db::text(idempotency_key),
                     db::text(command_hash),
                     db::number(next_version),
-                    db::text(&now),
                 ],
             )?,
             db::prepare(
@@ -1366,6 +1542,14 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
     Ok(response(&created, token.as_deref()))
 }
 
+fn confirmation_claim_sql() -> &'static str {
+    "UPDATE confirmation_tokens SET used_at = ? WHERE id = ? AND user_id = ? AND command_hash = ? AND used_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND version = ? AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL)))"
+}
+
+fn confirmation_queue_sql() -> &'static str {
+    "UPDATE commands SET state = 'queued', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND version = ? AND changes() = 1 AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL))"
+}
+
 pub async fn confirm(
     db: &D1Database,
     user_id: &str,
@@ -1422,6 +1606,7 @@ pub async fn confirm(
         return Err(ApiError::gone("Confirmation token expired"));
     }
 
+    // Metadata only; D1 evaluates expiry at statement execution.
     let now = db::now_iso();
     let next_version = command.version + 1;
     let outbox_id = new_id("out")?;
@@ -1430,30 +1615,27 @@ pub async fn confirm(
     let mut statements = vec![
         db::prepare(
             db,
-            "UPDATE confirmation_tokens SET used_at = ? WHERE id = ? AND user_id = ? AND command_hash = ? AND used_at IS NULL AND expires_at > ? AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND version = ? AND (expires_at IS NULL OR expires_at > ?) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL)))",
+            confirmation_claim_sql(),
             vec![
                 db::text(&now),
                 db::text(&token_row.id),
                 db::text(user_id),
                 db::text(&command.command_hash),
-                db::text(&now),
                 db::text(command_id),
                 db::text(user_id),
                 db::number(command.version),
-                db::text(&now),
                 db::text(user_id),
             ],
         )?,
         db::prepare(
             db,
-            "UPDATE commands SET state = 'queued', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND version = ? AND changes() = 1 AND (expires_at IS NULL OR expires_at > ?) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL))",
+            confirmation_queue_sql(),
             vec![
                 db::number(next_version),
                 db::text(&now),
                 db::text(command_id),
                 db::text(user_id),
                 db::number(command.version),
-                db::text(&now),
                 db::text(user_id),
             ],
         )?,
@@ -1551,7 +1733,7 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
     let statements = vec![
         db::prepare(
             db,
-            "UPDATE commands SET state = 'cancelled', error_code = NULL, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable') AND version = ?",
+            &cancel_command_sql(),
             vec![
                 db::number(next_version),
                 db::text(&now),
@@ -1584,7 +1766,7 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
         )?,
         db::prepare(
             db,
-            "UPDATE outbox_events SET state = 'failed', next_attempt_at = NULL, last_error = 'command_cancelled', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE aggregate_id = ? AND user_id = ? AND state IN ('queued', 'retrying', 'unknown') AND changes() = 1",
+            cancel_outbox_sql(),
             vec![db::text(&now), db::text(command_id), db::text(user_id)],
         )?,
     ];
@@ -1596,6 +1778,13 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
         if matches!(current.state.as_str(), "cancelled" | "expired") {
             return Ok(response(&current, None));
         }
+        if has_recoverable_action_attempt(db, user_id, command_id).await? {
+            return Err(ApiError::new(
+                409,
+                "command_effect_in_progress",
+                "The command effect already started and must finish reconciliation before it can be undone",
+            ));
+        }
         return Err(ApiError::conflict(
             "Command changed before it could be cancelled",
         ));
@@ -1604,6 +1793,17 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
         .await?
         .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;
     Ok(response(&updated, None))
+}
+
+fn cancel_command_sql() -> String {
+    format!(
+        "UPDATE commands SET state = 'cancelled', error_code = NULL, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable') AND version = ? AND NOT {}",
+        RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
+    )
+}
+
+fn cancel_outbox_sql() -> &'static str {
+    "UPDATE outbox_events SET state = 'failed', next_attempt_at = NULL, last_error = 'command_cancelled', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE aggregate_id = ? AND user_id = ? AND state IN ('queued', 'retrying', 'unknown') AND changes() = 1"
 }
 
 pub async fn undo(
@@ -1643,6 +1843,20 @@ pub async fn undo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sql_parameter_count(sql: &str) -> usize {
+        sql.bytes().filter(|byte| *byte == b'?').count()
+    }
+
+    fn assert_expiry_authorization_uses_db_time(sql: &str) {
+        assert!(sql.contains(SQLITE_EXECUTION_TIME_SQL));
+        for stale_predicate in ["expires_at > ?", "expires_at >= ?", "expires_at <= ?"] {
+            assert!(
+                !sql.contains(stale_predicate),
+                "expiry authorization still uses a bound timestamp: {stale_predicate}"
+            );
+        }
+    }
 
     fn envelope() -> CommandEnvelope {
         CommandEnvelope {
@@ -1696,6 +1910,18 @@ mod tests {
 
     fn action_args(value: Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap()
+    }
+
+    fn test_timestamp_millis(timestamp: &str) -> i64 {
+        parse_reminder_due_at_millis(timestamp).unwrap()
+    }
+
+    fn validate_reminder_due_at_at(due_at: &str, now: &str) -> Result<(), CommandValidationError> {
+        validate_action_args_at(
+            "create_reminder",
+            &action_args(json!({"title": "Pay rent", "due_at": due_at})),
+            test_timestamp_millis(now),
+        )
     }
 
     fn assert_valid_args(intent: &str, value: Value) {
@@ -1789,44 +2015,95 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_replay_requires_live_confirmation_state_and_expiry() {
-        let now = "2026-08-11T00:00:00.000Z";
+    fn confirmation_replay_candidate_requires_confirmation_state_and_expiry_field() {
         let mut command = command_row("send_message", "awaiting_confirmation", None);
         command.needs_confirmation = 1;
         command.expires_at = Some("2026-08-11T00:01:00.000Z".to_string());
-        assert!(confirmation_replay_eligible_at(&command, now));
+        assert!(confirmation_replay_command_candidate(&command));
 
         for state in ["queued", "succeeded", "failed", "expired", "cancelled"] {
             command.state = state.to_string();
-            assert!(!confirmation_replay_eligible_at(&command, now));
+            assert!(!confirmation_replay_command_candidate(&command));
         }
 
         command.state = "awaiting_confirmation".to_string();
         command.needs_confirmation = 0;
-        assert!(!confirmation_replay_eligible_at(&command, now));
+        assert!(!confirmation_replay_command_candidate(&command));
 
         command.needs_confirmation = 1;
-        command.expires_at = Some(now.to_string());
-        assert!(!confirmation_replay_eligible_at(&command, now));
+        // Freshness is deliberately left to the transactional D1 predicate.
+        command.expires_at = Some("1970-01-01T00:00:00.000Z".to_string());
+        assert!(confirmation_replay_command_candidate(&command));
         command.expires_at = None;
-        assert!(!confirmation_replay_eligible_at(&command, now));
+        assert!(!confirmation_replay_command_candidate(&command));
     }
 
     #[test]
-    fn confirmation_replay_sql_revokes_then_rebinds_with_command_guards() {
+    fn command_ttl_never_expires_authoritative_or_reconcilable_attempts() {
+        let condition = command_ttl_expiration_condition();
+        let query = expire_due_candidates_sql();
+
+        for sql in [&condition, &query] {
+            assert!(sql.contains("recovery_attempt.command_id = commands.id"));
+            assert!(sql.contains("recovery_attempt.user_id = commands.user_id"));
+            assert!(sql.contains(
+                "recovery_attempt.state IN ('succeeded', 'running', 'unknown', 'retrying')"
+            ));
+            assert!(sql.contains("AND NOT EXISTS"));
+        }
+        assert_eq!(condition.matches('?').count(), 1);
+        assert_eq!(query.matches('?').count(), 2);
+        assert_eq!(
+            query.matches(RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL).count(),
+            2
+        );
+        assert!(query.contains("state = 'awaiting_confirmation' AND EXISTS"));
+    }
+
+    #[test]
+    fn cancel_cannot_orphan_recoverable_effect_authority() {
+        let cancel = cancel_command_sql();
+        assert!(cancel.contains(&format!(
+            "AND NOT {}",
+            RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
+        )));
+        assert!(cancel.contains(
+            "state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable')"
+        ));
+        assert!(cancel_outbox_sql().contains("AND changes() = 1"));
+    }
+
+    #[test]
+    fn confirmation_replay_sql_requires_live_exact_authority_before_rotation() {
         let update = confirmation_replay_command_update_sql();
         let invalidation = confirmation_replay_invalidation_sql();
         let insert = confirmation_replay_insert_sql();
 
         assert!(update.starts_with("UPDATE commands SET version = version + 1"));
+        assert!(update.contains("EXISTS (SELECT 1 FROM confirmation_tokens AS replay_token"));
+        for guard in [
+            "replay_token.command_id = commands.id",
+            "replay_token.user_id = commands.user_id",
+            "replay_token.command_hash = commands.command_hash",
+            "replay_token.used_at IS NULL",
+            "replay_token.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        ] {
+            assert!(update.contains(guard), "missing live-token guard: {guard}");
+        }
+
         assert!(invalidation.starts_with("UPDATE confirmation_tokens SET used_at = ?"));
-        assert!(invalidation.contains("command_id = ? AND user_id = ? AND used_at IS NULL"));
+        assert!(invalidation.contains(
+            "command_id = ? AND user_id = ? AND command_hash = ? AND used_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+        ));
         assert!(invalidation.contains("changes() = 1"));
         assert!(insert.starts_with("INSERT INTO confirmation_tokens"));
         assert!(insert.contains(
             "SELECT ?, replay_command.id, replay_command.user_id, ?, replay_command.command_hash"
         ));
-        assert!(insert.contains("MIN(replay_command.expires_at, ?)"));
+        assert!(insert.contains(&format!(
+            "MIN(replay_command.expires_at, strftime('%Y-%m-%dT%H:%M:%fZ','now','+{CONFIRMATION_TTL_SECONDS} seconds'))"
+        )));
+        assert!(!insert.contains("MIN(replay_command.expires_at, ?)"));
         assert!(insert.contains("WHERE changes() = 1"));
         assert!(insert.contains("NOT EXISTS (SELECT 1 FROM confirmation_tokens"));
 
@@ -1838,7 +2115,7 @@ mod tests {
             "replay_command.state = 'awaiting_confirmation'",
             "replay_command.needs_confirmation = 1",
             "replay_command.expires_at IS NOT NULL",
-            "replay_command.expires_at > ?",
+            "replay_command.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             "sessions.user_id = replay_command.user_id",
             "sessions.deleted_at IS NULL",
         ] {
@@ -1848,6 +2125,61 @@ mod tests {
             );
             assert!(insert.contains(guard), "missing insert guard: {guard}");
         }
+
+        assert_expiry_authorization_uses_db_time(update);
+        assert_expiry_authorization_uses_db_time(invalidation);
+        assert_expiry_authorization_uses_db_time(&insert);
+        assert_eq!(update.matches(SQLITE_EXECUTION_TIME_SQL).count(), 2);
+        assert_eq!(invalidation.matches(SQLITE_EXECUTION_TIME_SQL).count(), 2);
+        assert_eq!(insert.matches(SQLITE_EXECUTION_TIME_SQL).count(), 1);
+        assert_eq!(sql_parameter_count(update), 6);
+        assert_eq!(sql_parameter_count(invalidation), 9);
+        assert_eq!(sql_parameter_count(&insert), 8);
+    }
+
+    #[test]
+    fn confirmation_replay_expired_token_gap_cannot_issue_authority() {
+        let update = confirmation_replay_command_update_sql();
+        let invalidation = confirmation_replay_invalidation_sql();
+        let insert = confirmation_replay_insert_sql();
+
+        assert_expiry_authorization_uses_db_time(update);
+        assert_expiry_authorization_uses_db_time(invalidation);
+        assert_expiry_authorization_uses_db_time(&insert);
+        assert!(update.contains(&format!(
+            "replay_token.expires_at > {SQLITE_EXECUTION_TIME_SQL}"
+        )));
+        assert!(invalidation.contains(&format!(
+            "expires_at > {SQLITE_EXECUTION_TIME_SQL} AND changes() = 1"
+        )));
+        assert!(insert.contains("WHERE changes() = 1"));
+        assert_eq!(replay_token_for_response(None, 8), None);
+    }
+
+    #[test]
+    fn confirmation_claim_keeps_expired_old_token_fail_closed() {
+        let claim = confirmation_claim_sql();
+
+        assert!(claim.contains("command_hash = ?"));
+        assert!(claim.contains(&format!(
+            "used_at IS NULL AND expires_at > {SQLITE_EXECUTION_TIME_SQL}"
+        )));
+        assert_expiry_authorization_uses_db_time(claim);
+        assert_eq!(claim.matches(SQLITE_EXECUTION_TIME_SQL).count(), 2);
+        assert_eq!(sql_parameter_count(claim), 8);
+    }
+
+    #[test]
+    fn confirmation_queue_rechecks_command_expiry_at_db_execution() {
+        let queue = confirmation_queue_sql();
+
+        assert!(queue.contains("changes() = 1"));
+        assert!(queue.contains(&format!(
+            "expires_at IS NULL OR expires_at > {SQLITE_EXECUTION_TIME_SQL}"
+        )));
+        assert_expiry_authorization_uses_db_time(queue);
+        assert_eq!(queue.matches(SQLITE_EXECUTION_TIME_SQL).count(), 1);
+        assert_eq!(sql_parameter_count(queue), 6);
     }
 
     #[test]
@@ -1959,6 +2291,7 @@ mod tests {
             json!({"title": "Pay rent", "due_at": "2099-01-01T09:00:00Z"}),
             json!({"text": "Pay rent", "time": "2099-01-01T09:00:00Z"}),
             json!({"message": "Pay rent", "datetime": "2099-01-01T09:00:00Z"}),
+            json!({"title": "Leap day", "due_at": "2096-02-29T09:00:00.123Z"}),
         ] {
             assert_valid_args("create_reminder", valid);
         }
@@ -1970,9 +2303,158 @@ mod tests {
             json!({"title": "Pay rent", "due_at": "later", "repeat": "daily"}),
             json!({"title": "Pay rent", "text": "Pay rent", "due_at": "later"}),
             json!({"title": "Pay rent", "due_at": "later", "time": "later"}),
+            json!({
+                "title": "Pay rent",
+                "due_at": "2099-01-01T09:00:00Z",
+                "time": "2099-01-01T09:00:00Z",
+            }),
         ] {
             assert_invalid_args("create_reminder", invalid);
         }
+    }
+
+    #[test]
+    fn create_reminder_rejects_non_timestamp_due_at() {
+        assert_eq!(
+            validate_reminder_due_at_at("tomorrow at nine", "2029-12-31T00:00:00Z"),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
+    }
+
+    #[test]
+    fn create_reminder_rejects_malformed_or_offsetless_due_at() {
+        for due_at in [
+            "2030-01-01T09:00:00",
+            "2030-02-30T09:00:00Z",
+            "2030-02-29T09:00:00Z",
+            "2030-01-01T09:00:00+0800",
+            "2030-01-01 09:00:00Z",
+        ] {
+            assert_eq!(
+                validate_reminder_due_at_at(due_at, "2029-12-31T00:00:00Z"),
+                Err(CommandValidationError::InvalidActionArguments),
+                "unexpectedly accepted {due_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_reminder_rejects_second_60() {
+        assert_eq!(
+            validate_reminder_due_at_at("2030-01-01T09:00:60Z", "2029-12-31T00:00:00Z"),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
+    }
+
+    #[test]
+    fn create_reminder_rejects_submillisecond_fractional_precision() {
+        for due_at in [
+            "2030-01-01T09:00:00.0000Z",
+            "2030-01-01T09:00:00.0005Z",
+            "2030-01-01T09:00:00.1234+08:00",
+        ] {
+            assert_eq!(
+                validate_reminder_due_at_at(due_at, "2029-12-31T00:00:00Z"),
+                Err(CommandValidationError::InvalidActionArguments),
+                "unexpectedly accepted {due_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_reminder_enforces_rfc3339_numeric_offset_bounds() {
+        for due_at in [
+            "2030-01-02T00:00:00+23:59",
+            "2030-01-01T00:00:00-23:59",
+            "2030-01-01T00:00:00-00:00",
+        ] {
+            assert_eq!(
+                validate_reminder_due_at_at(due_at, "2029-12-31T23:59:59.999Z"),
+                Ok(()),
+                "unexpectedly rejected {due_at}"
+            );
+        }
+
+        for due_at in [
+            "2030-01-01T09:00:00+24:00",
+            "2030-01-01T09:00:00-24:00",
+            "2030-01-01T09:00:00+23:60",
+            "2030-01-01T09:00:00+00:60",
+        ] {
+            assert_eq!(
+                validate_reminder_due_at_at(due_at, "2029-12-31T00:00:00Z"),
+                Err(CommandValidationError::InvalidActionArguments),
+                "unexpectedly accepted {due_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_reminder_rejects_exact_now_across_offsets() {
+        assert_eq!(
+            validate_reminder_due_at_at(
+                "2030-01-01T08:00:00.123+08:00",
+                "2030-01-01T00:00:00.123Z",
+            ),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
+    }
+
+    #[test]
+    fn create_reminder_rejects_past_due_at() {
+        assert_eq!(
+            validate_reminder_due_at_at("2030-01-01T00:00:00.000Z", "2030-01-01T00:00:00.001Z"),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
+    }
+
+    #[test]
+    fn persisted_reminder_shape_remains_valid_after_due_at_elapses() {
+        let args = action_args(json!({
+            "title": "Pay rent",
+            "due_at": "2030-01-01T00:00:00.000Z",
+        }));
+        assert_eq!(validate_action_args_shape("create_reminder", &args), Ok(()));
+        assert_eq!(
+            validate_action_args_at(
+                "create_reminder",
+                &args,
+                test_timestamp_millis("2030-01-01T00:00:00.001Z"),
+            ),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
+    }
+
+    #[test]
+    fn create_reminder_accepts_future_z_timestamp() {
+        assert_eq!(
+            validate_reminder_due_at_at("2030-01-01T00:00:00.001Z", "2030-01-01T00:00:00.000Z"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn create_reminder_accepts_future_explicit_offset_timestamp() {
+        assert_eq!(
+            validate_reminder_due_at_at(
+                "2030-01-01T09:00:00.999+08:00",
+                "2030-01-01T01:00:00.998Z",
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn create_reminder_revalidates_due_at_against_execution_time() {
+        let due_at = "2030-01-01T00:00:00Z";
+        assert_eq!(
+            validate_reminder_due_at_at(due_at, "2029-12-31T23:59:59.999Z"),
+            Ok(())
+        );
+        assert_eq!(
+            validate_reminder_due_at_at(due_at, "2030-01-01T00:00:00Z"),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
     }
 
     #[test]

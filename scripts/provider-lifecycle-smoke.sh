@@ -11,6 +11,8 @@ EMAIL="${SMOKE_EMAIL:-provider-lifecycle-$(date +%s)-$$@local.test}"
 WAIT_SECONDS="${PROVIDER_RECONCILE_WAIT_SECONDS:-6}"
 PROVIDER_LOG="${PROVIDER_LOG:-}"
 PROVIDER_STRICT_RESOURCE_IDENTITY="${PROVIDER_STRICT_RESOURCE_IDENTITY:-false}"
+PROVIDER_PERSIST_TO="${PROVIDER_PERSIST_TO:-}"
+PROVIDER_ENV_FILE="${PROVIDER_ENV_FILE:-}"
 
 http_json() {
   local body_file error_file
@@ -79,6 +81,7 @@ auth="$(json -X POST "${BASE_URL}/v1/auth/register" \
 jq -e '(.token | type == "string" and length > 0) and (.user_id | type == "string" and length > 0)' \
   <<<"${auth}" >/dev/null
 token="$(jq -r '.token' <<<"${auth}")"
+user_id="$(jq -r '.user_id' <<<"${auth}")"
 user_auth=(-H "authorization: Bearer ${token}")
 health="$(get_json "${BASE_URL}/health")"
 jq -e '
@@ -92,9 +95,87 @@ jq -e '
 create_reminder() {
   local command_id="$1"
   local idempotency_key="$2"
+  create_reminder_at "${command_id}" "${idempotency_key}" "2099-01-01T09:00:00Z"
+}
+
+create_reminder_at() {
+  local command_id="$1"
+  local idempotency_key="$2"
+  local due_at="$3"
+  json "${user_auth[@]}" -X POST "${BASE_URL}/v1/phone/commands" \
+    -d "$(jq -nc --arg id "${command_id}" --arg idem "${idempotency_key}" --arg due_at "${due_at}" \
+      '{schema_version:1,command_id:$id,intent:"create_reminder",args:{title:"Provider lifecycle smoke",due_at:$due_at},risk_level:"low",needs_confirmation:false,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC"}')"
+}
+
+create_reminder_at_in_session() {
+  local command_id="$1"
+  local idempotency_key="$2"
+  local due_at="$3"
+  local session_id="$4"
   json "${user_auth[@]}" -X POST "${BASE_URL}/v1/phone/commands" \
     -d "$(jq -nc --arg id "${command_id}" --arg idem "${idempotency_key}" \
-      '{schema_version:1,command_id:$id,intent:"create_reminder",args:{title:"Provider lifecycle smoke",due_at:"2099-01-01T09:00:00Z"},risk_level:"low",needs_confirmation:false,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC"}')"
+      --arg due_at "${due_at}" --arg session_id "${session_id}" \
+      '{schema_version:1,command_id:$id,intent:"create_reminder",args:{title:"Provider lifecycle smoke",due_at:$due_at},risk_level:"low",needs_confirmation:false,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC",session_id:$session_id}')"
+}
+
+future_rfc3339() {
+  local seconds="$1"
+  python3 - "${seconds}" <<'PY'
+from datetime import datetime, timedelta, timezone
+import sys
+
+value = datetime.now(timezone.utc) + timedelta(seconds=int(sys.argv[1]))
+print(value.isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+PY
+}
+
+d1_execute_fixture() {
+  local sql="$1"
+  test -n "${PROVIDER_PERSIST_TO}"
+  test -n "${PROVIDER_ENV_FILE}"
+  wrangler d1 execute DB --local \
+    --persist-to "${PROVIDER_PERSIST_TO}" \
+    --config "${ROOT_DIR}/wrangler.toml" \
+    --env-file "${PROVIDER_ENV_FILE}" \
+    --command "${sql}" >/dev/null
+}
+
+expire_command_ttl_fixture() {
+  local command_id="$1"
+  [[ "${command_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  d1_execute_fixture \
+    "UPDATE commands SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = '${command_id}'"
+}
+
+requeue_succeeded_command_fixture() {
+  local command_id="$1"
+  [[ "${command_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  d1_execute_fixture \
+    "UPDATE commands SET state = 'retryable', expires_at = '2000-01-01T00:00:00.000Z', version = version + 1 WHERE id = '${command_id}' AND state = 'succeeded'; UPDATE outbox_events SET state = 'retrying', next_attempt_at = NULL, last_error = 'ttl_recovery_fixture', lease_token = NULL, lease_expires_at = NULL WHERE aggregate_id = '${command_id}' AND state = 'succeeded'"
+}
+
+create_session_fixture() {
+  local session_id="$1"
+  local agent_id="agt-${session_id}"
+  local skill_id="skill-${session_id}"
+  [[ "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${user_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  d1_execute_fixture \
+    "INSERT INTO agents (id, user_id, label, api_key_hash, created_at) VALUES ('${agent_id}', '${user_id}', 'Provider lifecycle agent', 'hash-${agent_id}', strftime('%Y-%m-%dT%H:%M:%fZ','now')); INSERT INTO skills (skill_id, template, facts_schema_json, actions_json, ttl_json, created_at) VALUES ('${skill_id}', 'Provider lifecycle skill', '{}', '[]', '{}', strftime('%Y-%m-%dT%H:%M:%fZ','now')); INSERT INTO sessions (id, agent_id, user_id, skill_id, state, facts_json, created_at, updated_at) VALUES ('${session_id}', '${agent_id}', '${user_id}', '${skill_id}', 'active', '{}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+}
+
+delete_session_fixture() {
+  local session_id="$1"
+  [[ "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  d1_execute_fixture \
+    "UPDATE sessions SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = '${session_id}' AND user_id = '${user_id}'"
+}
+
+insert_zero_attempt_permit_fixture() {
+  local command_id="$1"
+  [[ "${command_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  d1_execute_fixture \
+    "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) SELECT 'attempt-${command_id}', user_id, id, NULL, 'action.reminder', 'permit-${command_id}', 'running', command_hash, NULL, 0, NULL, 'execution_permit', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM commands WHERE id = '${command_id}' AND user_id = '${user_id}'"
 }
 
 create_message() {
@@ -129,6 +210,108 @@ test "$(jq -r '.result.provider_id' <<<"${duplicate_success}")" = "$(jq -r '.res
 if [[ -n "${PROVIDER_LOG}" ]]; then
   duplicate_success_delivery_count="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
   test "${duplicate_success_delivery_count}" = "1"
+fi
+
+if [[ -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
+  ttl_success_id="cmd-ttl-success-reuse-$(date +%s%N)"
+  ttl_success_key="idem-ttl-success-reuse-$(date +%s%N)"
+  ttl_success="$(create_reminder "${ttl_success_id}" "${ttl_success_key}")"
+  test "$(jq -r '.state' <<<"${ttl_success}")" = "queued"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  ttl_success_first="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${ttl_success_id}")"
+  test "$(jq -r '.state' <<<"${ttl_success_first}")" = "succeeded"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    ttl_success_delivery_before="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+    ttl_success_status_before="$(count_provider_requests '/reminders/status' "${PROVIDER_LOG}")"
+  fi
+  requeue_succeeded_command_fixture "${ttl_success_id}"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  ttl_success_final="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${ttl_success_id}")"
+  test "$(jq -r '.state' <<<"${ttl_success_final}")" = "succeeded"
+  test "$(jq -r '.result.provider_id' <<<"${ttl_success_final}")" = \
+    "$(jq -r '.result.provider_id' <<<"${ttl_success_first}")"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    ttl_success_delivery_after="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+    ttl_success_status_after="$(count_provider_requests '/reminders/status' "${PROVIDER_LOG}")"
+    test "${ttl_success_delivery_after}" = "${ttl_success_delivery_before}"
+    test "${ttl_success_status_after}" = "${ttl_success_status_before}"
+  fi
+
+  ttl_fresh_id="cmd-ttl-fresh-expire-$(date +%s%N)"
+  ttl_fresh_key="idem-ttl-fresh-expire-$(date +%s%N)"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    ttl_fresh_delivery_before="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+  fi
+  ttl_fresh="$(create_reminder "${ttl_fresh_id}" "${ttl_fresh_key}")"
+  test "$(jq -r '.state' <<<"${ttl_fresh}")" = "queued"
+  expire_command_ttl_fixture "${ttl_fresh_id}"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  ttl_fresh_final="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${ttl_fresh_id}")"
+  test "$(jq -r '.state' <<<"${ttl_fresh_final}")" = "expired"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    ttl_fresh_delivery_after="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+    test "${ttl_fresh_delivery_after}" = "${ttl_fresh_delivery_before}"
+  fi
+
+  # Once attempts>=1 records that an effect may have started, deleting the
+  # parent session must not convert the command to cancelled. The next claim
+  # reconciles the provider resource and truthfully settles succeeded.
+  deleted_reconcile_session="ses-deleted-reconcile-$(date +%s%N)"
+  deleted_reconcile_id="cmd-status-reconcile-deleted-session-$(date +%s%N)"
+  deleted_reconcile_key="idem-deleted-reconcile-$(date +%s%N)"
+  create_session_fixture "${deleted_reconcile_session}"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    deleted_reconcile_delivery_before="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+    deleted_reconcile_status_before="$(count_provider_requests '/reminders/status' "${PROVIDER_LOG}")"
+  fi
+  deleted_reconcile="$(create_reminder_at_in_session \
+    "${deleted_reconcile_id}" "${deleted_reconcile_key}" \
+    "2099-01-01T09:00:00Z" "${deleted_reconcile_session}")"
+  test "$(jq -r '.state' <<<"${deleted_reconcile}")" = "queued"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  deleted_reconcile_first="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${deleted_reconcile_id}")"
+  assert_structured_command_error "${deleted_reconcile_first}"
+  delete_session_fixture "${deleted_reconcile_session}"
+  sleep "${WAIT_SECONDS}"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  deleted_reconcile_final="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${deleted_reconcile_id}")"
+  test "$(jq -r '.state' <<<"${deleted_reconcile_final}")" = "succeeded"
+  test "$(jq -r '.result.provider_id' <<<"${deleted_reconcile_final}")" != "null"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    deleted_reconcile_delivery_after="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+    deleted_reconcile_status_after="$(count_provider_requests '/reminders/status' "${PROVIDER_LOG}")"
+    test "${deleted_reconcile_delivery_after}" = "$((deleted_reconcile_delivery_before + 1))"
+    test "${deleted_reconcile_status_after}" = "$((deleted_reconcile_status_before + 1))"
+  fi
+
+  # An attempts=0 row is only a permit: no effect began. Session deletion may
+  # safely cancel it, and the provider must not receive a delivery.
+  deleted_permit_session="ses-deleted-permit-$(date +%s%N)"
+  deleted_permit_id="cmd-deleted-permit-$(date +%s%N)"
+  deleted_permit_key="idem-deleted-permit-$(date +%s%N)"
+  create_session_fixture "${deleted_permit_session}"
+  deleted_permit="$(create_reminder_at_in_session \
+    "${deleted_permit_id}" "${deleted_permit_key}" \
+    "2099-01-01T09:00:00Z" "${deleted_permit_session}")"
+  test "$(jq -r '.state' <<<"${deleted_permit}")" = "queued"
+  insert_zero_attempt_permit_fixture "${deleted_permit_id}"
+  delete_session_fixture "${deleted_permit_session}"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    deleted_permit_delivery_before="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+  fi
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  deleted_permit_final="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${deleted_permit_id}")"
+  test "$(jq -r '.state' <<<"${deleted_permit_final}")" = "cancelled"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    deleted_permit_delivery_after="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+    test "${deleted_permit_delivery_after}" = "${deleted_permit_delivery_before}"
+  fi
 fi
 
 cancel_reconcile_id="cmd-cancel-reconcile-$(date +%s%N)"
@@ -169,6 +352,51 @@ test "$(jq -r '.result.provider_id' <<<"${final}")" != "null"
 if [[ -n "${PROVIDER_LOG}" ]]; then
   reconcile_delivery_after="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
   test "${reconcile_delivery_after}" = "$((reconcile_delivery_before + 1))"
+fi
+
+# The first delivery reaches the provider but intentionally loses its response.
+# By the time status reconciliation reports success, due_at has elapsed. The
+# Worker must materialize that known provider success, not send again or mark
+# the command failed because the original deadline is now in the past.
+elapsed_reconcile_id="cmd-status-reconcile-expired-due-$(date +%s%N)"
+elapsed_reconcile_key="idem-status-reconcile-expired-due-$(date +%s%N)"
+elapsed_reconcile_due_at="$(future_rfc3339 8)"
+if [[ -n "${PROVIDER_LOG}" ]]; then
+  elapsed_delivery_before="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+  elapsed_status_before="$(count_provider_requests '/reminders/status' "${PROVIDER_LOG}")"
+fi
+elapsed_reconcile="$(create_reminder_at \
+  "${elapsed_reconcile_id}" "${elapsed_reconcile_key}" "${elapsed_reconcile_due_at}")"
+test "$(jq -r '.state' <<<"${elapsed_reconcile}")" = "queued"
+curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+elapsed_first="$(get_json "${user_auth[@]}" \
+  "${BASE_URL}/v1/phone/commands/${elapsed_reconcile_id}")"
+assert_structured_command_error "${elapsed_first}"
+elapsed_cancel_response="$(curl --silent --show-error --max-time "${HTTP_TIMEOUT_SECONDS:-10}" \
+  -H 'content-type: application/json' "${user_auth[@]}" \
+  -X POST "${BASE_URL}/v1/phone/commands/${elapsed_reconcile_id}/cancel" \
+  -w $'\n%{http_code}')" || {
+    echo "provider lifecycle failed: recovery cancellation check had a transport failure" >&2
+    exit 1
+  }
+elapsed_cancel_status="${elapsed_cancel_response##*$'\n'}"
+elapsed_cancel_body="${elapsed_cancel_response%$'\n'*}"
+test "${elapsed_cancel_status}" = "409"
+assert_error_response "${elapsed_cancel_body}" command_effect_in_progress
+if [[ -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
+  expire_command_ttl_fixture "${elapsed_reconcile_id}"
+fi
+sleep 10
+curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+elapsed_final="$(get_json "${user_auth[@]}" \
+  "${BASE_URL}/v1/phone/commands/${elapsed_reconcile_id}")"
+test "$(jq -r '.state' <<<"${elapsed_final}")" = "succeeded"
+test "$(jq -r '.result.provider_id' <<<"${elapsed_final}")" != "null"
+if [[ -n "${PROVIDER_LOG}" ]]; then
+  elapsed_delivery_after="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
+  elapsed_status_after="$(count_provider_requests '/reminders/status' "${PROVIDER_LOG}")"
+  test "${elapsed_delivery_after}" = "$((elapsed_delivery_before + 1))"
+  test "${elapsed_status_after}" = "$((elapsed_status_before + 1))"
 fi
 
 message_id="cmd-message-reconcile-$(date +%s%N)"
@@ -256,7 +484,7 @@ else
 fi
 
 if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
-  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, duplicate reminder/message idempotency, cancellation safety, scheduled cancellation recovery, reminder status reconciliation, asynchronous message delivery, structured failures, and strict resource-identity fail-closed behavior'
+  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, structured failures, and strict resource-identity fail-closed behavior'
 else
-  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, duplicate reminder/message idempotency, cancellation safety, scheduled cancellation recovery, reminder status reconciliation, asynchronous message delivery, and structured failures (strict resource-identity checks opt-in)'
+  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, and structured failures (strict resource-identity checks opt-in)'
 fi
