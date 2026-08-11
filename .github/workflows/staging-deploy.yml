@@ -129,8 +129,12 @@ jobs:
           set -euo pipefail
           test -n "${STAGING_WRANGLER_CONFIG:-}"
           test ! -e "$GITHUB_WORKSPACE/wrangler.production.toml"
+          # The config is intentionally materialized outside the checkout so
+          # its values are not part of the project tree. Keep Wrangler's
+          # project root anchored to the checkout so the custom worker-build
+          # output and the config's relative main path resolve together.
           # This job intentionally has no `wrangler d1 migrations apply` path.
-          wrangler deploy --config "$STAGING_WRANGLER_CONFIG"
+          wrangler deploy --cwd "$GITHUB_WORKSPACE" --config "$STAGING_WRANGLER_CONFIG"
 
       - name: Verify deployed staging health contract
         run: |
@@ -255,7 +259,7 @@ jobs:
           # The temporary migration directory contains exactly the documented
           # expand pair; no earlier, later, or production config is available.
           test "$(grep -Fc "migrations_dir = \"${RUNNER_TEMP}/staging-expand-migrations\"" "$STAGING_MIGRATION_CONFIG")" -eq 1
-          wrangler d1 migrations apply DB --remote --config "$STAGING_MIGRATION_CONFIG"
+          wrangler d1 migrations apply DB --remote --cwd "$GITHUB_WORKSPACE" --config "$STAGING_MIGRATION_CONFIG"
 
       - name: Remove materialized staging migration config
         if: ${{ always() }}
