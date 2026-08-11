@@ -89,6 +89,7 @@ jobs:
 
           config="$RUNNER_TEMP/wrangler.staging.toml"
           sed \
+            -e "s|^main = .*|main = \"${GITHUB_WORKSPACE}/build/worker/shim.mjs\"|" \
             -e "s|REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL|${STAGING_SUPABASE_URL}|g" \
             -e "s|REPLACE_WITH_STAGING_ALLOWED_ORIGIN|${STAGING_CORS_ORIGIN}|g" \
             -e "s|REPLACE_WITH_STAGING_RELEASE_VERSION|${STAGING_RELEASE_VERSION}|g" \
@@ -97,6 +98,7 @@ jobs:
             wrangler.staging.toml.example > "$config"
 
           test -s "$config"
+          grep -Fqx "main = \"${GITHUB_WORKSPACE}/build/worker/shim.mjs\"" "$config"
           grep -Fqx 'name = "knock-knock-backend-staging"' "$config"
           grep -Fqx 'NODE_ENV = "staging"' "$config"
           grep -Fqx 'PUSH_MODE = "both"' "$config"
@@ -217,6 +219,7 @@ jobs:
 
           config="$RUNNER_TEMP/wrangler.staging.toml"
           sed \
+            -e "s|^main = .*|main = \"${GITHUB_WORKSPACE}/build/worker/shim.mjs\"|" \
             -e "s|REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL|${STAGING_SUPABASE_URL}|g" \
             -e "s|REPLACE_WITH_STAGING_ALLOWED_ORIGIN|${STAGING_CORS_ORIGIN}|g" \
             -e "s|REPLACE_WITH_STAGING_RELEASE_VERSION|${STAGING_RELEASE_VERSION}|g" \
@@ -225,6 +228,7 @@ jobs:
             wrangler.staging.toml.example > "$config"
 
           test -s "$config"
+          grep -Fqx "main = \"${GITHUB_WORKSPACE}/build/worker/shim.mjs\"" "$config"
           grep -Fqx 'name = "knock-knock-backend-staging"' "$config"
           grep -Fqx 'NODE_ENV = "staging"' "$config"
           grep -Fqx 'PUSH_MODE = "both"' "$config"
