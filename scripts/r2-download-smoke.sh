@@ -2,8 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"${ROOT_DIR}/scripts/ci-prerequisites.sh" storage >/dev/null
+
 BASE_URL="${BASE_URL:-http://127.0.0.1:8787}"
 BASE_URL="${BASE_URL%/}"
+AUTH_MODE="${SMOKE_AUTH_MODE:-register}"
 BUCKET="${R2_SMOKE_BUCKET:-knock-knock-local}"
 PERSIST_TO="${R2_SMOKE_PERSIST_TO:-.wrangler/state}"
 WRANGLER_CONFIG="${R2_SMOKE_WRANGLER_CONFIG:-${ROOT_DIR}/wrangler.toml}"
@@ -12,6 +15,18 @@ REMOTE_RETENTION_TIMEOUT_SEC="${R2_SMOKE_REMOTE_RETENTION_TIMEOUT_SEC:-120}"
 REMOTE_RETENTION_POLL_SEC="${R2_SMOKE_REMOTE_RETENTION_POLL_SEC:-5}"
 PASSWORD="${SMOKE_PASSWORD:-password123}"
 EMAIL="${SMOKE_EMAIL:-r2-download-$(date +%s)-$$@local.test}"
+if [[ "${AUTH_MODE}" == "login" ]]; then
+  : "${SMOKE_EMAIL:?SMOKE_EMAIL is required when SMOKE_AUTH_MODE=login}"
+  : "${SMOKE_PASSWORD:?SMOKE_PASSWORD is required when SMOKE_AUTH_MODE=login}"
+  OTHER_EMAIL="${SMOKE_OTHER_EMAIL:?SMOKE_OTHER_EMAIL is required when SMOKE_AUTH_MODE=login}"
+  OTHER_PASSWORD="${SMOKE_OTHER_PASSWORD:?SMOKE_OTHER_PASSWORD is required when SMOKE_AUTH_MODE=login}"
+elif [[ "${AUTH_MODE}" == "register" ]]; then
+  OTHER_EMAIL="r2-download-other-$(date +%s)-$$@local.test"
+  OTHER_PASSWORD="${PASSWORD}"
+else
+  echo "SMOKE_AUTH_MODE must be register or login" >&2
+  exit 64
+fi
 FIXTURE="${ROOT_DIR}/scripts/fixtures/retrieval-download.txt"
 KEY=""
 TMP_DIR="$(mktemp -d)"
@@ -26,6 +41,18 @@ fi
 json() {
   curl --fail-with-body --silent --show-error \
     -H 'content-type: application/json' "$@"
+}
+
+auth_user() {
+  local email="$1"
+  local password="$2"
+  local endpoint="register"
+  if [[ "${AUTH_MODE}" == "login" ]]; then
+    endpoint="login"
+  fi
+  json -X POST "${BASE_URL}/v1/auth/${endpoint}" \
+    -d "$(jq -nc --arg email "${email}" --arg password "${password}" \
+      '{email:$email,password:$password}')"
 }
 
 wait_for_remote_expired_download() {
@@ -74,9 +101,7 @@ run_scheduled_sweep() {
   curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
 }
 
-auth="$(json -X POST "${BASE_URL}/v1/auth/register" \
-  -d "$(jq -nc --arg email "${EMAIL}" --arg password "${PASSWORD}" \
-    '{email:$email,password:$password}')")"
+auth="$(auth_user "${EMAIL}" "${PASSWORD}")"
 token="$(jq -r '.token' <<<"${auth}")"
 user_id="$(jq -r '.user_id' <<<"${auth}")"
 user_auth=(-H "authorization: Bearer ${token}")
@@ -126,10 +151,7 @@ detail_with_shared="$(curl --fail-with-body --silent --show-error "${user_auth[@
 shared_retrieval_id="$(jq -r --arg hash "${shared_hash}" '.retrieval_items[] | select(.content_hash == $hash) | .retrieval_id' <<<"${detail_with_shared}")"
 test -n "${shared_retrieval_id}" && test "${shared_retrieval_id}" != "null"
 
-other_email="r2-download-other-$(date +%s)-$$@local.test"
-other_auth="$(json -X POST "${BASE_URL}/v1/auth/register" \
-  -d "$(jq -nc --arg email "${other_email}" --arg password "${PASSWORD}" \
-    '{email:$email,password:$password}')")"
+other_auth="$(auth_user "${OTHER_EMAIL}" "${OTHER_PASSWORD}")"
 other_token="$(jq -r '.token' <<<"${other_auth}")"
 other_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
   -H "authorization: Bearer ${other_token}" "${BASE_URL}${download_path}")"

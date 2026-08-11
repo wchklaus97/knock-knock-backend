@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
+./scripts/ci-prerequisites.sh static
 
 echo "[phase45] Rust format, tests, Clippy, and Worker target"
 cargo fmt --all -- --check
@@ -19,27 +20,48 @@ echo "[phase45] contract, migration, configuration, and adversarial checks"
 ./scripts/adversarial-data-smoke.sh
 ./scripts/production-config-smoke.sh
 ./scripts/backup-restore-smoke.sh
+./scripts/ci-log-sanitization-smoke.sh
+test -x ./scripts/local-contract-gate.sh
 test -x ./scripts/r2-download-smoke.sh
 test -x ./scripts/provider-lifecycle-smoke.sh
+test -x ./scripts/provider-local-gate.sh
+test -x ./scripts/provider-observability-smoke.sh
+test -x ./scripts/provider-mock.py
+test -x ./scripts/rate-limit-smoke.sh
 test -x ./scripts/staging-contract-gate.sh
-bash -n ./scripts/r2-download-smoke.sh ./scripts/provider-lifecycle-smoke.sh ./scripts/staging-contract-gate.sh
+bash -n \
+  ./scripts/ci-log-sanitize.sh \
+  ./scripts/ci-log-sanitization-smoke.sh \
+  ./scripts/local-contract-gate.sh \
+  ./scripts/r2-download-smoke.sh \
+  ./scripts/provider-lifecycle-smoke.sh \
+  ./scripts/provider-local-gate.sh \
+  ./scripts/provider-observability-smoke.sh \
+  ./scripts/rate-limit-smoke.sh \
+  ./scripts/staging-contract-gate.sh
+python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("scripts/provider-mock.py").read_text())'
 
 echo "[phase45] repository hygiene"
 git diff --check
-if git ls-files | rg -n '(^|/)(\.env($|\.)|.*\.p8$|.*\.pem$|.*\.key$)' ; then
+secret_like_files="$(git ls-files | grep -En '(^|/)(\.env($|\.)|.*\.p8$|.*\.pem$|.*\.key$)' || true)"
+if [[ -n "${secret_like_files}" ]]; then
+  printf '%s\n' "${secret_like_files}" >&2
   echo "tracked secret-like file detected" >&2
   exit 1
 fi
-if git grep -nE 'BEGIN (OPENSSH|RSA|EC|PRIVATE) KEY|SUPABASE_SERVICE_ROLE_KEY[[:space:]]*=' -- ':!wrangler*.toml.example' ; then
+if git grep -qE 'BEGIN (OPENSSH|RSA|EC|PRIVATE) KEY|SUPABASE_SERVICE_ROLE_KEY[[:space:]]*=' -- ':!wrangler*.toml.example'; then
   echo "private key or service-role secret detected in tracked source" >&2
+  exit 1
+fi
+if git grep -qE '(^|[[:space:]])[r][g]([[:space:]]|$)' -- .github/workflows scripts; then
+  echo "CI gate references an undeclared ripgrep command; use portable grep or install it in CI" >&2
   exit 1
 fi
 
 cat <<'EOF'
-phase45 static release gate passed.
-Required before production: deployed D1/E2E contract smoke, configured and
-reviewed provider endpoints/sandbox evidence, configured model
-manifest/public-key rollout, security review, physical iPhone performance and
-voice golden-set evidence, human approval of migration/APNs/provider/model
-rollout.
+phase45 static release preflight passed.
+This output is limited to the local static checks above; it does not claim
+staging deployment, APNs delivery, physical-iPhone performance, voice
+golden-set, provider sandbox, or production rollout evidence. Those remain
+explicit release prerequisites.
 EOF

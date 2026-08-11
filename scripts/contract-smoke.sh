@@ -1,10 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"${ROOT_DIR}/scripts/ci-prerequisites.sh" health >/dev/null
+
 BASE_URL="${BASE_URL:-http://127.0.0.1:8787}"
 BASE_URL="${BASE_URL%/}"
+AUTH_MODE="${SMOKE_AUTH_MODE:-register}"
 PASSWORD="${SMOKE_PASSWORD:-password123}"
 EMAIL="${SMOKE_EMAIL:-rust-smoke-$(date +%s)-$$@local.test}"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+case "${AUTH_MODE}" in
+  register)
+    OTHER_EMAIL="rust-contract-other-$(date +%s)-$$@local.test"
+    OTHER_PASSWORD="${PASSWORD}"
+    ;;
+  login)
+    : "${SMOKE_EMAIL:?SMOKE_EMAIL is required when SMOKE_AUTH_MODE=login}"
+    : "${SMOKE_PASSWORD:?SMOKE_PASSWORD is required when SMOKE_AUTH_MODE=login}"
+    OTHER_EMAIL="${SMOKE_OTHER_EMAIL:?SMOKE_OTHER_EMAIL is required when SMOKE_AUTH_MODE=login}"
+    OTHER_PASSWORD="${SMOKE_OTHER_PASSWORD:?SMOKE_OTHER_PASSWORD is required when SMOKE_AUTH_MODE=login}"
+    ;;
+  *)
+    echo "SMOKE_AUTH_MODE must be register or login" >&2
+    exit 64
+    ;;
+esac
 
 json() {
   curl --fail-with-body --silent --show-error \
@@ -15,32 +38,52 @@ get() {
   curl --fail-with-body --silent --show-error "$@"
 }
 
+auth_user() {
+  local email="$1"
+  local password="$2"
+  local endpoint="register"
+  if [[ "${AUTH_MODE}" == "login" ]]; then
+    endpoint="login"
+  fi
+  json -X POST "$BASE_URL/v1/auth/${endpoint}" \
+    -d "$(jq -nc --arg email "$email" --arg password "$password" '{email:$email,password:$password}')"
+}
+
 health="$(get "$BASE_URL/health")"
-test "$(jq -r '.ok' <<<"$health")" = "true"
-test "$(jq -r '.api' <<<"$health")" = "rust"
+jq -e '
+  (.ok == true) and
+  (.api == "rust") and
+  (.runtime == "cloudflare-worker") and
+  (.version | type == "string") and
+  (.apns_ready | type == "boolean") and
+  (.action_provider_ready | type == "boolean")
+' <<<"$health" >/dev/null
 v1_health="$(get "$BASE_URL/v1/health")"
-test "$(jq -r '.ok' <<<"$v1_health")" = "true"
-test "$(jq -r '.api' <<<"$v1_health")" = "rust"
+jq -e '(.ok == true) and (.api == "rust") and (.runtime == "cloudflare-worker")' <<<"$v1_health" >/dev/null
 metrics="$(get "$BASE_URL/metrics")"
 grep -q 'knock_knock_api_info' <<<"$metrics"
 grep -q 'knock_knock_provider_ready' <<<"$metrics"
 grep -q 'knock_knock_apns_ready' <<<"$metrics"
+grep -Eq 'knock_knock_model_enabled[[:space:]]+[01]' <<<"$metrics"
 request_headers="$(curl --fail-with-body --silent --show-error \
   -H 'x-request-id: contract-smoke-correlation' \
   -D - -o /dev/null "$BASE_URL/health")"
 grep -qi '^x-request-id: contract-smoke-correlation' <<<"$request_headers"
+invalid_request_headers="$(curl --fail-with-body --silent --show-error \
+  -H 'x-request-id: invalid request id with spaces' \
+  -D - -o /dev/null "$BASE_URL/health")"
+invalid_request_id="$(awk -F': ' 'tolower($1) == "x-request-id" {gsub(/\r/, "", $2); print $2; exit}' <<<"$invalid_request_headers")"
+test -n "$invalid_request_id"
+test "$invalid_request_id" != 'invalid request id with spaces'
 
-auth="$(json -X POST "$BASE_URL/v1/auth/register" \
-  -d "$(jq -nc --arg email "$EMAIL" --arg password "$PASSWORD" '{email:$email,password:$password}')")"
+auth="$(auth_user "$EMAIL" "$PASSWORD")"
 token="$(jq -r '.token' <<<"$auth")"
 refresh="$(jq -r '.refresh_token' <<<"$auth")"
 test -n "$token" && test "$token" != "null"
 test -n "$refresh" && test "$refresh" != "null"
 
 user_auth=(-H "authorization: Bearer $token")
-OTHER_EMAIL="rust-contract-other-$(date +%s)-$$@local.test"
-other_auth_response="$(json -X POST "$BASE_URL/v1/auth/register" \
-  -d "$(jq -nc --arg email "$OTHER_EMAIL" --arg password "$PASSWORD" '{email:$email,password:$password}')")"
+other_auth_response="$(auth_user "$OTHER_EMAIL" "$OTHER_PASSWORD")"
 other_token="$(jq -r '.token' <<<"$other_auth_response")"
 test -n "$other_token" && test "$other_token" != "null"
 other_auth=(-H "authorization: Bearer $other_token")
@@ -59,16 +102,28 @@ test "$(jq -r '.agents | length' <<<"$agents")" -ge 1
 skills="$(get "${user_auth[@]}" "$BASE_URL/v1/skills")"
 test "$(jq -r '.skills | length' <<<"$skills")" -ge 1
 
+device_correlation_id="device-contract-$(date +%s%N)"
 device="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/devices" \
-  -d '{"platform":"ios","locale":"zh-HK"}')"
-test "$(jq -r '.platform' <<<"$device")" = "ios"
+  -d "$(jq -nc --arg device_id "$device_correlation_id" \
+    '{platform:"ios",push_token:"contract-smoke-device-token",locale:"zh-HK",timezone:"Asia/Hong_Kong",device_id:$device_id}')")"
+jq -e --arg device_id "$device_correlation_id" \
+  '(.device_id | type == "string" and length > 0) and (.platform == "ios")' <<<"$device" >/dev/null
+device_again="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/devices" \
+  -d "$(jq -nc --arg device_id "$device_correlation_id" \
+    '{platform:"ios",push_token:"contract-smoke-device-token",locale:"zh-HK",timezone:"Asia/Hong_Kong",device_id:$device_id}')")"
+test "$(jq -r '.device_id' <<<"$device_again")" = "$(jq -r '.device_id' <<<"$device")"
 
+command_key="command-smoke-$(date +%s%N)"
 command="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/commands" \
-  -d "$(jq -nc --arg key "command-smoke-$(date +%s%N)" \
+  -d "$(jq -nc --arg key "$command_key" \
     '{schema_version:1,command_id:("cmd-smoke-" + ($key | split("-") | last)),intent:"search_history",args:{q:"history"},risk_level:"low",needs_confirmation:false,idempotency_key:$key,confidence:0.95,locale:"zh-Hans-HK",timezone:"Asia/Hong_Kong"}')")"
 command_id="$(jq -r '.command_id' <<<"$command")"
 test -n "$command_id" && test "$command_id" != "null"
 test "$(jq -r '.state' <<<"$command")" = "queued"
+command_detail="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands/$command_id")"
+jq -e --arg command_id "$command_id" \
+  '(.command_id == $command_id) and (.state == "queued") and (.version | type == "number")' \
+  <<<"$command_detail" >/dev/null
 commands="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands?state=queued&limit=50")"
 test "$(jq -r --arg id "$command_id" '[.commands[] | select(.command_id == $id)] | length' <<<"$commands")" = "1"
 
@@ -140,16 +195,21 @@ test "$(jq -r '.session_id' <<<"$session_view")" = "$session_id"
 
 event="$(json "${agent_auth[@]}" -X POST "$BASE_URL/v1/sessions/$session_id/events" \
   -d "$(jq -nc --arg key "needs-user-$(date +%s%N)" \
-    '{status:"needs_user",idempotency_key:$key,facts:{status:"waiting"},actions:[{id:"rollback",risk:"destructive",confirm:true,title:"Rollback deployment",payload:{scope:"service"}},{id:"ack",risk:"low",confirm:false,title:"Acknowledge"}]}')")"
+    '{status:"needs_user",idempotency_key:$key,facts:{status:"waiting"},actions:[{id:"rollback",risk:"destructive",confirm:true,title:"Rollback deployment",payload:{scope:"service"}},{id:"ack",risk:"low",confirm:false,title:"Acknowledge"}],retrievals:[range(0;51) | {title:("export source " + tostring),url:("https://example.com/export/" + tostring),snippet:"export fixture",content_hash:($key + "-" + tostring)}]}')")"
 test "$(jq -r '.session.state' <<<"$event")" = "needs_user"
 test "$(jq -r '.pushed' <<<"$event")" = "true"
 test "$(jq -r '[.session.available_action_descriptors[] | select(.action_key == "rollback" and .risk == "destructive" and .confirm_required == true and (.title | type == "string") and (.title | length > 0) and .payload.scope == "service")] | length' <<<"$event")" = "1"
+
+exported_session="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/sessions/$session_id/export")"
+test "$(jq -r '.retrieval_items | length' <<<"$exported_session")" = "51"
+test "$(jq -r '.truncated' <<<"$exported_session")" = "false"
 
 offered="$(get "${agent_auth[@]}" "$BASE_URL/v1/sessions/$session_id/actions/pending?claim=false")"
 test "$(jq -r '.actions | length' <<<"$offered")" = "0"
 
 phone="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/sessions")"
 test "$(jq -r '.sessions | length' <<<"$phone")" -ge 1
+test "$(jq -r --arg id "$session_id" '[.sessions[] | select(.session_id == $id)] | length' <<<"$phone")" = "1"
 
 reply="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/sessions/$session_id/reply" \
   -d '{"action_key":"rollback","utterance":"确认回滚"}')"
@@ -201,6 +261,16 @@ test "$(jq -r '.session_id' <<<"$final_session")" = "$session_id"
 test "$(jq -r '.chat_id' <<<"$final_session")" = "$chat_id"
 test "$(jq -r '.state' <<<"$final_session")" = "running"
 
+sync_page="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/sync?limit=50")"
+jq -e '
+  (.cursor | type == "string" and length > 0) and
+  (.changes | type == "array") and
+  (.has_more | type == "boolean")
+' <<<"$sync_page" >/dev/null
+sync_cursor="$(jq -r '.cursor' <<<"$sync_page")"
+sync_after="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/sync?limit=50&after=$(jq -rn --arg value "$sync_cursor" '$value | @uri')")"
+jq -e '(.cursor | type == "string" and length > 0) and (.changes | type == "array")' <<<"$sync_after" >/dev/null
+
 pushes="$(get "${user_auth[@]}" "$BASE_URL/v1/dev/pushes")"
 test "$(jq -r '.pushes | length' <<<"$pushes")" -ge 1
 push_id="$(jq -r '.pushes[0].push_id' <<<"$pushes")"
@@ -235,4 +305,6 @@ logout="$(json -X POST "$BASE_URL/v1/auth/logout" \
   -d "$(jq -nc --arg refresh "$rotated_refresh" '{refresh_token:$refresh}')")"
 test "$(jq -r '.ok' <<<"$logout")" = "true"
 
-printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/chat/multi-turn/phone/command-pagination/pairing-isolation-and-expiry/push-isolation-and-dismissal/action-descriptors/confirm/claim/result/refresh'
+BASE_URL="$BASE_URL" "${ROOT_DIR}/scripts/rate-limit-smoke.sh"
+
+printf '%s\n' 'rust contract smoke passed: health/auth/agent/skill/session/chat/multi-turn/phone/export-pagination/command-pagination/pairing-isolation-and-expiry/push-isolation-and-dismissal/action-descriptors/confirm/claim/result/refresh'

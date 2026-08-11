@@ -15,21 +15,25 @@ approval.
 - R2: dedicated private `knock-knock-staging` bucket
 - `NODE_ENV`: `staging`
 - `AUTH_PROVIDER`: `supabase`
-- `PUSH_MODE`: `dev`
+- `PUSH_MODE`: `both` (APNs sandbox plus development push inbox)
+- `APNS_PRODUCTION`: `false`
 - `ACTION_PROVIDER_MODE`: `disabled`
 - Reminder/message effects: disabled
 - Voice model rollout: disabled
 
-Staging intentionally uses the development push inbox and disabled external
-effects. It is safe for contract, sync, history, retrieval, and iOS integration
-testing. Real APNs is a separate sandbox/device gate and must not be inferred
-from staging health.
+Staging intentionally uses the APNs sandbox alongside the development push
+inbox and keeps external action effects disabled. `apns_ready=true` means that
+the signing configuration is present; it is not evidence of APNs delivery or
+physical-device completion. `APNS_PRODUCTION=false` is mandatory. Real APNs
+device delivery remains a separate sandbox/device gate, and production APNs
+rollout remains deferred.
 
 ## Evidence completed
 
 - Worker deployment succeeded with the current backend bundle.
-- `/health` returned `ok=true`, Rust Worker runtime, staging release version,
-  `push_mode=dev`, disabled action provider, and no external action readiness.
+- The current staging `/health` profile is `push_mode=both`,
+  `apns_ready=true`, and `apns_production=false`, with the action provider
+  disabled and no external action readiness.
 - `/metrics` returned the API, provider-readiness, and APNs-readiness gauges.
 - Remote D1 schema was queried after migration verification; all foundation,
   command, history, retrieval, outbox, rate-limit, and vertical-action tables

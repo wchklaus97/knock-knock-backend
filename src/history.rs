@@ -10,6 +10,8 @@ use crate::pagination;
 use crate::sessions;
 
 const RETENTION_SWEEP_BATCH: i64 = 500;
+const EXPORT_MAX_ITEMS: usize = 10_000;
+const EXPORT_QUERY_LIMIT: i64 = EXPORT_MAX_ITEMS as i64 + 1;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ExpiredRetrievalRow {
@@ -48,7 +50,7 @@ pub async fn purge_expired(db: &D1Database, env: &Env, user_id: &str) -> ApiResu
     // later compact old rows for users who are never active.
     let retrievals = expired_retrievals(db, Some(user_id), &now, RETENTION_SWEEP_BATCH).await?;
     delete_r2_objects(db, env, &retrievals).await?;
-    delete_retrieval_rows(db, &retrievals).await?;
+    expire_retrieval_rows(db, &retrievals, &now).await?;
     db::run(
         db,
         "DELETE FROM session_messages WHERE user_id = ? AND retention_expires_at IS NOT NULL AND retention_expires_at <= ?",
@@ -65,7 +67,7 @@ pub async fn purge_expired_all(db: &D1Database, env: &Env) -> ApiResult<usize> {
     let now = db::now_iso();
     let expired = expired_retrievals(db, None, &now, RETENTION_SWEEP_BATCH).await?;
     delete_r2_objects(db, env, &expired).await?;
-    let retrievals = delete_retrieval_rows(db, &expired).await?;
+    let retrievals = expire_retrieval_rows(db, &expired, &now).await?;
     let messages = db::run(
         db,
         "DELETE FROM session_messages WHERE id IN (SELECT id FROM session_messages WHERE retention_expires_at IS NOT NULL AND retention_expires_at <= ? ORDER BY created_at ASC, id ASC LIMIT ?)",
@@ -85,7 +87,7 @@ async fn expired_retrievals(
         Some(user_id) => {
             db::all(
                 db,
-                "SELECT id, r2_key FROM retrieval_items WHERE user_id = ? AND retention_expires_at IS NOT NULL AND retention_expires_at <= ? ORDER BY created_at ASC, id ASC LIMIT ?",
+                "SELECT id, r2_key FROM retrieval_items WHERE user_id = ? AND r2_delete_status = 'active' AND retention_expires_at IS NOT NULL AND retention_expires_at <= ? ORDER BY created_at ASC, id ASC LIMIT ?",
                 vec![
                     db::text(user_id),
                     db::text(now),
@@ -97,7 +99,7 @@ async fn expired_retrievals(
         None => {
             db::all(
                 db,
-                "SELECT id, r2_key FROM retrieval_items WHERE retention_expires_at IS NOT NULL AND retention_expires_at <= ? ORDER BY created_at ASC, id ASC LIMIT ?",
+                "SELECT id, r2_key FROM retrieval_items WHERE r2_delete_status = 'active' AND retention_expires_at IS NOT NULL AND retention_expires_at <= ? ORDER BY created_at ASC, id ASC LIMIT ?",
                 vec![db::text(now), db::number(limit)],
             )
             .await
@@ -166,9 +168,10 @@ async fn delete_r2_objects(
     Ok(())
 }
 
-async fn delete_retrieval_rows(
+async fn expire_retrieval_rows(
     db: &D1Database,
     retrievals: &[ExpiredRetrievalRow],
+    now: &str,
 ) -> ApiResult<usize> {
     if retrievals.is_empty() {
         return Ok(0);
@@ -178,10 +181,31 @@ async fn delete_retrieval_rows(
         .join(", ");
     let result = db::run(
         db,
-        &format!("DELETE FROM retrieval_items WHERE id IN ({placeholders})"),
-        retrievals.iter().map(|row| db::text(&row.id)).collect(),
+        &format!("UPDATE retrieval_items SET r2_delete_status = 'deleted', expired_at = COALESCE(expired_at, ?), r2_deleted_at = COALESCE(r2_deleted_at, ?), r2_key = NULL, message_id = NULL WHERE id IN ({placeholders}) AND r2_delete_status <> 'deleted'"),
+        std::iter::once(db::text(now))
+            .chain(std::iter::once(db::text(now)))
+            .chain(retrievals.iter().map(|row| db::text(&row.id)))
+            .collect(),
     )
     .await?;
+    for row in retrievals {
+        db::run(
+            db,
+            "INSERT OR IGNORE INTO sync_tombstones (id, user_id, entity_type, entity_id, deleted_at) SELECT ?, user_id, 'retrieval', id, ? FROM retrieval_items WHERE id = ?",
+            vec![
+                db::text(&format!("retention-tombstone-{}", row.id)),
+                db::text(now),
+                db::text(&row.id),
+            ],
+        )
+        .await?;
+        db::run(
+            db,
+            "INSERT OR IGNORE INTO phone_changes (user_id, entity_type, entity_id, session_id, version, deleted_at, created_at) SELECT user_id, 'retrieval', id, session_id, 2, ?, ? FROM retrieval_items WHERE id = ?",
+            vec![db::text(now), db::text(now), db::text(&row.id)],
+        )
+        .await?;
+    }
     Ok(db::changes(&result))
 }
 
@@ -216,6 +240,10 @@ fn retrieval_value(row: RetrievalItemRow) -> Value {
         "score": row.score,
         "content_hash": row.content_hash,
         "download_path": format!("/v1/phone/retrievals/{}/download", row.id),
+        "retention_expires_at": row.retention_expires_at,
+        "expired_at": row.expired_at,
+        "r2_delete_status": row.r2_delete_status,
+        "r2_deleted_at": row.r2_deleted_at,
         "created_at": row.created_at,
     })
 }
@@ -351,21 +379,86 @@ pub async fn list_messages(
     }))
 }
 
+#[allow(dead_code)]
 pub async fn list_retrieval(
     db: &D1Database,
     user_id: &str,
     session_id: &str,
     limit: i32,
 ) -> ApiResult<Vec<Value>> {
+    let page = list_retrieval_page(db, user_id, session_id, None, limit).await?;
+    Ok(page
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Cursor-paginated retrieval summaries. The `(created_at, id)` tie-breaker
+/// makes equal timestamps deterministic and prevents duplicate/omitted rows
+/// when a client walks the history while new snapshots arrive.
+pub async fn list_retrieval_page(
+    db: &D1Database,
+    user_id: &str,
+    session_id: &str,
+    before: Option<&str>,
+    limit: i32,
+) -> ApiResult<Value> {
+    let before = pagination::decode(before)?;
     let now = db::now_iso();
     let rows: Vec<RetrievalItemRow> = db::all(
         db,
-        "SELECT id, user_id, session_id, message_id, title, url, snippet, score, content_hash, r2_key, retention_expires_at, created_at FROM retrieval_items WHERE user_id = ? AND session_id = ? AND (retention_expires_at IS NULL OR retention_expires_at > ?) ORDER BY created_at DESC, id DESC LIMIT ?",
+        if before.is_some() {
+            "SELECT id, user_id, session_id, message_id, title, url, snippet, score, content_hash, r2_key, retention_expires_at, r2_delete_status, r2_deleted_at, expired_at, created_at FROM retrieval_items WHERE user_id = ? AND session_id = ? AND r2_delete_status = 'active' AND (retention_expires_at IS NULL OR retention_expires_at > ?) AND (created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT ?"
+        } else {
+            "SELECT id, user_id, session_id, message_id, title, url, snippet, score, content_hash, r2_key, retention_expires_at, r2_delete_status, r2_deleted_at, expired_at, created_at FROM retrieval_items WHERE user_id = ? AND session_id = ? AND r2_delete_status = 'active' AND (retention_expires_at IS NULL OR retention_expires_at > ?) ORDER BY created_at DESC, id DESC LIMIT ?"
+        },
+        match before {
+            Some(cursor) => vec![
+                db::text(user_id), db::text(session_id), db::text(&now),
+                db::text(&cursor.sort_key), db::text(&cursor.sort_key),
+                db::text(&cursor.id), db::number(limit.clamp(1, 50) as i64 + 1),
+            ],
+            None => vec![
+                db::text(user_id), db::text(session_id), db::text(&now),
+                db::number(limit.clamp(1, 50) as i64 + 1),
+            ],
+        },
+    )
+    .await?;
+    let safe_limit = limit.clamp(1, 50) as usize;
+    let has_more = rows.len() > safe_limit;
+    let rows = rows.into_iter().take(safe_limit).collect::<Vec<_>>();
+    let next_cursor = rows
+        .last()
+        .map(|row| pagination::encode(&row.created_at, &row.id));
+    Ok(serde_json::json!({
+        "items": rows.into_iter().map(retrieval_value).collect::<Vec<_>>(),
+        "next_cursor": has_more.then_some(next_cursor).flatten(),
+        "has_more": has_more,
+    }))
+}
+
+// Keep export retrieval reads independent from the bounded summary page. The
+// additive retention columns introduced by migration 0013 are intentionally
+// included via SELECT * so this query remains compatible with both the
+// pre-migration model and the tombstone-aware model; serde ignores columns
+// unknown to the older model. The response still passes through
+// retrieval_value, which never exposes the internal R2 key.
+async fn list_retrieval_for_export(
+    db: &D1Database,
+    user_id: &str,
+    session_id: &str,
+) -> ApiResult<Vec<Value>> {
+    let now = db::now_iso();
+    let rows: Vec<RetrievalItemRow> = db::all(
+        db,
+        "SELECT * FROM retrieval_items WHERE user_id = ? AND session_id = ? AND (retention_expires_at IS NULL OR retention_expires_at > ?) ORDER BY created_at DESC, id DESC LIMIT ?",
         vec![
             db::text(user_id),
             db::text(session_id),
             db::text(&now),
-            db::number(limit.clamp(1, 10_001) as i64),
+            db::number(EXPORT_QUERY_LIMIT),
         ],
     )
     .await?;
@@ -384,7 +477,7 @@ pub async fn get_retrieval(
     let now = db::now_iso();
     db::first(
         db,
-        "SELECT r.id, r.user_id, r.session_id, r.message_id, r.title, r.url, r.snippet, r.score, r.content_hash, r.r2_key, r.retention_expires_at, r.created_at FROM retrieval_items AS r JOIN sessions AS s ON s.id = r.session_id AND s.user_id = r.user_id AND s.deleted_at IS NULL WHERE r.id = ? AND r.user_id = ? AND (r.retention_expires_at IS NULL OR r.retention_expires_at > ?)",
+        "SELECT r.id, r.user_id, r.session_id, r.message_id, r.title, r.url, r.snippet, r.score, r.content_hash, r.r2_key, r.retention_expires_at, r.r2_delete_status, r.r2_deleted_at, r.expired_at, r.created_at FROM retrieval_items AS r JOIN sessions AS s ON s.id = r.session_id AND s.user_id = r.user_id AND s.deleted_at IS NULL WHERE r.id = ? AND r.user_id = ? AND r.r2_delete_status = 'active' AND (r.retention_expires_at IS NULL OR r.retention_expires_at > ?)",
         vec![
             db::text(retrieval_id),
             db::text(user_id),
@@ -402,7 +495,7 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
         ));
     }
     let safe_limit = limit.clamp(1, 50) as i64;
-    let needle = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+    let needle = search_like_pattern(query);
     let sessions: Vec<SessionRow> = db::all(
         db,
         "SELECT id, agent_id, user_id, skill_id, state, progress_status, progress_message, progress_percent, title, chat_id, summary_text, voice_script, facts_json, available_actions_json, available_action_descriptors_json, expires_at, created_at, updated_at, archived_at, deleted_at, retention_expires_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL AND (title LIKE ? ESCAPE '\\' OR summary_text LIKE ? ESCAPE '\\' OR facts_json LIKE ? ESCAPE '\\') ORDER BY updated_at DESC, id DESC LIMIT ?",
@@ -428,7 +521,7 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
     .await?;
     let retrievals: Vec<RetrievalItemRow> = db::all(
         db,
-        "SELECT r.id, r.user_id, r.session_id, r.message_id, r.title, r.url, r.snippet, r.score, r.content_hash, r.r2_key, r.retention_expires_at, r.created_at FROM retrieval_items AS r JOIN sessions AS s ON s.id = r.session_id AND s.user_id = r.user_id AND s.deleted_at IS NULL WHERE r.user_id = ? AND (r.retention_expires_at IS NULL OR r.retention_expires_at > ?) AND (r.title LIKE ? ESCAPE '\\' OR r.snippet LIKE ? ESCAPE '\\') ORDER BY r.created_at DESC, r.id DESC LIMIT ?",
+        "SELECT r.id, r.user_id, r.session_id, r.message_id, r.title, r.url, r.snippet, r.score, r.content_hash, r.r2_key, r.retention_expires_at, r.r2_delete_status, r.r2_deleted_at, r.expired_at, r.created_at FROM retrieval_items AS r JOIN sessions AS s ON s.id = r.session_id AND s.user_id = r.user_id AND s.deleted_at IS NULL WHERE r.user_id = ? AND r.r2_delete_status = 'active' AND (r.retention_expires_at IS NULL OR r.retention_expires_at > ?) AND (r.title LIKE ? ESCAPE '\\' OR r.snippet LIKE ? ESCAPE '\\') ORDER BY r.created_at DESC, r.id DESC LIMIT ?",
         vec![
             db::text(user_id),
             db::text(&db::now_iso()),
@@ -453,6 +546,16 @@ pub async fn search(db: &D1Database, user_id: &str, query: &str, limit: i32) -> 
         "messages": message_values,
         "retrieval_items": retrieval_values,
     }))
+}
+
+fn search_like_pattern(query: &str) -> String {
+    format!(
+        "%{}%",
+        query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
 }
 
 pub async fn export_session(
@@ -487,11 +590,14 @@ pub async fn export_session(
             break;
         }
     }
-    let retrieval_items = list_retrieval(db, user_id, &session.id, 10_001).await?;
-    if retrieval_items.len() > 10_000 {
+    let retrieval_items = list_retrieval_for_export(db, user_id, &session.id).await?;
+    if retrieval_items.len() > EXPORT_MAX_ITEMS {
         truncated = true;
     }
-    let retrieval_items = retrieval_items.into_iter().take(10_000).collect::<Vec<_>>();
+    let retrieval_items = retrieval_items
+        .into_iter()
+        .take(EXPORT_MAX_ITEMS)
+        .collect::<Vec<_>>();
     Ok(serde_json::json!({
         "schema_version": 1,
         "exported_at": db::now_iso(),
@@ -500,4 +606,58 @@ pub async fn export_session(
         "retrieval_items": retrieval_items,
         "truncated": truncated,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r2_namespace_is_strictly_user_scoped() {
+        assert!(is_user_r2_key("user_a", "users/user_a/retrievals/item-1"));
+        assert!(!is_user_r2_key("user_a", "users/user_b/retrievals/item-1"));
+        assert!(!is_user_r2_key(
+            "user_a",
+            "users/user_a/retrievals/../user_b/item-1"
+        ));
+        assert!(!is_user_r2_key("user_a", "users/user_a/retrievals/"));
+    }
+
+    #[test]
+    fn retrieval_summary_never_exposes_the_r2_reference() {
+        let row = RetrievalItemRow {
+            id: "ret-1".into(),
+            user_id: "user_a".into(),
+            session_id: "session-1".into(),
+            message_id: None,
+            title: "Source".into(),
+            url: "https://example.test".into(),
+            snippet: Some("summary".into()),
+            score: Some(0.9),
+            content_hash: "hash".into(),
+            r2_key: Some("users/user_a/retrievals/ret-1".into()),
+            retention_expires_at: None,
+            r2_delete_status: "active".into(),
+            r2_deleted_at: None,
+            expired_at: None,
+            created_at: "2026-08-11T00:00:00Z".into(),
+        };
+        let value = retrieval_value(row);
+        assert!(value.get("r2_key").is_none());
+        assert_eq!(
+            value.get("r2_delete_status").and_then(Value::as_str),
+            Some("active")
+        );
+    }
+
+    #[test]
+    fn export_query_keeps_a_truncation_sentinel() {
+        assert_eq!(EXPORT_MAX_ITEMS, 10_000);
+        assert_eq!(EXPORT_QUERY_LIMIT, 10_001);
+    }
+
+    #[test]
+    fn search_like_pattern_escapes_sql_like_controls() {
+        assert_eq!(search_like_pattern(r"a\b%c_d"), r"%a\\b\%c\_d%");
+    }
 }

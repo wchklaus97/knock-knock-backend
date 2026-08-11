@@ -2,19 +2,37 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"${ROOT_DIR}/scripts/ci-prerequisites.sh" staging >/dev/null
+
 BASE_URL="${BASE_URL:?Set BASE_URL to the deployed staging Worker URL}"
 BASE_URL="${BASE_URL%/}"
 : "${SMOKE_EMAIL:?Set SMOKE_EMAIL to a staging Supabase UAT account}"
 : "${SMOKE_PASSWORD:?Set SMOKE_PASSWORD to the staging Supabase UAT password}"
+: "${SMOKE_OTHER_EMAIL:?Set SMOKE_OTHER_EMAIL to a second staging Supabase UAT account}"
+: "${SMOKE_OTHER_PASSWORD:?Set SMOKE_OTHER_PASSWORD to the second staging Supabase UAT password}"
 : "${STAGING_WRANGLER_CONFIG:?Set STAGING_WRANGLER_CONFIG to a materialized staging Wrangler config}"
 : "${R2_SMOKE_BUCKET:?Set R2_SMOKE_BUCKET to the private staging R2 bucket}"
+
+case "${BASE_URL}" in
+  https://*) ;;
+  *)
+    echo "staging contract gate requires an HTTPS staging URL" >&2
+    exit 64
+    ;;
+esac
+if [[ "${BASE_URL}" == *production* ]]; then
+  echo "staging contract gate refuses a production-looking URL" >&2
+  exit 64
+fi
 
 health="$(curl --fail-with-body --silent --show-error "${BASE_URL}/health")"
 jq -e '
   (.ok == true) and
   (.api == "rust") and
   (.runtime == "cloudflare-worker") and
-  (.push_mode == "dev") and
+  (.push_mode == "both") and
+  (.apns_ready == true) and
+  (.apns_production == false) and
   (.action_provider_mode == "disabled") and
   (.action_provider_ready == false) and
   (.action_reminder_enabled == false) and
@@ -22,21 +40,34 @@ jq -e '
 ' <<<"${health}" >/dev/null
 
 BASE_URL="${BASE_URL}" \
+EXPECTED_PROVIDER_READY=false \
+EXPECTED_APNS_READY=true \
+EXPECTED_APNS_PRODUCTION=false \
+EXPECTED_MODEL_ENABLED=0 \
+  "${ROOT_DIR}/scripts/provider-observability-smoke.sh"
+
+BASE_URL="${BASE_URL}" \
 SMOKE_EMAIL="${SMOKE_EMAIL}" \
 SMOKE_PASSWORD="${SMOKE_PASSWORD}" \
   "${ROOT_DIR}/scripts/supabase-auth-smoke.sh"
 
-# The staging project must allow sign-up for this disposable contract account;
-# the generated account is only used by this run and no production endpoint is
-# accepted by this script's health-policy assertions.
+# Hosted Supabase email sending is rate-limited, so staging uses two
+# pre-provisioned UAT accounts. Local contract/R2 gates keep their default
+# registration mode; this script still refuses production-looking URLs.
 BASE_URL="${BASE_URL}" \
-SMOKE_EMAIL="staging-contract-$(date +%s)-$$@local.test" \
+SMOKE_AUTH_MODE=login \
+SMOKE_EMAIL="${SMOKE_EMAIL}" \
 SMOKE_PASSWORD="${SMOKE_PASSWORD}" \
+SMOKE_OTHER_EMAIL="${SMOKE_OTHER_EMAIL}" \
+SMOKE_OTHER_PASSWORD="${SMOKE_OTHER_PASSWORD}" \
   "${ROOT_DIR}/scripts/contract-smoke.sh"
 
 BASE_URL="${BASE_URL}" \
-SMOKE_EMAIL="staging-r2-$(date +%s)-$$@local.test" \
+SMOKE_AUTH_MODE=login \
+SMOKE_EMAIL="${SMOKE_EMAIL}" \
 SMOKE_PASSWORD="${SMOKE_PASSWORD}" \
+SMOKE_OTHER_EMAIL="${SMOKE_OTHER_EMAIL}" \
+SMOKE_OTHER_PASSWORD="${SMOKE_OTHER_PASSWORD}" \
 R2_SMOKE_BUCKET="${R2_SMOKE_BUCKET}" \
 R2_SMOKE_REMOTE=true \
 R2_SMOKE_WRANGLER_CONFIG="${STAGING_WRANGLER_CONFIG}" \

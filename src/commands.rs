@@ -16,6 +16,12 @@ struct IdOnly {
     _id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CommandScopeRow {
+    id: String,
+    user_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandValidationError {
     UnsupportedSchemaVersion,
@@ -27,7 +33,9 @@ pub enum CommandValidationError {
     MissingTimezone,
     InvalidCommandId,
     InvalidFieldLength,
+    EnvelopeTooLarge,
     SensitiveArgument,
+    InvalidActionArguments,
 }
 
 impl std::fmt::Display for CommandValidationError {
@@ -42,7 +50,9 @@ impl std::fmt::Display for CommandValidationError {
             Self::MissingTimezone => "command timezone is required",
             Self::InvalidCommandId => "command_id is required",
             Self::InvalidFieldLength => "command field exceeds the maximum length",
+            Self::EnvelopeTooLarge => "command envelope exceeds the maximum size",
             Self::SensitiveArgument => "command arguments cannot contain credentials or secrets",
+            Self::InvalidActionArguments => "command arguments do not match the registered action",
         };
         formatter.write_str(message)
     }
@@ -51,8 +61,18 @@ impl std::fmt::Display for CommandValidationError {
 impl std::error::Error for CommandValidationError {}
 
 const RISKS: [&str; 4] = ["low", "medium", "high", "destructive"];
+const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
+const MAX_ARGUMENT_BYTES: usize = 48 * 1024;
+const MAX_MODEL_VERSION: usize = 128;
+const MAX_CONFIRMATION_TOKEN: usize = 256;
+const COMMAND_TTL_SECONDS: i64 = 900;
+const CONFIRMATION_TTL_SECONDS: i64 = 600;
+const MAX_ACTION_TITLE: usize = 200;
+const MAX_ACTION_RECIPIENT: usize = 320;
+const MAX_ACTION_BODY: usize = 8_000;
+const MAX_ACTION_DUE_AT: usize = 64;
 #[allow(dead_code)]
-const STATES: [&str; 10] = [
+const STATES: [&str; 11] = [
     "pending",
     "validated",
     "awaiting_confirmation",
@@ -62,6 +82,7 @@ const STATES: [&str; 10] = [
     "failed",
     "expired",
     "cancelled",
+    "retryable",
     "unknown",
 ];
 
@@ -110,6 +131,85 @@ pub fn registry_requires_confirmation(intent: &str) -> Option<bool> {
     registry_policy(intent).map(|policy| policy.requires_confirmation)
 }
 
+/// Validate the argument shape for a registered action before it can enter
+/// the durable queue. The executor repeats this check immediately before an
+/// effect, so legacy or manually repaired rows cannot bypass the same rules.
+pub fn validate_action_args(
+    intent: &str,
+    args: &Map<String, Value>,
+) -> Result<(), CommandValidationError> {
+    let valid = match intent {
+        "search_history" => {
+            valid_required_action_string(args, &["q", "query", "text"], 2, usize::MAX)
+        }
+        "create_reminder" => {
+            valid_required_action_string(args, &["title", "text", "message"], 1, MAX_ACTION_TITLE)
+                && valid_required_action_string(
+                    args,
+                    &["due_at", "time", "datetime"],
+                    1,
+                    MAX_ACTION_DUE_AT,
+                )
+        }
+        "create_draft" => {
+            valid_required_action_string(args, &["body", "content", "text"], 1, MAX_ACTION_BODY)
+                && valid_optional_action_strings(args, &["title", "subject"], MAX_ACTION_TITLE)
+                && valid_optional_action_strings(args, &["recipient", "to"], MAX_ACTION_RECIPIENT)
+        }
+        "send_message" => {
+            valid_required_action_string(args, &["body", "message", "text"], 1, MAX_ACTION_BODY)
+                && valid_required_action_string(
+                    args,
+                    &["recipient", "to", "email", "phone"],
+                    1,
+                    MAX_ACTION_RECIPIENT,
+                )
+        }
+        _ => true,
+    };
+    valid
+        .then_some(())
+        .ok_or(CommandValidationError::InvalidActionArguments)
+}
+
+fn valid_required_action_string(
+    args: &Map<String, Value>,
+    names: &[&str],
+    min_length: usize,
+    max_length: usize,
+) -> bool {
+    names
+        .iter()
+        .find_map(|name| args.get(*name).and_then(Value::as_str))
+        .map(str::trim)
+        .is_some_and(|value| {
+            !value.is_empty() && value.len() >= min_length && value.chars().count() <= max_length
+        })
+}
+
+fn valid_optional_action_strings(
+    args: &Map<String, Value>,
+    names: &[&str],
+    max_length: usize,
+) -> bool {
+    names.iter().all(|name| {
+        args.get(*name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(|value| value.chars().count() <= max_length)
+            .unwrap_or(true)
+    })
+}
+
+/// Check the persisted policy again at the execution boundary. This is a
+/// defense against stale or manually repaired rows, where create-time policy
+/// enforcement is no longer enough to protect a side effect.
+pub fn execution_policy_matches(intent: &str, risk_level: &str, needs_confirmation: bool) -> bool {
+    registry_policy(intent).is_some_and(|policy| {
+        policy.risk_level == risk_level && policy.requires_confirmation == needs_confirmation
+    })
+}
+
 fn action_metadata(intent: &str) -> Value {
     registry_policy(intent)
         .map(|policy| {
@@ -135,11 +235,11 @@ pub fn validate_envelope(envelope: &CommandEnvelope) -> Result<(), CommandValida
     if envelope.command_id.trim().is_empty() {
         return Err(CommandValidationError::InvalidCommandId);
     }
-    if envelope.command_id.len() > 128
-        || envelope.intent.len() > 128
-        || envelope.idempotency_key.len() > 200
-        || envelope.locale.len() > 32
-        || envelope.timezone.len() > 64
+    if envelope.command_id.chars().count() > 128
+        || envelope.intent.chars().count() > 128
+        || envelope.idempotency_key.chars().count() > 200
+        || envelope.locale.chars().count() > 32
+        || envelope.timezone.chars().count() > 64
     {
         return Err(CommandValidationError::InvalidFieldLength);
     }
@@ -158,8 +258,32 @@ pub fn validate_envelope(envelope: &CommandEnvelope) -> Result<(), CommandValida
     if envelope.locale.trim().is_empty() {
         return Err(CommandValidationError::MissingLocale);
     }
+    if envelope.locale.chars().count() < 2 {
+        return Err(CommandValidationError::InvalidFieldLength);
+    }
     if envelope.timezone.trim().is_empty() {
         return Err(CommandValidationError::MissingTimezone);
+    }
+    for (field, max_length) in [
+        (envelope.device_id.as_deref(), 128),
+        (envelope.session_id.as_deref(), 128),
+        (envelope.model_version.as_deref(), MAX_MODEL_VERSION),
+    ] {
+        if let Some(field) = field {
+            if field.trim().is_empty() || field.chars().count() > max_length {
+                return Err(CommandValidationError::InvalidFieldLength);
+            }
+        }
+    }
+    let args_bytes =
+        serde_json::to_vec(&envelope.args).map_err(|_| CommandValidationError::EnvelopeTooLarge)?;
+    if args_bytes.len() > MAX_ARGUMENT_BYTES {
+        return Err(CommandValidationError::EnvelopeTooLarge);
+    }
+    let envelope_bytes =
+        serde_json::to_vec(envelope).map_err(|_| CommandValidationError::EnvelopeTooLarge)?;
+    if envelope_bytes.len() > MAX_ENVELOPE_BYTES {
+        return Err(CommandValidationError::EnvelopeTooLarge);
     }
     if contains_sensitive_argument(&Value::Object(envelope.args.clone())) {
         return Err(CommandValidationError::SensitiveArgument);
@@ -222,14 +346,24 @@ pub fn valid_transition(from: Option<&str>, to: &str) -> bool {
         return to == "pending";
     };
     match from {
-        "pending" => matches!(to, "validated" | "failed" | "expired" | "cancelled"),
+        "pending" => matches!(
+            to,
+            "validated" | "failed" | "expired" | "cancelled" | "retryable"
+        ),
         "validated" => matches!(
             to,
-            "awaiting_confirmation" | "queued" | "failed" | "expired" | "cancelled"
+            "awaiting_confirmation" | "queued" | "failed" | "expired" | "cancelled" | "retryable"
         ),
         "awaiting_confirmation" => matches!(to, "queued" | "cancelled" | "expired"),
-        "queued" => matches!(to, "running" | "cancelled" | "expired" | "unknown"),
-        "running" => matches!(to, "succeeded" | "failed" | "unknown"),
+        "queued" => matches!(
+            to,
+            "running" | "cancelled" | "expired" | "retryable" | "unknown"
+        ),
+        "running" => matches!(to, "succeeded" | "failed" | "retryable" | "unknown"),
+        "retryable" => matches!(
+            to,
+            "running" | "retryable" | "failed" | "expired" | "cancelled" | "unknown"
+        ),
         "unknown" => matches!(to, "running" | "succeeded" | "failed" | "expired"),
         "succeeded" | "failed" | "expired" | "cancelled" => false,
         _ => false,
@@ -237,10 +371,11 @@ pub fn valid_transition(from: Option<&str>, to: &str) -> bool {
 }
 
 /// Hash the canonical wire representation used by confirmation tokens.
-/// serde_json::Map is ordered in this build, so equivalent object keys produce
-/// a stable hash across retries.
+/// Object keys are sorted recursively so equivalent JSON objects produce the
+/// same hash even if serde_json is later configured to preserve insertion
+/// order.
 pub fn canonical_hash(envelope: &CommandEnvelope) -> Result<String, serde_json::Error> {
-    let value = json!({
+    let value = canonicalize_value(json!({
         "schema_version": envelope.schema_version,
         "command_id": envelope.command_id,
         "intent": envelope.intent,
@@ -254,9 +389,25 @@ pub fn canonical_hash(envelope: &CommandEnvelope) -> Result<String, serde_json::
         "device_id": envelope.device_id,
         "session_id": envelope.session_id,
         "model_version": envelope.model_version,
-    });
+    }));
     let bytes = serde_json::to_vec(&value)?;
     Ok(hex_encode(Sha256::digest(bytes)))
+}
+
+fn canonicalize_value(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries = object.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut canonical = Map::new();
+            for (key, value) in entries {
+                canonical.insert(key, canonicalize_value(value));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_value).collect()),
+        other => other,
+    }
 }
 
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
@@ -281,7 +432,10 @@ pub fn require_owner(authenticated_user_id: &str, resource_user_id: &str) -> boo
 }
 
 pub fn normalized_args(args: &Map<String, Value>) -> Map<String, Value> {
-    args.clone()
+    canonicalize_value(Value::Object(args.clone()))
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn command_select() -> &'static str {
@@ -315,7 +469,7 @@ fn error_value(row: &CommandRow) -> Value {
             json!({
                 "code": code,
                 "message": code,
-                "retryable": row.state == "unknown",
+                "retryable": matches!(row.state.as_str(), "retryable" | "unknown"),
             })
         })
         .unwrap_or(Value::Null)
@@ -491,7 +645,147 @@ pub async fn ensure_session_live(
     Ok(())
 }
 
+fn expirable_state(state: &str) -> bool {
+    matches!(
+        state,
+        "pending" | "validated" | "awaiting_confirmation" | "queued" | "retryable" | "unknown"
+    )
+}
+
+/// Persist an expiration transition exactly once. The `changes()` fences make
+/// audit, sync, and outbox cleanup conditional on the command update that won
+/// the race; a second sweeper or request is therefore a no-op.
+async fn mark_expired(
+    db: &D1Database,
+    user_id: &str,
+    command: &CommandRow,
+    reason: &str,
+    confirmation_token_expired: bool,
+) -> ApiResult<bool> {
+    if !expirable_state(&command.state) {
+        return Ok(false);
+    }
+    let now = db::now_iso();
+    let next_version = command.version + 1;
+    let condition = if confirmation_token_expired {
+        "state = 'awaiting_confirmation' AND EXISTS (SELECT 1 FROM confirmation_tokens WHERE command_id = commands.id AND user_id = commands.user_id AND used_at IS NULL AND expires_at <= ?)"
+    } else {
+        "expires_at IS NOT NULL AND expires_at <= ?"
+    };
+    let statements = vec![
+        db::prepare(
+            db,
+            &format!(
+                "UPDATE commands SET state = 'expired', error_code = ?, result_json = NULL, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable', 'unknown') AND version = ? AND {condition}"
+            ),
+            vec![
+                db::text(reason),
+                db::number(next_version),
+                db::text(&now),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(command.version),
+                db::text(&now),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.expired', ?, ? WHERE changes() = 1",
+            vec![
+                db::text(&new_id("aud")?),
+                db::text(user_id),
+                db::optional_text(command.session_id.as_deref()),
+                db::text(&json!({"command_id": command.id, "reason": reason, "version": next_version}).to_string()),
+                db::text(&now),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1",
+            vec![
+                db::text(user_id),
+                db::text(&command.id),
+                db::optional_text(command.session_id.as_deref()),
+                db::number(next_version),
+                db::text(&now),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "UPDATE outbox_events SET state = 'failed', next_attempt_at = NULL, last_error = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE aggregate_id = ? AND user_id = ? AND state IN ('queued', 'retrying', 'unknown') AND changes() = 1 AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'expired' AND version = ?)",
+            vec![
+                db::text(reason),
+                db::text(&now),
+                db::text(&command.id),
+                db::text(user_id),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(next_version),
+            ],
+        )?,
+    ];
+    let results = db.batch(statements).await?;
+    Ok(results.first().map(db::changes).unwrap_or(0) == 1)
+}
+
+/// Expire an active command before a read/confirm/cancel operation can act on
+/// stale authorization or queue work that is no longer valid.
+pub async fn expire_if_due(
+    db: &D1Database,
+    user_id: &str,
+    command_id: &str,
+) -> ApiResult<Option<CommandRow>> {
+    let Some(command) = get_for_user(db, user_id, command_id).await? else {
+        return Ok(None);
+    };
+    if expirable_state(&command.state) && command.expires_at.as_deref().is_some_and(db::is_expired)
+    {
+        let _ = mark_expired(db, user_id, &command, "command_expired", false).await?;
+    }
+    get_for_user(db, user_id, command_id).await
+}
+
+/// Scheduled workers call this bounded sweep before claiming outbox work. It
+/// also closes an awaiting-confirmation command when its one-time token ages
+/// out, preventing an otherwise permanent `awaiting_confirmation` record.
+pub async fn expire_due(db: &D1Database) -> ApiResult<usize> {
+    let now = db::now_iso();
+    let rows: Vec<CommandScopeRow> = db::all(
+        db,
+        "SELECT id, user_id FROM commands WHERE (state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable', 'unknown') AND expires_at IS NOT NULL AND expires_at <= ?) OR (state = 'awaiting_confirmation' AND EXISTS (SELECT 1 FROM confirmation_tokens WHERE command_id = commands.id AND user_id = commands.user_id AND used_at IS NULL AND expires_at <= ?)) ORDER BY updated_at ASC LIMIT 50",
+        vec![db::text(&now), db::text(&now)],
+    )
+    .await?;
+    let mut expired = 0;
+    for scope in rows {
+        let Some(command) = get_for_user(db, &scope.user_id, &scope.id).await? else {
+            continue;
+        };
+        let command_expired = command.expires_at.as_deref().is_some_and(db::is_expired);
+        let token_expired = command.state == "awaiting_confirmation" && !command_expired;
+        if mark_expired(
+            db,
+            &scope.user_id,
+            &command,
+            if token_expired {
+                "confirmation_expired"
+            } else {
+                "command_expired"
+            },
+            token_expired,
+        )
+        .await?
+        {
+            expired += 1;
+        }
+    }
+    Ok(expired)
+}
+
 pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -> ApiResult<Value> {
+    if user_id.trim().is_empty() {
+        return Err(ApiError::unauthorized("Authenticated user is required"));
+    }
     validate_envelope(&envelope).map_err(validation_error)?;
     let policy =
         registry_policy(&envelope.intent).ok_or_else(|| registry_error(&envelope.intent))?;
@@ -517,9 +811,11 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
         return Ok(response(&existing, None));
     }
 
+    validate_action_args(&envelope.intent, &envelope.args).map_err(validation_error)?;
+
     let command_id = envelope.command_id.clone();
     let now = db::now_iso();
-    let expires_at = db::add_seconds_iso(900);
+    let expires_at = db::add_seconds_iso(COMMAND_TTL_SECONDS);
     let registry_confirmation = registry_requires_confirmation(&envelope.intent)
         .ok_or_else(|| registry_error(&envelope.intent))?;
     let confirmation_required = requires_confirmation(&envelope, registry_confirmation);
@@ -562,7 +858,7 @@ pub async fn create(db: &D1Database, user_id: &str, envelope: CommandEnvelope) -
         let token = new_id("ctok")?;
         let token_hash = sha256_hex(&token);
         let token_id = new_id("cont")?;
-        let token_expires_at = db::add_seconds_iso(600);
+        let token_expires_at = db::add_seconds_iso(CONFIRMATION_TTL_SECONDS);
         statements.push(db::prepare(
             db,
             "UPDATE commands SET state = 'awaiting_confirmation', version = 2, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'validated'",
@@ -662,12 +958,29 @@ pub async fn confirm(
     command_id: &str,
     token: &str,
 ) -> ApiResult<Value> {
-    if token.trim().is_empty() {
+    if user_id.trim().is_empty() {
+        return Err(ApiError::unauthorized("Authenticated user is required"));
+    }
+    let token = token.trim();
+    if token.is_empty() {
         return Err(ApiError::validation("confirmation_token is required"));
     }
-    let command = get_for_user(db, user_id, command_id)
+    if token.chars().count() > MAX_CONFIRMATION_TOKEN {
+        return Err(ApiError::validation("confirmation_token is too long"));
+    }
+    let mut command = get_for_user(db, user_id, command_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Command not found"))?;
+    if expirable_state(&command.state) && command.expires_at.as_deref().is_some_and(db::is_expired)
+    {
+        let _ = mark_expired(db, user_id, &command, "command_expired", false).await?;
+        command = get_for_user(db, user_id, command_id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("Command not found"))?;
+    }
+    if command.state == "expired" {
+        return Err(ApiError::gone("Command has expired"));
+    }
     if let Some(session_id) = command.session_id.as_deref() {
         ensure_session_live(db, user_id, session_id).await?;
     }
@@ -685,15 +998,14 @@ pub async fn confirm(
     if token_row.used_at.is_some() {
         return Err(ApiError::conflict("Confirmation token was already used"));
     }
-    if db::is_expired(&token_row.expires_at)
-        || db::is_expired(command.expires_at.as_deref().unwrap_or_default())
-    {
-        return Err(ApiError::gone("Confirmation token expired"));
-    }
     if token_row.command_hash != command.command_hash {
         return Err(ApiError::unauthorized(
             "Confirmation token does not match command",
         ));
+    }
+    if db::is_expired(&token_row.expires_at) {
+        let _ = mark_expired(db, user_id, &command, "confirmation_expired", true).await?;
+        return Err(ApiError::gone("Confirmation token expired"));
     }
 
     let now = db::now_iso();
@@ -704,7 +1016,7 @@ pub async fn confirm(
     let mut statements = vec![
         db::prepare(
             db,
-            "UPDATE confirmation_tokens SET used_at = ? WHERE id = ? AND user_id = ? AND command_hash = ? AND used_at IS NULL AND expires_at > ? AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL)))",
+            "UPDATE confirmation_tokens SET used_at = ? WHERE id = ? AND user_id = ? AND command_hash = ? AND used_at IS NULL AND expires_at > ? AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND version = ? AND (expires_at IS NULL OR expires_at > ?) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL)))",
             vec![
                 db::text(&now),
                 db::text(&token_row.id),
@@ -713,37 +1025,27 @@ pub async fn confirm(
                 db::text(&now),
                 db::text(command_id),
                 db::text(user_id),
-                db::text(user_id),
-            ],
-        )?,
-        db::prepare(
-            db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.confirm', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL)))",
-            vec![
-                db::text(&new_id("aud")?),
-                db::text(user_id),
-                db::optional_text(command.session_id.as_deref()),
-                db::text(&json!({"command_id": command_id}).to_string()),
+                db::number(command.version),
                 db::text(&now),
-                db::text(command_id),
-                db::text(user_id),
                 db::text(user_id),
             ],
         )?,
         db::prepare(
             db,
-            "UPDATE commands SET state = 'queued', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL))",
+            "UPDATE commands SET state = 'queued', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'awaiting_confirmation' AND version = ? AND changes() = 1 AND (expires_at IS NULL OR expires_at > ?) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL))",
             vec![
                 db::number(next_version),
                 db::text(&now),
                 db::text(command_id),
                 db::text(user_id),
+                db::number(command.version),
+                db::text(&now),
                 db::text(user_id),
             ],
         )?,
         db::prepare(
             db,
-            "INSERT INTO outbox_events (id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, created_at, updated_at) SELECT ?, ?, 'command.execute', ?, ?, ?, 'queued', ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'queued' AND version = ?)",
+            "INSERT INTO outbox_events (id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, created_at, updated_at) SELECT ?, ?, 'command.execute', ?, ?, ?, 'queued', ?, ? WHERE changes() = 1",
             vec![
                 db::text(&outbox_id),
                 db::text(user_id),
@@ -752,32 +1054,49 @@ pub async fn confirm(
                 db::text(&outbox_idempotency_key),
                 db::text(&now),
                 db::text(&now),
-                db::text(command_id),
-                db::text(user_id),
-                db::number(next_version),
             ],
         )?,
         db::prepare(
             db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'queued' AND version = ?)",
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.confirm', ?, ? WHERE changes() = 1",
+            vec![
+                db::text(&new_id("aud")?),
+                db::text(user_id),
+                db::optional_text(command.session_id.as_deref()),
+                db::text(&json!({"command_id": command_id}).to_string()),
+                db::text(&now),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1",
             vec![
                 db::text(user_id),
                 db::text(command_id),
                 db::optional_text(command.session_id.as_deref()),
                 db::number(next_version),
                 db::text(&now),
-                db::text(command_id),
-                db::text(user_id),
-                db::number(next_version),
             ],
         )?,
     ];
-    if let Err(error) = db.batch(std::mem::take(&mut statements)).await {
-        let current = get_for_user(db, user_id, command_id).await?;
-        if current.as_ref().is_some_and(|row| row.state == "queued") {
-            return Err(ApiError::conflict("Command was already confirmed"));
+    let results = match db.batch(std::mem::take(&mut statements)).await {
+        Ok(results) => results,
+        Err(error) => {
+            let current = get_for_user(db, user_id, command_id).await?;
+            if current.as_ref().is_some_and(|row| row.state == "queued") {
+                return Err(ApiError::conflict("Confirmation token was already used"));
+            }
+            return Err(error.into());
         }
-        return Err(error.into());
+    };
+    if results.first().map(db::changes).unwrap_or(0) == 0
+        || results.get(1).map(db::changes).unwrap_or(0) == 0
+    {
+        let current = get_for_user(db, user_id, command_id).await?;
+        if current.as_ref().is_some_and(|row| row.state == "expired") {
+            return Err(ApiError::gone("Command has expired"));
+        }
+        return Err(ApiError::conflict("Confirmation token was already used"));
     }
     let updated = get_for_user(db, user_id, command_id)
         .await?
@@ -786,15 +1105,28 @@ pub async fn confirm(
 }
 
 pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResult<Value> {
-    let command = get_for_user(db, user_id, command_id)
+    if user_id.trim().is_empty() {
+        return Err(ApiError::unauthorized("Authenticated user is required"));
+    }
+    let mut command = get_for_user(db, user_id, command_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Command not found"))?;
+    if expirable_state(&command.state) && command.expires_at.as_deref().is_some_and(db::is_expired)
+    {
+        let _ = mark_expired(db, user_id, &command, "command_expired", false).await?;
+        command = get_for_user(db, user_id, command_id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("Command not found"))?;
+    }
     if let Some(session_id) = command.session_id.as_deref() {
         ensure_session_live(db, user_id, session_id).await?;
     }
+    if command.state == "cancelled" || command.state == "expired" {
+        return Ok(response(&command, None));
+    }
     if !matches!(
         command.state.as_str(),
-        "pending" | "validated" | "awaiting_confirmation" | "queued"
+        "pending" | "validated" | "awaiting_confirmation" | "queued" | "retryable"
     ) {
         return Err(ApiError::conflict(
             "Command cannot be cancelled in its current state",
@@ -805,22 +1137,18 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
     let statements = vec![
         db::prepare(
             db,
-            "UPDATE commands SET state = 'cancelled', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('pending', 'validated', 'awaiting_confirmation', 'queued')",
+            "UPDATE commands SET state = 'cancelled', error_code = NULL, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable') AND version = ?",
             vec![
                 db::number(next_version),
                 db::text(&now),
                 db::text(command_id),
                 db::text(user_id),
+                db::number(command.version),
             ],
         )?,
         db::prepare(
             db,
-            "UPDATE outbox_events SET state = 'failed', last_error = 'command_cancelled', updated_at = ? WHERE aggregate_id = ? AND user_id = ? AND state IN ('queued', 'retrying')",
-            vec![db::text(&now), db::text(command_id), db::text(user_id)],
-        )?,
-        db::prepare(
-            db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) VALUES (?, ?, ?, 'command.cancel', ?, ?)",
+            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.cancel', ?, ? WHERE changes() = 1",
             vec![
                 db::text(&new_id("aud")?),
                 db::text(user_id),
@@ -831,7 +1159,7 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
         )?,
         db::prepare(
             db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) VALUES (?, 'command', ?, ?, ?, ?)",
+            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1",
             vec![
                 db::text(user_id),
                 db::text(command_id),
@@ -840,9 +1168,23 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
                 db::text(&now),
             ],
         )?,
+        db::prepare(
+            db,
+            "UPDATE outbox_events SET state = 'failed', next_attempt_at = NULL, last_error = 'command_cancelled', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE aggregate_id = ? AND user_id = ? AND state IN ('queued', 'retrying', 'unknown') AND changes() = 1",
+            vec![db::text(&now), db::text(command_id), db::text(user_id)],
+        )?,
     ];
-    if let Err(error) = db.batch(statements).await {
-        return Err(error.into());
+    let results = db.batch(statements).await?;
+    if results.first().map(db::changes).unwrap_or(0) == 0 {
+        let current = get_for_user(db, user_id, command_id)
+            .await?
+            .ok_or_else(|| ApiError::new(500, "command_error", "Command disappeared"))?;
+        if matches!(current.state.as_str(), "cancelled" | "expired") {
+            return Ok(response(&current, None));
+        }
+        return Err(ApiError::conflict(
+            "Command changed before it could be cancelled",
+        ));
     }
     let updated = get_for_user(db, user_id, command_id)
         .await?
@@ -913,6 +1255,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_envelope_fields_before_command_validation() {
+        let mut value = serde_json::to_value(envelope()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("untrusted_policy_override".into(), json!(true));
+        assert!(serde_json::from_value::<CommandEnvelope>(value).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_nested_arguments_and_optional_fields() {
+        let mut oversized = envelope();
+        oversized
+            .args
+            .insert("body".into(), Value::String("x".repeat(MAX_ARGUMENT_BYTES)));
+        assert_eq!(
+            validate_envelope(&oversized),
+            Err(CommandValidationError::EnvelopeTooLarge)
+        );
+
+        let mut invalid_optional = envelope();
+        invalid_optional.device_id = Some(" ".into());
+        assert_eq!(
+            validate_envelope(&invalid_optional),
+            Err(CommandValidationError::InvalidFieldLength)
+        );
+    }
+
+    #[test]
     fn backend_registry_policy_overrides_model_risk_and_flag() {
         let mut low = envelope();
         assert!(!requires_confirmation(&low, false));
@@ -938,6 +1309,49 @@ mod tests {
     }
 
     #[test]
+    fn registered_action_arguments_are_validated_before_queueing() {
+        let empty = Map::new();
+        assert_eq!(
+            validate_action_args("send_message", &empty),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
+        assert!(validate_action_args(
+            "send_message",
+            &serde_json::from_value(json!({
+                "body": "hello",
+                "recipient": "+85255550123"
+            }))
+            .unwrap()
+        )
+        .is_ok());
+
+        assert_eq!(
+            validate_action_args(
+                "create_draft",
+                &serde_json::from_value(json!({"body": "x".repeat(MAX_ACTION_BODY + 1)})).unwrap()
+            ),
+            Err(CommandValidationError::InvalidActionArguments)
+        );
+        assert!(validate_action_args(
+            "create_reminder",
+            &serde_json::from_value(json!({
+                "title": "Pay rent",
+                "due_at": "2099-01-01T09:00:00Z"
+            }))
+            .unwrap()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn execution_policy_must_match_the_registered_action() {
+        assert!(execution_policy_matches("send_message", "high", true));
+        assert!(!execution_policy_matches("send_message", "low", true));
+        assert!(!execution_policy_matches("send_message", "high", false));
+        assert!(!execution_policy_matches("unknown", "low", false));
+    }
+
+    #[test]
     fn authoritative_envelope_normalizes_model_risk_before_hashing() {
         let mut model = envelope();
         model.risk_level = "destructive".to_string();
@@ -957,6 +1371,11 @@ mod tests {
         assert!(valid_transition(None, "pending"));
         assert!(valid_transition(Some("pending"), "validated"));
         assert!(valid_transition(Some("validated"), "queued"));
+        assert!(valid_state("retryable"));
+        assert!(valid_transition(Some("running"), "retryable"));
+        assert!(valid_transition(Some("retryable"), "running"));
+        assert!(valid_transition(Some("retryable"), "cancelled"));
+        assert!(valid_transition(Some("retryable"), "unknown"));
         assert!(valid_transition(Some("running"), "unknown"));
         assert!(valid_transition(Some("unknown"), "succeeded"));
         assert!(!valid_transition(Some("succeeded"), "running"));

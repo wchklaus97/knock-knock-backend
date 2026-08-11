@@ -533,6 +533,8 @@ paths:
       operationId: getPhoneSession
       parameters:
         - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/BeforeCursor'
+        - $ref: '#/components/parameters/PageLimit'
       responses:
         '200':
           description: Full session detail.
@@ -1167,7 +1169,7 @@ components:
         model_version: { type: [string, 'null'] }
     CommandState:
       type: string
-      enum: [pending, validated, awaiting_confirmation, queued, running, succeeded, failed, expired, cancelled, unknown]
+      enum: [pending, validated, awaiting_confirmation, queued, running, succeeded, failed, expired, cancelled, retryable, unknown]
     CommandActionMetadata:
       type: object
       additionalProperties: false
@@ -1361,6 +1363,8 @@ components:
             retrieval_items:
               type: array
               items: { $ref: '#/components/schemas/RetrievalItem' }
+            retrieval_next_cursor: { type: [string, 'null'] }
+            retrieval_has_more: { type: boolean }
             expires_at: { type: [string, 'null'], format: date-time }
             archived_at: { type: [string, 'null'], format: date-time }
             deleted_at: { type: [string, 'null'], format: date-time }
@@ -1387,7 +1391,16 @@ components:
         score: { type: [number, 'null'] }
         content_hash: { type: string }
         download_path: { type: string }
-        expires_at: { type: [string, 'null'], format: date-time }
+        retention_expires_at: { type: [string, 'null'], format: date-time }
+        expired_at: { type: [string, 'null'], format: date-time }
+        r2_delete_status: { type: string, enum: [active, deleted] }
+        r2_deleted_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+          deprecated: true
+          description: Legacy compatibility alias; current responses use retention_expires_at.
     Push:
       type: object
       required: [push_id, title, body, created_at]
