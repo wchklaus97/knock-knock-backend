@@ -131,6 +131,27 @@ pub fn load(env: &Env) -> ApiResult<ActionProviderConfig> {
         "internal"
     };
     let mode = parse_mode(&config_value(env, "ACTION_PROVIDER_MODE", default))?;
+
+    // Disabled and internal modes must not probe external provider bindings.
+    // In particular, staging intentionally has no ACTION_* secrets. Reading
+    // missing Worker secrets on every request adds an unnecessary runtime
+    // boundary and has caused intermittent Cloudflare 1101 hangs. External
+    // credentials are only relevant when the external adapter is selected.
+    if mode == ActionProviderMode::Disabled {
+        return Ok(ActionProviderConfig {
+            mode,
+            reminder_enabled: false,
+            message_enabled: false,
+            reminder_url: None,
+            message_url: None,
+            reminder_cancel_url: None,
+            reminder_status_url: None,
+            message_status_url: None,
+            reminder_token: None,
+            message_token: None,
+        });
+    }
+
     let enabled_default = if node_env == "production" {
         "false"
     } else {
@@ -138,13 +159,53 @@ pub fn load(env: &Env) -> ApiResult<ActionProviderConfig> {
     };
     let reminder_enabled = bool_value(env, "ACTION_REMINDER_ENABLED", enabled_default)?;
     let message_enabled = bool_value(env, "ACTION_MESSAGE_ENABLED", enabled_default)?;
-    let reminder_url = optional_endpoint(env, "ACTION_REMINDER_URL", &node_env)?;
-    let message_url = optional_endpoint(env, "ACTION_MESSAGE_URL", &node_env)?;
-    let reminder_cancel_url = optional_endpoint(env, "ACTION_REMINDER_CANCEL_URL", &node_env)?;
-    let reminder_status_url = optional_endpoint(env, "ACTION_REMINDER_STATUS_URL", &node_env)?;
-    let message_status_url = optional_endpoint(env, "ACTION_MESSAGE_STATUS_URL", &node_env)?;
-    let reminder_token = secret_value(env, "ACTION_REMINDER_TOKEN");
-    let message_token = secret_value(env, "ACTION_MESSAGE_TOKEN");
+
+    if mode == ActionProviderMode::Internal {
+        return Ok(ActionProviderConfig {
+            mode,
+            reminder_enabled,
+            message_enabled,
+            reminder_url: None,
+            message_url: None,
+            reminder_cancel_url: None,
+            reminder_status_url: None,
+            message_status_url: None,
+            reminder_token: None,
+            message_token: None,
+        });
+    }
+
+    let reminder_url = if reminder_enabled {
+        optional_endpoint(env, "ACTION_REMINDER_URL", &node_env)?
+    } else {
+        None
+    };
+    let message_url = if message_enabled {
+        optional_endpoint(env, "ACTION_MESSAGE_URL", &node_env)?
+    } else {
+        None
+    };
+    let reminder_cancel_url = if reminder_enabled {
+        optional_endpoint(env, "ACTION_REMINDER_CANCEL_URL", &node_env)?
+    } else {
+        None
+    };
+    let reminder_status_url = if reminder_enabled {
+        optional_endpoint(env, "ACTION_REMINDER_STATUS_URL", &node_env)?
+    } else {
+        None
+    };
+    let message_status_url = if message_enabled {
+        optional_endpoint(env, "ACTION_MESSAGE_STATUS_URL", &node_env)?
+    } else {
+        None
+    };
+    let reminder_token = reminder_enabled
+        .then(|| secret_value(env, "ACTION_REMINDER_TOKEN"))
+        .flatten();
+    let message_token = message_enabled
+        .then(|| secret_value(env, "ACTION_MESSAGE_TOKEN"))
+        .flatten();
 
     if mode == ActionProviderMode::External {
         validate_external_action(
