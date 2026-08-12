@@ -6,20 +6,34 @@
 
 ## Preconditions
 
-Configure these in the GitHub `production` environment, never in repository
-files or workflow output:
+Configure release/deployment values in the GitHub `production` environment,
+never in repository files or workflow output:
 
 - secret: `CLOUDFLARE_API_TOKEN`
-- secret: `KNOCK_KNOCK_BACKUP_PASSPHRASE`
 - variable: `KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID`
 - variable: `KNOCK_KNOCK_D1_DATABASE_ID`
 - variable: `KNOCK_KNOCK_R2_BUCKET`
-- variable: `KNOCK_KNOCK_BACKUP_BUCKET`
 - variable: `KNOCK_KNOCK_SUPABASE_URL`
 - variable: `KNOCK_KNOCK_CORS_ORIGIN`
 - provider URL variables used by `.github/workflows/production-release.yml`
 - signed voice-model URL, R2 key, manifest JSON, and expiry variables used by
   `.github/workflows/production-release.yml`
+
+Configure the scheduled backup job in a separate GitHub
+`production-backup` environment:
+
+- secret: `CLOUDFLARE_API_TOKEN` using a dedicated least-privilege token that
+  can read the production D1 database and write/read only the backup R2 bucket
+- secret: `KNOCK_KNOCK_BACKUP_PASSPHRASE`
+- variable: `KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID`
+- variable: `KNOCK_KNOCK_D1_DATABASE_ID`
+- variable: `KNOCK_KNOCK_BACKUP_BUCKET`
+- variable: `KNOCK_KNOCK_CORS_ORIGIN`
+
+Restrict `production-backup` to the repository's protected `main` branch. Do
+not add a required reviewer to that environment: a required reviewer would
+leave every scheduled backup waiting for manual approval. It must not contain
+Worker-deploy, APNs, Supabase, action-provider, or voice-model secrets.
 
 The Worker secrets `JWT_SECRET`, `SUPABASE_PUBLISHABLE_KEY`, `APNS_KEY`,
 `APNS_KEY_ID`, `APNS_TEAM_ID`, and any provider tokens must already exist in
@@ -28,8 +42,9 @@ recreates them.
 
 Protect the `production` environment with at least one required reviewer and
 disable administrator bypass. Protect `main` with required backend CI and a
-pull-request review. These controls are external repository settings and must
-be verified in the release record.
+pull-request review. Keep the independently scoped `production-backup`
+environment automatic and branch-restricted as described above. These controls
+are external repository settings and must be verified in the release record.
 
 ## Release
 
@@ -76,4 +91,3 @@ down-migrations automatically.
   health failure, or readiness failure blocks release.
 - Do not include tokens, `.p8` material, user audio, full sensitive command
   text, or database exports in GitHub artifacts or logs.
-
