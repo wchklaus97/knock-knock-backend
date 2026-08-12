@@ -14,11 +14,22 @@ struct DeviceTokenRow {
     push_token: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PushDelivery {
     pub inbox: bool,
     pub apns_sent: usize,
     pub apns_errors: Vec<String>,
+}
+
+impl PushDelivery {
+    pub fn diagnostic_value(&self) -> Value {
+        serde_json::json!({
+            "inbox": self.inbox,
+            "apns_attempted": self.apns_sent + self.apns_errors.len(),
+            "apns_sent": self.apns_sent,
+            "apns_errors": self.apns_errors,
+        })
+    }
 }
 
 pub struct PushRequest<'a> {
@@ -246,4 +257,25 @@ pub async fn notify_user(
         apns_sent,
         apns_errors,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_diagnostic_reports_attempts_without_device_tokens() {
+        let delivery = PushDelivery {
+            inbox: true,
+            apns_sent: 1,
+            apns_errors: vec!["APNs returned 400: {\"reason\":\"BadDeviceToken\"}".into()],
+        };
+
+        let value = delivery.diagnostic_value();
+        assert_eq!(value["inbox"], true);
+        assert_eq!(value["apns_attempted"], 2);
+        assert_eq!(value["apns_sent"], 1);
+        assert_eq!(value["apns_errors"].as_array().map(Vec::len), Some(1));
+        assert!(!value.to_string().contains("device_token"));
+    }
 }

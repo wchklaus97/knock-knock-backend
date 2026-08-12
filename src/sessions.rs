@@ -631,8 +631,8 @@ pub async fn report_event(
         .ok_or_else(|| ApiError::conflict("Event idempotency conflict"))?;
         return Ok(event_result(previous, session_api(db, current).await?));
     }
-    if pushed {
-        if let Ok(delivery) = crate::push::notify_user(
+    let push_delivery = if pushed {
+        match crate::push::notify_user(
             db,
             env,
             crate::push::PushRequest {
@@ -651,13 +651,17 @@ pub async fn report_event(
         )
         .await
         {
-            let _ = (
-                delivery.inbox,
-                delivery.apns_sent,
-                delivery.apns_errors.len(),
-            );
+            Ok(delivery) => delivery.diagnostic_value(),
+            Err(error) => serde_json::json!({
+                "inbox": false,
+                "apns_attempted": 0,
+                "apns_sent": 0,
+                "apns_errors": [error.message],
+            }),
         }
-    }
+    } else {
+        serde_json::Value::Null
+    };
     let fresh = get_session(db, &current.id)
         .await?
         .ok_or_else(|| ApiError::new(500, "event_error", "Session update failed"))?;
@@ -665,6 +669,7 @@ pub async fn report_event(
         "event_id": event_id,
         "session": session_to_api(&fresh),
         "pushed": pushed,
+        "push_delivery": push_delivery,
         "summary_text": summary,
         "voice_script": voice,
         "deduped": false,
