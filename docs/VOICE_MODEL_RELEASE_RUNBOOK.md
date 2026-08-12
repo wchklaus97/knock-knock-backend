@@ -9,10 +9,16 @@ signed descriptor consumed by Knock Knock. It does not authorize a production
 rollout. The application is currently pinned to the LiteRT-LM `v0.12.0` C
 framework so the main target can retain its iOS 15 deployment floor.
 
-The recommended first artifact is the 4-bit Gemma 3 1B `.litertlm` published
-by the LiteRT community. Its Hugging Face repository is publicly listed but
-gated by the Gemma license. A human must accept that license and create their
-own access token; neither the repository nor CI may bypass that step.
+The recommended first artifact is pinned to the official LiteRT community
+source below. The Hugging Face repository is publicly listed but gated by the
+Gemma license. A human must accept that license and authenticate the `hf` CLI;
+neither the repository nor CI may bypass that step.
+
+- Repository: `litert-community/Gemma3-1B-IT`
+- Revision: `6d54daa71cfbffba6b2843c08eeb1a27e7430bf0`
+- Filename: `gemma3-1b-it-int4.litertlm`
+- Expected size: `584417280` bytes
+- Expected SHA-256: `1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be`
 
 ## Security boundaries
 
@@ -34,14 +40,62 @@ own access token; neither the repository nor CI may bypass that step.
   independently owns action allowlisting, argument validation, risk,
   confirmation, ownership, and idempotency.
 
+## Gemma 4 remains an isolated experiment
+
+The repository
+[`wchklaus97/swift-gemma4-sample`](https://github.com/wchklaus97/swift-gemma4-sample)
+was reviewed at commit `5dcc5f060ebac8c5e1d1ebed09c8b706a5394fac`.
+It is useful as an experimental adapter reference, but it must not be linked
+into the current release target:
+
+- it uses MLX and the third-party `Swift-gemma4-core` package rather than the
+  pinned LiteRT-LM C runtime;
+- it raises the deployment floor from iOS 15 to iOS 17;
+- its local `mlx-community/gemma-4-e2b-it-4bit` directory is roughly 3.4 GB in
+  the current workspace and does not fit the signed `.litertlm` delivery path;
+- its sample runtime currently calls `applyChatTemplate`, while the dependency's
+  own verified Gemma 4 path requires `Gemma4PromptFormatter`; that mismatch must
+  be corrected before treating the sample as a trustworthy device baseline.
+
+Keep Gemma 3 1B INT4 as the iPhone 13 release candidate. A future Gemma 4 RFC
+may introduce a separately feature-flagged adapter for newer devices after
+artifact size, prompt formatting, cancellation, memory, thermal, and golden-set
+gates pass. It must continue to emit only `CommandEnvelope v1`; it never gains
+authority to execute commands locally.
+
 ## Prepare a candidate
 
-1. Sign in to Hugging Face and accept the Gemma license for
-   `litert-community/Gemma3-1B-IT`.
-2. Download the pinned `gemma3-1b-it-int4.litertlm` revision using a personal
-   token. Record the source repository, revision, filename, and license review
-   in the release ticket. Do not place the token or artifact in a worktree.
-3. Generate or select an operator-controlled Ed25519 key outside the
+1. Sign in to Hugging Face, accept the Gemma license for
+   `litert-community/Gemma3-1B-IT`, and authenticate locally using the
+   interactive `hf auth login` flow. Never put the token in this runbook's
+   commands, a shell history argument, CI, or Git.
+2. Run the pinned access preflight. It uses only the existing `hf` login and
+   performs an authenticated dry run; by default it downloads nothing:
+
+   ```bash
+   ./scripts/voice-model-candidate.sh
+   ```
+
+   Exit 77 with an “Accept the Gemma license” message means the logged-in
+   account has not been granted access. Accept the license in the browser and
+   rerun the same preflight. Do not add `--token`.
+3. Create a private destination outside every Git worktree, then explicitly
+   download the pinned candidate:
+
+   ```bash
+   umask 077
+   mkdir -p /secure/path/gemma3-1b-it-candidate
+   ./scripts/voice-model-candidate.sh \
+     --download \
+     --output /secure/path/gemma3-1b-it-candidate/gemma3-1b-it-int4.litertlm
+   ```
+
+   The script pins repository, revision, and filename; refuses an output in a
+   Git worktree or an existing output; suppresses all `hf` output; and publishes
+   the artifact only after its exact 584,417,280-byte size and pinned SHA-256
+   both match. Record the pinned values and license review in the release
+   ticket.
+4. Generate or select an operator-controlled Ed25519 key outside the
    repositories. For a new test key:
 
    ```bash
@@ -49,7 +103,7 @@ own access token; neither the repository nor CI may bypass that step.
    openssl genpkey -algorithm ED25519 -out /secure/path/voice-model-ed25519.pem
    ```
 
-4. Create release metadata in a new, private output directory:
+5. Create release metadata in a new, private output directory:
 
    ```bash
    ./scripts/voice-model-release.sh \
@@ -65,7 +119,7 @@ own access token; neither the repository nor CI may bypass that step.
    syntax and precedence rules) and no longer than 128 characters. The script
    rejects artifacts larger than 2,147,483,648 bytes before hashing them.
 
-5. Independently verify the emitted `manifest.json` and
+6. Independently verify the emitted `manifest.json` and
    `public-key.base64`. The script refuses to overwrite an existing release
    directory.
 
