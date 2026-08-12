@@ -99,6 +99,9 @@ jobs:
               core.setFailed("backup workflow evidence is not a successful completed production backup");
             }
             if (run.head_branch !== "main") core.setFailed("backup evidence must come from main");
+            if (run.head_sha !== process.env.RELEASE_SHA) {
+              core.setFailed("backup evidence must be produced from the exact release SHA");
+            }
 
       - name: Install pinned release toolchain
         run: |
