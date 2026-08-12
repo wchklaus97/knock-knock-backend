@@ -6,6 +6,9 @@ CANDIDATE_SCRIPT="$ROOT_DIR/scripts/voice-model-candidate.sh"
 MODEL_FILENAME="gemma3-1b-it-int4.litertlm"
 EXPECTED_SIZE_BYTES="584417280"
 EXPECTED_SHA256="1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be"
+IPHONE13_MODEL_FILENAME="gemma3-270m-it-q8.litertlm"
+IPHONE13_EXPECTED_SIZE_BYTES="304005120"
+IPHONE13_EXPECTED_SHA256="757e9119fa5bd667a2774fb470ac4afcd3190a21c677f8e69a5d6bc908abdd63"
 
 smoke_tmp="$(mktemp -d)"
 cleanup() {
@@ -20,11 +23,6 @@ mkdir -p "$fake_bin"
 cat > "$fake_bin/hf" <<'FAKE_HF'
 #!/usr/bin/env bash
 set -euo pipefail
-
-readonly expected_repository="litert-community/Gemma3-1B-IT"
-readonly expected_revision="6d54daa71cfbffba6b2843c08eeb1a27e7430bf0"
-readonly expected_filename="gemma3-1b-it-int4.litertlm"
-readonly expected_size_bytes="584417280"
 
 : "${FAKE_HF_LOG:?}"
 mode="${FAKE_HF_MODE:-approved}"
@@ -48,6 +46,22 @@ case "${1:-}" in
     repository="${2:-}"
     filename="${3:-}"
     shift 3
+    case "$repository" in
+      litert-community/Gemma3-1B-IT)
+        expected_revision="6d54daa71cfbffba6b2843c08eeb1a27e7430bf0"
+        expected_filename="gemma3-1b-it-int4.litertlm"
+        expected_size_bytes="584417280"
+        ;;
+      litert-community/gemma-3-270m-it)
+        expected_revision="9d2093270fb5aa49a986b49b5779d763dde7b630"
+        expected_filename="gemma3-270m-it-q8.litertlm"
+        expected_size_bytes="304005120"
+        ;;
+      *)
+        echo "fake hf received an unpinned repository" >&2
+        exit 64
+        ;;
+    esac
     revision=""
     local_dir=""
     dry_run=0
@@ -60,7 +74,6 @@ case "${1:-}" in
         *) echo "fake hf received an unexpected argument" >&2; exit 64 ;;
       esac
     done
-    [[ "$repository" == "$expected_repository" ]]
     [[ "$filename" == "$expected_filename" ]]
     [[ "$revision" == "$expected_revision" ]]
 
@@ -93,7 +106,18 @@ cat > "$fake_bin/sha256sum" <<'FAKE_SHA256SUM'
 #!/usr/bin/env bash
 set -euo pipefail
 
-expected="1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be"
+case "$(basename "$1")" in
+  gemma3-1b-it-int4.litertlm)
+    expected="1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be"
+    ;;
+  gemma3-270m-it-q8.litertlm)
+    expected="757e9119fa5bd667a2774fb470ac4afcd3190a21c677f8e69a5d6bc908abdd63"
+    ;;
+  *)
+    echo "fake sha256sum received an unexpected model" >&2
+    exit 64
+    ;;
+esac
 if [[ "${FAKE_HF_MODE:-approved}" == "hash-mismatch" ]]; then
   expected="0325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be"
 fi
@@ -114,6 +138,20 @@ grep -Fq "auth whoami" "$fake_log"
 grep -Fq -- "--dry-run" "$fake_log"
 if grep -Fq -- "--local-dir" "$fake_log"; then
   echo "default candidate preflight performed a download" >&2
+  exit 1
+fi
+
+: > "$fake_log"
+FAKE_HF_MODE=approved "$CANDIDATE_SCRIPT" \
+  --tier iphone13-270m \
+  --preflight > "$smoke_tmp/iphone13-preflight.out" 2>&1
+grep -Fq "litert-community/gemma-3-270m-it" "$smoke_tmp/iphone13-preflight.out"
+grep -Fq "$IPHONE13_MODEL_FILENAME" "$smoke_tmp/iphone13-preflight.out"
+grep -Fq "$IPHONE13_EXPECTED_SIZE_BYTES" "$smoke_tmp/iphone13-preflight.out"
+grep -Fq "$IPHONE13_EXPECTED_SHA256" "$smoke_tmp/iphone13-preflight.out"
+grep -Fq -- "--dry-run" "$fake_log"
+if grep -Fq -- "--local-dir" "$fake_log"; then
+  echo "iPhone 13 candidate preflight performed a download" >&2
   exit 1
 fi
 
@@ -142,6 +180,30 @@ test "$(wc -c < "$approved_output" | tr -d '[:space:]')" = "$EXPECTED_SIZE_BYTES
 grep -Fq -- "--local-dir" "$fake_log"
 grep -Fq "verified voice model candidate created outside Git" "$smoke_tmp/approved.out"
 grep -Fq "$EXPECTED_SHA256" "$smoke_tmp/approved.out"
+
+iphone13_dir="$smoke_tmp/iphone13-approved"
+iphone13_output="$iphone13_dir/$IPHONE13_MODEL_FILENAME"
+mkdir -p "$iphone13_dir"
+: > "$fake_log"
+FAKE_HF_MODE=approved "$CANDIDATE_SCRIPT" \
+  --tier iphone13-270m \
+  --download \
+  --output "$iphone13_output" > "$smoke_tmp/iphone13-approved.out" 2>&1
+test -f "$iphone13_output"
+test ! -L "$iphone13_output"
+test "$(wc -c < "$iphone13_output" | tr -d '[:space:]')" = "$IPHONE13_EXPECTED_SIZE_BYTES"
+grep -Fq -- "--local-dir" "$fake_log"
+grep -Fq "$IPHONE13_EXPECTED_SHA256" "$smoke_tmp/iphone13-approved.out"
+
+set +e
+"$CANDIDATE_SCRIPT" --tier unknown > "$smoke_tmp/invalid-tier.out" 2>&1
+invalid_tier_status=$?
+set -e
+if [[ "$invalid_tier_status" -ne 64 ]]; then
+  echo "invalid tier returned $invalid_tier_status instead of 64" >&2
+  exit 1
+fi
+grep -Fq -- "--tier must be default-1b or iphone13-270m" "$smoke_tmp/invalid-tier.out"
 
 hash_mismatch_dir="$smoke_tmp/hash-mismatch"
 hash_mismatch_output="$hash_mismatch_dir/$MODEL_FILENAME"

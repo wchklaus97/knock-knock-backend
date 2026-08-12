@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly MODEL_REPOSITORY="litert-community/Gemma3-1B-IT"
-readonly MODEL_REVISION="6d54daa71cfbffba6b2843c08eeb1a27e7430bf0"
-readonly MODEL_FILENAME="gemma3-1b-it-int4.litertlm"
-readonly MODEL_EXPECTED_SIZE_BYTES="584417280"
-readonly MODEL_EXPECTED_SHA256="1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be"
+readonly DEFAULT_MODEL_TIER="default-1b"
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/voice-model-candidate.sh [--preflight]
-       scripts/voice-model-candidate.sh --download --output /absolute/outside-git/gemma3-1b-it-int4.litertlm
+usage: scripts/voice-model-candidate.sh [--tier default-1b|iphone13-270m] [--preflight]
+       scripts/voice-model-candidate.sh [--tier default-1b|iphone13-270m] --download --output /absolute/outside-git/model.litertlm
 
 Checks access to the pinned official LiteRT Gemma candidate using the existing
 `hf auth login` state. With no arguments, only an authenticated Hugging Face
@@ -25,9 +21,18 @@ EOF
 download_requested=0
 preflight_requested=0
 output=""
+model_tier="$DEFAULT_MODEL_TIER"
 
 while (($# > 0)); do
   case "$1" in
+    --tier)
+      if (($# < 2)) || [[ -z "${2:-}" ]]; then
+        echo "--tier requires default-1b or iphone13-270m" >&2
+        exit 64
+      fi
+      model_tier="$2"
+      shift 2
+      ;;
     --preflight)
       preflight_requested=1
       shift
@@ -55,6 +60,27 @@ while (($# > 0)); do
       ;;
   esac
 done
+
+case "$model_tier" in
+  default-1b)
+    readonly MODEL_REPOSITORY="litert-community/Gemma3-1B-IT"
+    readonly MODEL_REVISION="6d54daa71cfbffba6b2843c08eeb1a27e7430bf0"
+    readonly MODEL_FILENAME="gemma3-1b-it-int4.litertlm"
+    readonly MODEL_EXPECTED_SIZE_BYTES="584417280"
+    readonly MODEL_EXPECTED_SHA256="1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be"
+    ;;
+  iphone13-270m)
+    readonly MODEL_REPOSITORY="litert-community/gemma-3-270m-it"
+    readonly MODEL_REVISION="9d2093270fb5aa49a986b49b5779d763dde7b630"
+    readonly MODEL_FILENAME="gemma3-270m-it-q8.litertlm"
+    readonly MODEL_EXPECTED_SIZE_BYTES="304005120"
+    readonly MODEL_EXPECTED_SHA256="757e9119fa5bd667a2774fb470ac4afcd3190a21c677f8e69a5d6bc908abdd63"
+    ;;
+  *)
+    echo "--tier must be default-1b or iphone13-270m" >&2
+    exit 64
+    ;;
+esac
 
 if ((preflight_requested == 1 && download_requested == 1)); then
   echo "--preflight and --download are mutually exclusive" >&2

@@ -9,16 +9,21 @@ signed descriptor consumed by Knock Knock. It does not authorize a production
 rollout. The application is currently pinned to the LiteRT-LM `v0.12.0` C
 framework so the main target can retain its iOS 15 deployment floor.
 
-The recommended first artifact is pinned to the official LiteRT community
-source below. The Hugging Face repository is publicly listed but gated by the
-Gemma license. A human must accept that license and authenticate the `hf` CLI;
-neither the repository nor CI may bypass that step.
+The default artifact and the smaller iPhone 13 candidate are pinned to the
+official LiteRT community sources below. Both Hugging Face repositories are
+publicly listed but gated by the Gemma license. A human must accept each
+repository's license grant and authenticate the `hf` CLI; neither the
+repository nor CI may bypass that step.
 
-- Repository: `litert-community/Gemma3-1B-IT`
-- Revision: `6d54daa71cfbffba6b2843c08eeb1a27e7430bf0`
-- Filename: `gemma3-1b-it-int4.litertlm`
-- Expected size: `584417280` bytes
-- Expected SHA-256: `1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be`
+| Tier | Repository | Revision | Filename | Size | SHA-256 |
+|---|---|---|---|---:|---|
+| `default-1b` | `litert-community/Gemma3-1B-IT` | `6d54daa71cfbffba6b2843c08eeb1a27e7430bf0` | `gemma3-1b-it-int4.litertlm` | 584417280 | `1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be` |
+| `iphone13-270m` | `litert-community/gemma-3-270m-it` | `9d2093270fb5aa49a986b49b5779d763dde7b630` | `gemma3-270m-it-q8.litertlm` | 304005120 | `757e9119fa5bd667a2774fb470ac4afcd3190a21c677f8e69a5d6bc908abdd63` |
+
+The 270M artifact is only a candidate until the same signed 32-example gate
+proves at least 95% semantic accuracy, zero high-risk false executions, and the
+approved iPhone 13 latency/memory/thermal limits. A smaller file does not waive
+those gates or grant the model any execution authority.
 
 ## Security boundaries
 
@@ -57,16 +62,18 @@ into the current release target:
   own verified Gemma 4 path requires `Gemma4PromptFormatter`; that mismatch must
   be corrected before treating the sample as a trustworthy device baseline.
 
-Keep Gemma 3 1B INT4 as the iPhone 13 release candidate. A future Gemma 4 RFC
-may introduce a separately feature-flagged adapter for newer devices after
-artifact size, prompt formatting, cancellation, memory, thermal, and golden-set
-gates pass. It must continue to emit only `CommandEnvelope v1`; it never gains
-authority to execute commands locally.
+Keep Gemma 3 1B INT4 as the verified default tier. Evaluate the pinned Gemma 3
+270M IT artifact as the iPhone 13 tier because the 1B artifact passes semantic
+and safety checks there but misses the two-second latency target. A future
+Gemma 4 RFC may introduce a separately feature-flagged adapter for newer
+devices after artifact size, prompt formatting, cancellation, memory, thermal,
+and golden-set gates pass. Every tier must continue to emit only
+`CommandEnvelope v1`; no model gains authority to execute commands locally.
 
 ## Prepare a candidate
 
-1. Sign in to Hugging Face, accept the Gemma license for
-   `litert-community/Gemma3-1B-IT`, and authenticate locally using the
+1. Sign in to Hugging Face, accept the Gemma license for the exact repository
+   selected above, and authenticate locally using the
    interactive `hf auth login` flow. Never put the token in this runbook's
    commands, a shell history argument, CI, or Git.
 2. Run the pinned access preflight. It uses only the existing `hf` login and
@@ -74,6 +81,12 @@ authority to execute commands locally.
 
    ```bash
    ./scripts/voice-model-candidate.sh
+   ```
+
+   For the iPhone 13 candidate, use the explicit tier on every invocation:
+
+   ```bash
+   ./scripts/voice-model-candidate.sh --tier iphone13-270m --preflight
    ```
 
    Exit 77 with an “Accept the Gemma license” message means the logged-in
@@ -90,11 +103,22 @@ authority to execute commands locally.
      --output /secure/path/gemma3-1b-it-candidate/gemma3-1b-it-int4.litertlm
    ```
 
+   The equivalent iPhone 13 candidate command is:
+
+   ```bash
+   umask 077
+   mkdir -p /secure/path/gemma3-270m-it-candidate
+   ./scripts/voice-model-candidate.sh \
+     --tier iphone13-270m \
+     --download \
+     --output /secure/path/gemma3-270m-it-candidate/gemma3-270m-it-q8.litertlm
+   ```
+
    The script pins repository, revision, and filename; refuses an output in a
    Git worktree or an existing output; suppresses all `hf` output; and publishes
-   the artifact only after its exact 584,417,280-byte size and pinned SHA-256
-   both match. Record the pinned values and license review in the release
-   ticket.
+   the artifact only after the selected tier's exact byte size and pinned
+   SHA-256 both match. Record the tier, pinned values, and license review in
+   the release ticket.
 4. Generate or select an operator-controlled Ed25519 key outside the
    repositories. For a new test key:
 
