@@ -379,6 +379,46 @@ pub struct ProviderStatus {
     pub provider_id: Option<String>,
 }
 
+pub(crate) fn validate_cancellation_resource_identity(
+    expected_provider_id: &str,
+    response: &ProviderResponse,
+) -> ApiResult<()> {
+    if response.state == ProviderDeliveryState::Succeeded
+        && response.provider_id.as_deref() != Some(expected_provider_id)
+    {
+        return Err(ApiError::new(
+            503,
+            "provider_cancel_mismatch",
+            "The provider did not confirm cancellation of the requested reminder",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_message_resource_identity(
+    persisted_provider_id: Option<&str>,
+    response: &ProviderResponse,
+) -> ApiResult<()> {
+    let response_provider_id = response.provider_id.as_deref();
+    if response.state == ProviderDeliveryState::Succeeded && response_provider_id.is_none() {
+        return Err(ApiError::new(
+            503,
+            "provider_missing_id",
+            "The message provider reported success without a provider identifier",
+        ));
+    }
+    if let (Some(persisted), Some(returned)) = (persisted_provider_id, response_provider_id) {
+        if persisted != returned {
+            return Err(ApiError::new(
+                503,
+                "provider_id_mismatch",
+                "The message provider returned a different provider identifier",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Send a minimal, idempotent provider request. The provider is deliberately
 /// an HTTPS webhook boundary rather than a vendor SDK: the backend owns the
 /// command/idempotency contract while a deployment can select a reminder or
@@ -402,10 +442,14 @@ pub async fn send(
         .ok_or_else(|| unavailable(config.mode, intent))?;
     let body = post_json(endpoint, token, intent, idempotency_key, payload).await?;
     let provider_id = provider_id_from_body(&body, intent);
-    Ok(ProviderResponse {
+    let response = ProviderResponse {
         provider_id,
         state: send_delivery_state(intent, &body),
-    })
+    };
+    if intent == "send_message" {
+        validate_message_resource_identity(None, &response)?;
+    }
+    Ok(response)
 }
 
 /// Ask a provider for the authoritative state of a request whose network
@@ -436,6 +480,15 @@ pub async fn status(
         .map(|raw| status_delivery_state(intent, raw))
         .unwrap_or(ProviderDeliveryState::Unknown);
     let provider_id = provider_id_from_body(&body, intent);
+    if intent == "send_message" {
+        validate_message_resource_identity(
+            None,
+            &ProviderResponse {
+                provider_id: provider_id.clone(),
+                state,
+            },
+        )?;
+    }
     Ok(ProviderStatus { state, provider_id })
 }
 
@@ -457,12 +510,19 @@ pub async fn cancel(
     let token = config
         .token(intent)
         .ok_or_else(|| unavailable(config.mode, intent))?;
+    let expected_provider_id = payload
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let body = post_json(endpoint, token, intent, idempotency_key, payload).await?;
     let provider_id = provider_id_from_body(&body, intent);
-    Ok(ProviderResponse {
+    let response = ProviderResponse {
         provider_id,
         state: cancel_delivery_state(&body),
-    })
+    };
+    validate_cancellation_resource_identity(&expected_provider_id, &response)?;
+    Ok(response)
 }
 
 fn provider_id_from_body(body: &Value, intent: &str) -> Option<String> {
@@ -765,6 +825,56 @@ mod tests {
     }
 
     #[test]
+    fn message_success_requires_a_stable_provider_identity() {
+        let missing = ProviderResponse {
+            provider_id: None,
+            state: ProviderDeliveryState::Succeeded,
+        };
+        assert_eq!(
+            validate_message_resource_identity(None, &missing)
+                .unwrap_err()
+                .code,
+            "provider_missing_id"
+        );
+
+        let succeeded = ProviderResponse {
+            provider_id: Some("msg-1".to_string()),
+            state: ProviderDeliveryState::Succeeded,
+        };
+        assert!(validate_message_resource_identity(None, &succeeded).is_ok());
+        assert!(validate_message_resource_identity(Some("msg-1"), &succeeded).is_ok());
+        assert_eq!(
+            validate_message_resource_identity(Some("msg-other"), &succeeded)
+                .unwrap_err()
+                .code,
+            "provider_id_mismatch"
+        );
+
+        let pending_without_id = ProviderResponse {
+            provider_id: None,
+            state: ProviderDeliveryState::Pending,
+        };
+        assert!(validate_message_resource_identity(None, &pending_without_id).is_ok());
+    }
+
+    #[test]
+    fn failed_message_status_cannot_target_a_different_persisted_resource() {
+        let matching = ProviderResponse {
+            provider_id: Some("msg-a".to_string()),
+            state: ProviderDeliveryState::Failed,
+        };
+        assert!(validate_message_resource_identity(Some("msg-a"), &matching).is_ok());
+
+        let mismatched = ProviderResponse {
+            provider_id: Some("msg-b".to_string()),
+            state: ProviderDeliveryState::Failed,
+        };
+        let error = validate_message_resource_identity(Some("msg-a"), &mismatched).unwrap_err();
+        assert_eq!(error.code, "provider_id_mismatch");
+        assert!(error.retryable);
+    }
+
+    #[test]
     fn scheduled_reminder_response_is_success_only_as_a_provider_resource() {
         assert_eq!(
             send_delivery_state("create_reminder", &json!({"provider_id": "rem-1"})),
@@ -831,5 +941,30 @@ mod tests {
             cancel_delivery_state(&json!({})),
             ProviderDeliveryState::Unknown
         );
+    }
+
+    #[test]
+    fn cancellation_success_must_confirm_the_exact_resource() {
+        let matching = ProviderResponse {
+            provider_id: Some("rem-1".to_string()),
+            state: ProviderDeliveryState::Succeeded,
+        };
+        assert!(validate_cancellation_resource_identity("rem-1", &matching).is_ok());
+
+        for provider_id in [None, Some("rem-other".to_string())] {
+            let response = ProviderResponse {
+                provider_id,
+                state: ProviderDeliveryState::Succeeded,
+            };
+            let error = validate_cancellation_resource_identity("rem-1", &response).unwrap_err();
+            assert_eq!(error.code, "provider_cancel_mismatch");
+            assert!(error.retryable);
+        }
+
+        let pending = ProviderResponse {
+            provider_id: None,
+            state: ProviderDeliveryState::Pending,
+        };
+        assert!(validate_cancellation_resource_identity("rem-1", &pending).is_ok());
     }
 }

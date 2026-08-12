@@ -646,9 +646,9 @@ async fn process_claimed(
     let Some(expected_running_version) = start_command(db, user_id, &command, row).await? else {
         // D1 execution time is authoritative. If the TTL crossed after this
         // Worker loaded the row, expire only never-started work. A recoverable
-        // attempt makes the expiration CAS a no-op and another worker/generation
-        // can continue without this stale invocation being classified as a
-        // provider failure.
+        // attempt blocks expiration only after attempts>=1 proves the effect
+        // may have started. Another worker/generation can then reconcile it
+        // without this stale invocation being classified as provider failure.
         let _ = expire_claimed_command(db, row, user_id, &command).await?;
         return Ok(());
     };
@@ -687,7 +687,7 @@ fn validated_command_args(intent: &str, args_json: &str) -> ApiResult<Map<String
 fn expire_claimed_command_sql() -> String {
     format!(
         "UPDATE commands SET state = 'expired', error_code = 'command_expired', result_json = NULL, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('pending', 'validated', 'queued', 'retryable', 'unknown') AND version = ? AND expires_at IS NOT NULL AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now') AND NOT {}{}",
-        commands::RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL,
+        commands::ACTION_EFFECT_MAY_HAVE_STARTED_SQL,
         active_command_claim_fence_sql()
     )
 }
@@ -778,7 +778,7 @@ async fn expire_claimed_command(
 fn start_command_sql() -> String {
     format!(
         "UPDATE commands SET state = 'running', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('queued', 'retryable', 'unknown') AND version = ? AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') OR {}) AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions WHERE id = commands.session_id AND user_id = ? AND deleted_at IS NULL) OR {}){}",
-        commands::RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL,
+        commands::ACTION_EFFECT_MAY_HAVE_STARTED_SQL,
         commands::ACTION_EFFECT_MAY_HAVE_STARTED_SQL,
         active_command_claim_fence_sql()
     )
@@ -939,7 +939,8 @@ fn command_matches_expected_running_generation(
 
 fn command_execution_permit_sql() -> String {
     format!(
-        "UPDATE commands SET version = version WHERE id = ? AND user_id = ? AND state = 'running' AND version = ?{}",
+        "UPDATE commands SET version = version WHERE id = ? AND user_id = ? AND state = 'running' AND version = ? AND (session_id IS NULL OR EXISTS (SELECT 1 FROM sessions AS permit_session WHERE permit_session.id = commands.session_id AND permit_session.user_id = commands.user_id AND permit_session.deleted_at IS NULL) OR {}){}",
+        commands::ACTION_EFFECT_MAY_HAVE_STARTED_SQL,
         active_command_claim_fence_sql()
     )
 }
@@ -1849,11 +1850,11 @@ mod tests {
         assert!(expire_claimed_command_sql().contains(&format!("expires_at <= {}", db_now_sql())));
         assert!(start_command_sql().contains(&format!(
             "OR {}",
-            commands::RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
+            commands::ACTION_EFFECT_MAY_HAVE_STARTED_SQL
         )));
         assert!(expire_claimed_command_sql().contains(&format!(
             "AND NOT {}",
-            commands::RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
+            commands::ACTION_EFFECT_MAY_HAVE_STARTED_SQL
         )));
         assert!(start_command_sql().contains(&format!(
             "OR {}",
@@ -1871,6 +1872,13 @@ mod tests {
         let permit = command_execution_permit_sql();
         assert!(permit.contains("SET version = version"));
         assert!(permit.contains("state = 'running' AND version = ?"));
+        assert!(permit.contains("permit_session.id = commands.session_id"));
+        assert!(permit.contains("permit_session.user_id = commands.user_id"));
+        assert!(permit.contains("permit_session.deleted_at IS NULL"));
+        assert!(permit.contains(&format!(
+            "OR {}",
+            commands::ACTION_EFFECT_MAY_HAVE_STARTED_SQL
+        )));
         assert_eq!(sql_parameter_count(&expire_claimed_outbox_sql()), 11);
     }
 
@@ -2003,6 +2011,8 @@ mod tests {
 
         let permit = command_execution_permit_sql();
         assert!(permit.contains("state = 'running' AND version = ?"));
+        assert!(permit.contains("permit_session.deleted_at IS NULL"));
+        assert!(permit.contains("started_attempt.attempts >= 1"));
         assert!(permit.ends_with(active_command_claim_fence_sql()));
 
         let durable_attempt = command_execution_attempt_permit_sql();
