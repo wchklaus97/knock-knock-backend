@@ -4,26 +4,30 @@
 > The canonical decisions live in `ARCHITECTURE_DECISIONS.md`; this document
 > defines agent boundaries, handoffs, verification, and release gates.
 
-## Execution status — 2026-08-11
+## Execution status — 2026-08-12
 
 The architecture, data, sync, history, command-safety, staging, and UI
 checkpoints are merged. The only bases for the current paired voice work are:
 
 | Repository | Merged base | Current completion branch | Status |
 |---|---|---|---|
-| Backend | `c83b04d` ([PR #27](https://github.com/wchklaus97/knock-knock-backend/pull/27)) | `agent/voice-workflow-completion-backend-20260811` | Local implementation and verification in progress; not deployed |
-| iOS | `931c6bf` ([PR #14](https://github.com/wchklaus97/knock-knock-frontend/pull/14)) | `agent/voice-workflow-completion-ios-20260811` | Local implementation and verification in progress; not distributed |
+| Backend | `bbb4a82` ([PR #29](https://github.com/wchklaus97/knock-knock-backend/pull/29)) | `agent/reject-unqualified-270m-20260812` | Voice backend merged; fail-closed 270M follow-up pending review; not deployed |
+| iOS | `1757009` ([PR #15](https://github.com/wchklaus97/knock-knock-frontend/pull/15)) | `agent/voice-goal-completion-ios-20260812` ([PR #17](https://github.com/wchklaus97/knock-knock-frontend/pull/17)) | Model safety and verified voice workflow pending review; not distributed |
 
-The protected staging deploy and contract workflows passed for backend
-`c83b04d`, and 20 consecutive health probes passed. The current voice branches
+The protected staging deploy and contract workflows passed for the previously
+deployed backend checkpoint, and 20 consecutive health probes passed. Backend
+PR #29 is now merged but has not been deployed by this work. The current iOS
+PR and backend model-policy follow-up
 add strict app-owned command canonicalization, backend-owned presentation,
 crash-safe pre-POST SQLite checkpoint/replay, one-time confirmation-token
 rotation, lightweight command summaries, authenticated private-R2 model
 delivery, signed release tooling, and a 32-example multilingual golden fixture.
 
-Remaining external gates are an operator-licensed and signed Gemma artifact,
-real-model ≥95%/zero-high-risk-false-execution evidence, exact-current-revision
-iPhone 13 microphone/memory/thermal/crash UAT, real APNs delivery, simultaneous
+Gemma 3 1B now has ≥95%/zero-high-risk-false-execution evidence on iPhone 17
+Pro Max. The evaluated 270M tier is rejected at 0.500 accuracy and its
+acquisition path fails closed; iPhone 13 keeps deterministic parsing plus
+clarification. Remaining external gates are production trust-key approval,
+private staging-R2 publication, microphone/memory/thermal/crash UAT, real APNs delivery, simultaneous
 two-physical-device convergence, provider sandbox approval, paired PR review,
 and human approval of deployment, secrets, migrations, and model rollout.
 

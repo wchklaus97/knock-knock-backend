@@ -6,9 +6,6 @@ CANDIDATE_SCRIPT="$ROOT_DIR/scripts/voice-model-candidate.sh"
 MODEL_FILENAME="gemma3-1b-it-int4.litertlm"
 EXPECTED_SIZE_BYTES="584417280"
 EXPECTED_SHA256="1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be"
-IPHONE13_MODEL_FILENAME="gemma3-270m-it-q8.litertlm"
-IPHONE13_EXPECTED_SIZE_BYTES="304005120"
-IPHONE13_EXPECTED_SHA256="757e9119fa5bd667a2774fb470ac4afcd3190a21c677f8e69a5d6bc908abdd63"
 
 smoke_tmp="$(mktemp -d)"
 cleanup() {
@@ -51,11 +48,6 @@ case "${1:-}" in
         expected_revision="6d54daa71cfbffba6b2843c08eeb1a27e7430bf0"
         expected_filename="gemma3-1b-it-int4.litertlm"
         expected_size_bytes="584417280"
-        ;;
-      litert-community/gemma-3-270m-it)
-        expected_revision="9d2093270fb5aa49a986b49b5779d763dde7b630"
-        expected_filename="gemma3-270m-it-q8.litertlm"
-        expected_size_bytes="304005120"
         ;;
       *)
         echo "fake hf received an unpinned repository" >&2
@@ -110,9 +102,6 @@ case "$(basename "$1")" in
   gemma3-1b-it-int4.litertlm)
     expected="1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be"
     ;;
-  gemma3-270m-it-q8.litertlm)
-    expected="757e9119fa5bd667a2774fb470ac4afcd3190a21c677f8e69a5d6bc908abdd63"
-    ;;
   *)
     echo "fake sha256sum received an unexpected model" >&2
     exit 64
@@ -142,18 +131,20 @@ if grep -Fq -- "--local-dir" "$fake_log"; then
 fi
 
 : > "$fake_log"
+set +e
 FAKE_HF_MODE=approved "$CANDIDATE_SCRIPT" \
   --tier iphone13-270m \
   --preflight > "$smoke_tmp/iphone13-preflight.out" 2>&1
-grep -Fq "litert-community/gemma-3-270m-it" "$smoke_tmp/iphone13-preflight.out"
-grep -Fq "$IPHONE13_MODEL_FILENAME" "$smoke_tmp/iphone13-preflight.out"
-grep -Fq "$IPHONE13_EXPECTED_SIZE_BYTES" "$smoke_tmp/iphone13-preflight.out"
-grep -Fq "$IPHONE13_EXPECTED_SHA256" "$smoke_tmp/iphone13-preflight.out"
-grep -Fq -- "--dry-run" "$fake_log"
-if grep -Fq -- "--local-dir" "$fake_log"; then
-  echo "iPhone 13 candidate preflight performed a download" >&2
+iphone13_preflight_status=$?
+set -e
+if [[ "$iphone13_preflight_status" -ne 78 ]]; then
+  echo "rejected iPhone 13 preflight returned $iphone13_preflight_status instead of 78" >&2
   exit 1
 fi
+grep -Fq "iphone13-270m is rejected" "$smoke_tmp/iphone13-preflight.out"
+grep -Fq "0.500 semantic accuracy" "$smoke_tmp/iphone13-preflight.out"
+grep -Fq "0.950 release threshold" "$smoke_tmp/iphone13-preflight.out"
+test ! -s "$fake_log"
 
 : > "$fake_log"
 set +e
@@ -181,19 +172,24 @@ grep -Fq -- "--local-dir" "$fake_log"
 grep -Fq "verified voice model candidate created outside Git" "$smoke_tmp/approved.out"
 grep -Fq "$EXPECTED_SHA256" "$smoke_tmp/approved.out"
 
-iphone13_dir="$smoke_tmp/iphone13-approved"
-iphone13_output="$iphone13_dir/$IPHONE13_MODEL_FILENAME"
+iphone13_dir="$smoke_tmp/iphone13-rejected"
+iphone13_output="$iphone13_dir/gemma3-270m-it-q8.litertlm"
 mkdir -p "$iphone13_dir"
 : > "$fake_log"
+set +e
 FAKE_HF_MODE=approved "$CANDIDATE_SCRIPT" \
   --tier iphone13-270m \
   --download \
-  --output "$iphone13_output" > "$smoke_tmp/iphone13-approved.out" 2>&1
-test -f "$iphone13_output"
-test ! -L "$iphone13_output"
-test "$(wc -c < "$iphone13_output" | tr -d '[:space:]')" = "$IPHONE13_EXPECTED_SIZE_BYTES"
-grep -Fq -- "--local-dir" "$fake_log"
-grep -Fq "$IPHONE13_EXPECTED_SHA256" "$smoke_tmp/iphone13-approved.out"
+  --output "$iphone13_output" > "$smoke_tmp/iphone13-rejected.out" 2>&1
+iphone13_download_status=$?
+set -e
+if [[ "$iphone13_download_status" -ne 78 ]]; then
+  echo "rejected iPhone 13 download returned $iphone13_download_status instead of 78" >&2
+  exit 1
+fi
+test ! -e "$iphone13_output"
+test ! -s "$fake_log"
+grep -Fq "No preflight or download was performed" "$smoke_tmp/iphone13-rejected.out"
 
 set +e
 "$CANDIDATE_SCRIPT" --tier unknown > "$smoke_tmp/invalid-tier.out" 2>&1
@@ -203,7 +199,7 @@ if [[ "$invalid_tier_status" -ne 64 ]]; then
   echo "invalid tier returned $invalid_tier_status instead of 64" >&2
   exit 1
 fi
-grep -Fq -- "--tier must be default-1b or iphone13-270m" "$smoke_tmp/invalid-tier.out"
+grep -Fq -- "--tier must be default-1b" "$smoke_tmp/invalid-tier.out"
 
 hash_mismatch_dir="$smoke_tmp/hash-mismatch"
 hash_mismatch_output="$hash_mismatch_dir/$MODEL_FILENAME"
@@ -288,4 +284,4 @@ if grep -Eq '(^|[[:space:]])--token([=[:space:]]|$)' "$fake_log"; then
   exit 1
 fi
 
-echo "voice model candidate smoke passed: approved preflight/download, license denial, exact-size and SHA-256 verification, overwrite fence, worktree fence, and no token output"
+echo "voice model candidate smoke passed: approved 1B acquisition, rejected 270M acquisition, license denial, exact-size and SHA-256 verification, overwrite fence, worktree fence, and no token output"
