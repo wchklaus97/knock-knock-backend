@@ -1,0 +1,195 @@
+name: Production release (human approved)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact 40-character main commit SHA to deploy
+        required: true
+        type: string
+      backup_run_id:
+        description: Successful Production D1 backup workflow run ID
+        required: true
+        type: string
+      rollback_version_id:
+        description: Current Cloudflare Worker version ID recorded before rollout
+        required: true
+        type: string
+      apply_migrations:
+        description: Apply pending D1 migrations after backup verification
+        required: true
+        default: false
+        type: boolean
+      approval_phrase:
+        description: Type RELEASE KNOCK KNOCK PRODUCTION
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: knock-knock-production-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://knock-knock-backend-production.wch-klaus.workers.dev
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
+      PRODUCTION_D1_DATABASE_ID: ${{ vars.KNOCK_KNOCK_D1_DATABASE_ID }}
+      PRODUCTION_R2_BUCKET: ${{ vars.KNOCK_KNOCK_R2_BUCKET }}
+      PRODUCTION_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_SUPABASE_URL }}
+      PRODUCTION_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_CORS_ORIGIN }}
+      PRODUCTION_REMINDER_URL: ${{ vars.KNOCK_KNOCK_REMINDER_PROVIDER_URL }}
+      PRODUCTION_MESSAGE_URL: ${{ vars.KNOCK_KNOCK_MESSAGE_PROVIDER_URL }}
+      PRODUCTION_REMINDER_CANCEL_URL: ${{ vars.KNOCK_KNOCK_REMINDER_CANCEL_PROVIDER_URL }}
+      PRODUCTION_REMINDER_STATUS_URL: ${{ vars.KNOCK_KNOCK_REMINDER_STATUS_PROVIDER_URL }}
+      PRODUCTION_MESSAGE_STATUS_URL: ${{ vars.KNOCK_KNOCK_MESSAGE_STATUS_PROVIDER_URL }}
+      PRODUCTION_MODEL_URL: ${{ vars.KNOCK_KNOCK_VOICE_MODEL_URL }}
+      PRODUCTION_MODEL_R2_KEY: ${{ vars.KNOCK_KNOCK_VOICE_MODEL_R2_KEY }}
+      PRODUCTION_MODEL_MANIFEST_JSON: ${{ vars.KNOCK_KNOCK_VOICE_MODEL_MANIFEST_JSON }}
+      PRODUCTION_MODEL_EXPIRES_AT: ${{ vars.KNOCK_KNOCK_VOICE_MODEL_EXPIRES_AT }}
+      PRODUCTION_URL: https://knock-knock-backend-production.wch-klaus.workers.dev
+    steps:
+      - name: Validate immutable release request
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          APPROVAL_PHRASE: ${{ inputs.approval_phrase }}
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+        run: |
+          set -euo pipefail
+          test "$APPROVAL_PHRASE" = "RELEASE KNOCK KNOCK PRODUCTION"
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ROLLBACK_VERSION_ID" =~ ^[0-9a-f-]{16,64}$ ]]
+
+      - name: Check out exact approved revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+
+      - name: Prove revision is current main
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          git fetch --no-tags origin main
+          test "$(git rev-parse origin/main)" = "$RELEASE_SHA"
+
+      - name: Verify successful production backup evidence
+        uses: actions/github-script@v7
+        env:
+          BACKUP_RUN_ID: ${{ inputs.backup_run_id }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        with:
+          script: |
+            const runId = Number(process.env.BACKUP_RUN_ID);
+            if (!Number.isSafeInteger(runId) || runId <= 0) core.setFailed("invalid backup run id");
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner, repo: context.repo.repo, run_id: runId
+            });
+            if (run.name !== "Production D1 backup" || run.status !== "completed" || run.conclusion !== "success") {
+              core.setFailed("backup workflow evidence is not a successful completed production backup");
+            }
+            if (run.head_branch !== "main") core.setFailed("backup evidence must come from main");
+
+      - name: Install pinned release toolchain
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install worker-build --version 0.8.3 --locked
+          npm install --global wrangler@4.81.1
+
+      - name: Run code and contract release gates
+        run: ./scripts/phase45-release-gate.sh
+
+      - name: Materialize fail-closed production config
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID PRODUCTION_D1_DATABASE_ID PRODUCTION_R2_BUCKET PRODUCTION_SUPABASE_URL PRODUCTION_CORS_ORIGIN PRODUCTION_REMINDER_URL PRODUCTION_MESSAGE_URL PRODUCTION_REMINDER_CANCEL_URL PRODUCTION_REMINDER_STATUS_URL PRODUCTION_MESSAGE_STATUS_URL PRODUCTION_MODEL_URL PRODUCTION_MODEL_R2_KEY PRODUCTION_MODEL_MANIFEST_JSON PRODUCTION_MODEL_EXPIRES_AT; do
+            test -n "${!name:-}" || { echo "missing required production setting: $name" >&2; exit 64; }
+          done
+          config="$RUNNER_TEMP/wrangler.production.toml"
+          python3 - "$config" <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          source = pathlib.Path("wrangler.production.toml.example").read_text()
+
+          def toml_string(value: str) -> str:
+              return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+          replacements = {
+              "REPLACE_WITH_SUPABASE_PROJECT_URL": os.environ["PRODUCTION_SUPABASE_URL"],
+              "REPLACE_WITH_ALLOWED_ORIGIN": os.environ["PRODUCTION_CORS_ORIGIN"],
+              "REPLACE_WITH_RELEASE_VERSION": os.environ["RELEASE_SHA"],
+              "REPLACE_WITH_REMINDER_PROVIDER_URL": os.environ["PRODUCTION_REMINDER_URL"],
+              "REPLACE_WITH_MESSAGE_PROVIDER_URL": os.environ["PRODUCTION_MESSAGE_URL"],
+              "REPLACE_WITH_REMINDER_CANCEL_PROVIDER_URL": os.environ["PRODUCTION_REMINDER_CANCEL_URL"],
+              "REPLACE_WITH_REMINDER_STATUS_PROVIDER_URL": os.environ["PRODUCTION_REMINDER_STATUS_URL"],
+              "REPLACE_WITH_MESSAGE_STATUS_PROVIDER_URL": os.environ["PRODUCTION_MESSAGE_STATUS_URL"],
+              "REPLACE_WITH_SIGNED_MODEL_URL": os.environ["PRODUCTION_MODEL_URL"],
+              "REPLACE_WITH_SIGNED_MODEL_R2_KEY": os.environ["PRODUCTION_MODEL_R2_KEY"],
+              "REPLACE_WITH_SIGNED_MODEL_MANIFEST_JSON": os.environ["PRODUCTION_MODEL_MANIFEST_JSON"],
+              "REPLACE_WITH_MODEL_URL_EXPIRY": os.environ["PRODUCTION_MODEL_EXPIRES_AT"],
+              "REPLACE_WITH_D1_DATABASE_ID": os.environ["PRODUCTION_D1_DATABASE_ID"],
+              "REPLACE_WITH_R2_BUCKET_NAME": os.environ["PRODUCTION_R2_BUCKET"],
+          }
+          source = source.replace(
+              'main = "build/worker/shim.mjs"',
+              f'main = "{toml_string(os.environ["GITHUB_WORKSPACE"] + "/build/worker/shim.mjs")}"',
+          )
+          for marker, value in replacements.items():
+              source = source.replace(marker, toml_string(value))
+          pathlib.Path(sys.argv[1]).write_text(source)
+          PY
+          if grep -q 'REPLACE_WITH_' "$config"; then
+            echo "production configuration still contains a placeholder" >&2
+            exit 64
+          fi
+          grep -Fqx 'NODE_ENV = "production"' "$config"
+          grep -Fqx 'APNS_PRODUCTION = "true"' "$config"
+          echo "PRODUCTION_WRANGLER_CONFIG=$config" >> "$GITHUB_ENV"
+
+      - name: Apply approved production migrations
+        if: ${{ inputs.apply_migrations == true }}
+        run: wrangler d1 migrations apply knock-knock --remote --config "$PRODUCTION_WRANGLER_CONFIG"
+
+      - name: Deploy exact approved Worker
+        run: wrangler deploy --cwd "$GITHUB_WORKSPACE" --config "$PRODUCTION_WRANGLER_CONFIG"
+
+      - name: Verify production revision and readiness
+        env:
+          KNOCK_KNOCK_EXPECTED_PRODUCTION_VERSION: ${{ inputs.release_sha }}
+          KNOCK_KNOCK_REQUIRE_RELEASE_READINESS_GAUGES: "1"
+        run: ./scripts/production-healthcheck.sh "$PRODUCTION_URL"
+
+      - name: Record rollback evidence
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+          BACKUP_RUN_ID: ${{ inputs.backup_run_id }}
+        run: |
+          printf 'release_sha=%s\nrollback_version_id=%s\nbackup_run_id=%s\n' \
+            "$RELEASE_SHA" "$ROLLBACK_VERSION_ID" "$BACKUP_RUN_ID" > "$RUNNER_TEMP/release-record.txt"
+
+      - name: Upload non-secret release record
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-release-record-${{ github.run_id }}
+          path: ${{ runner.temp }}/release-record.txt
+          retention-days: 90
+
+      - name: Remove materialized production config
+        if: ${{ always() }}
+        run: rm -f -- "${PRODUCTION_WRANGLER_CONFIG:-}"

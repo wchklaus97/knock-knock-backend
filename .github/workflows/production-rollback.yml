@@ -1,0 +1,92 @@
+name: Production rollback (human approved)
+
+on:
+  workflow_dispatch:
+    inputs:
+      failed_release_sha:
+        description: Exact 40-character release SHA being rolled back
+        required: true
+        type: string
+      rollback_version_id:
+        description: Previously recorded healthy Cloudflare Worker version ID
+        required: true
+        type: string
+      expected_service_version:
+        description: SERVICE_VERSION expected after rollback
+        required: true
+        type: string
+      approval_phrase:
+        description: Type ROLLBACK KNOCK KNOCK PRODUCTION
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knock-knock-production-release
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: https://knock-knock-backend-production.wch-klaus.workers.dev
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
+      PRODUCTION_URL: https://knock-knock-backend-production.wch-klaus.workers.dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate rollback request
+        env:
+          APPROVAL_PHRASE: ${{ inputs.approval_phrase }}
+          FAILED_RELEASE_SHA: ${{ inputs.failed_release_sha }}
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+          EXPECTED_SERVICE_VERSION: ${{ inputs.expected_service_version }}
+        run: |
+          set -euo pipefail
+          test "$APPROVAL_PHRASE" = "ROLLBACK KNOCK KNOCK PRODUCTION"
+          [[ "$FAILED_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ROLLBACK_VERSION_ID" =~ ^[0-9a-f-]{16,64}$ ]]
+          test -n "$EXPECTED_SERVICE_VERSION"
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+
+      - name: Install pinned Wrangler
+        run: npm install --global wrangler@4.81.1
+
+      - name: Roll back Worker code
+        env:
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+          FAILED_RELEASE_SHA: ${{ inputs.failed_release_sha }}
+        run: |
+          set -euo pipefail
+          wrangler rollback "$ROLLBACK_VERSION_ID" \
+            --name knock-knock-backend-production \
+            --message "Human-approved rollback of ${FAILED_RELEASE_SHA}" \
+            --yes
+
+      - name: Verify rolled-back service version
+        env:
+          KNOCK_KNOCK_EXPECTED_PRODUCTION_VERSION: ${{ inputs.expected_service_version }}
+        run: ./scripts/production-healthcheck.sh "$PRODUCTION_URL"
+
+      - name: Record rollback evidence
+        env:
+          FAILED_RELEASE_SHA: ${{ inputs.failed_release_sha }}
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+          EXPECTED_SERVICE_VERSION: ${{ inputs.expected_service_version }}
+        run: |
+          printf 'failed_release_sha=%s\nrollback_version_id=%s\nexpected_service_version=%s\n' \
+            "$FAILED_RELEASE_SHA" "$ROLLBACK_VERSION_ID" "$EXPECTED_SERVICE_VERSION" \
+            > "$RUNNER_TEMP/rollback-record.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: production-rollback-record-${{ github.run_id }}
+          path: ${{ runner.temp }}/rollback-record.txt
+          retention-days: 90
