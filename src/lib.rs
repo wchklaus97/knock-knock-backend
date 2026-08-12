@@ -100,18 +100,63 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// adapters remain unknown/retryable instead of being reported as success.
 #[event(scheduled)]
 pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    if runtime_configuration(&env).is_err() {
+    if let Err(error) = runtime_configuration(&env) {
+        worker::console_error!(
+            "scheduled pass skipped: runtime configuration failed ({}; status {})",
+            error.code,
+            error.status
+        );
         return;
     }
-    if let Ok(db) = env.d1("DB") {
-        let _ = action_effects::reconcile_succeeded_cancellations(&db).await;
-        let _ = outbox::drain(&db, &env).await;
-        if let Ok(provider_config) = providers::load(&env) {
-            let _ =
-                action_effects::reconcile_external_cancellations(&env, &db, provider_config).await;
+    let Ok(db) = env.d1("DB") else {
+        worker::console_error!("scheduled pass skipped: DB binding is unavailable");
+        return;
+    };
+    if let Err(error) = action_effects::reconcile_succeeded_cancellations(&db).await {
+        worker::console_error!(
+            "scheduled cancellation reconciliation failed ({}; status {})",
+            error.code,
+            error.status
+        );
+    }
+    if let Err(error) = outbox::drain(&db, &env).await {
+        worker::console_error!(
+            "scheduled outbox drain left unsettled work ({}; status {})",
+            error.code,
+            error.status
+        );
+    }
+    match providers::load(&env) {
+        Ok(provider_config) => {
+            if let Err(error) =
+                action_effects::reconcile_external_cancellations(&env, &db, provider_config).await
+            {
+                worker::console_error!(
+                    "scheduled external cancellation reconciliation failed ({}; status {})",
+                    error.code,
+                    error.status
+                );
+            }
         }
-        let _ = reminders::drain_due(&db, &env).await;
-        let _ = history::purge_expired_all(&db, &env).await;
+        Err(error) => worker::console_error!(
+            "scheduled provider configuration failed ({}; status {})",
+            error.code,
+            error.status
+        ),
+    }
+    if let Err(error) = reminders::drain_due(&db, &env).await {
+        worker::console_error!(
+            "scheduled reminder drain failed ({}; status {})",
+            error.code,
+            error.status
+        );
+    }
+    if let Err(error) = history::purge_expired_all(&db, &env).await {
+        worker::console_error!(
+            "scheduled history purge failed ({}; status {})",
+            error.code,
+            error.status
+        );
     }
 }
 

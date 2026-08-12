@@ -18,6 +18,9 @@ const MAX_ATTEMPTS: i32 = 3;
 const LEASE_SECONDS: i64 = 300;
 const UNKNOWN_RECONCILE_SECONDS: i64 = 300;
 const COMMAND_EXECUTE_TOPIC: &str = "command.execute";
+const COMMAND_WAKEUP_SCOPE: &str = "command.wakeup";
+const APNS_COMMAND_WAKEUP_TOPIC: &str = "command.wakeup.apns";
+const APNS_COMMAND_WAKEUP_PROVIDER: &str = "apns.command_wakeup";
 const ACTIVE_COMMAND_CLAIM_FENCE_BIND_COUNT: usize = 7;
 const RECOVERY_COMMAND_CLAIM_FENCE_BIND_COUNT: usize = 9;
 
@@ -57,6 +60,22 @@ fn expected_execution_outbox_key(
     } else {
         providers::scoped_idempotency_key(user_id, "command.execute", command_idempotency_key)
     }
+}
+
+fn command_wakeup_key(user_id: &str, command_id: &str, command_version: i64) -> String {
+    providers::scoped_idempotency_key(
+        user_id,
+        COMMAND_WAKEUP_SCOPE,
+        &format!("{command_id}:{command_version}"),
+    )
+}
+
+fn apns_command_wakeup_key(wake_key: &str, device_id: &str) -> String {
+    format!("{wake_key}:{device_id}")
+}
+
+fn active_wake_claim_fence_sql() -> &'static str {
+    "EXISTS (SELECT 1 FROM outbox_events AS wake_claim WHERE wake_claim.id = ? AND wake_claim.user_id = ? AND wake_claim.topic = ? AND wake_claim.aggregate_id = ? AND wake_claim.idempotency_key = ? AND wake_claim.state = 'running' AND wake_claim.lease_token = ? AND wake_claim.lease_expires_at IS NOT NULL AND wake_claim.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -267,14 +286,59 @@ struct CommandPayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct CommandWakeTokenRow {
+struct ApnsCommandWakePayload {
+    command_id: String,
+    command_version: i64,
+    device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApnsWakeDeviceRow {
     push_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WakeAttemptRow {
+    state: String,
 }
 
 #[derive(Debug)]
 enum ExecutionFailure {
     Permanent(ApiError),
     Retryable(ApiError),
+}
+
+#[derive(Debug)]
+enum WakeFailure {
+    Permanent(ApiError),
+    Retryable(ApiError),
+    Unknown(ApiError),
+}
+
+impl WakeFailure {
+    fn known(error: ApiError) -> Self {
+        if error.retryable {
+            Self::Retryable(error)
+        } else {
+            Self::Permanent(error)
+        }
+    }
+
+    fn from_apns(failure: apns::CommandWakeFailure) -> Self {
+        let unknown = failure.is_unknown();
+        let error = failure.into_error();
+        if unknown {
+            Self::Unknown(error)
+        } else {
+            Self::known(error)
+        }
+    }
+
+    fn error(&self) -> &ApiError {
+        match self {
+            Self::Permanent(error) | Self::Retryable(error) | Self::Unknown(error) => error,
+        }
+    }
 }
 
 impl ExecutionFailure {
@@ -326,6 +390,20 @@ fn recover_stale_claims_sql() -> String {
     )
 }
 
+fn due_outbox_sql() -> String {
+    // Command unknowns enter action-attempt/provider reconciliation before any
+    // new effect permit. APNs has no status lookup, so its unknown rows remain
+    // durable for operators and are deliberately absent from this selector.
+    format!(
+        "{} WHERE (state IN ('queued', 'retrying') OR (state = 'unknown' AND topic = 'command.execute')) AND lease_token IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
+        outbox_select()
+    )
+}
+
+fn claim_outbox_sql() -> &'static str {
+    "UPDATE outbox_events SET state = 'running', attempts = attempts + 1, lease_token = ?, lease_expires_at = ?, updated_at = ? WHERE id = ? AND (state IN ('queued', 'retrying') OR (state = 'unknown' AND topic = 'command.execute')) AND lease_token IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+}
+
 fn recover_running_command_sql() -> String {
     format!(
         "UPDATE commands SET state = 'retryable', error_code = 'worker_lease_expired', version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'running' AND version = ? AND updated_at <= ?{}",
@@ -375,37 +453,58 @@ async fn resume_expired_claim(
 }
 
 pub async fn drain(db: &D1Database, env: &worker::Env) -> ApiResult<usize> {
-    let provider_config = providers::load(env)?;
     commands::expire_due(db).await?;
     recover_stale_claims(db, env).await?;
-    let now = db::now_iso();
-    let rows: Vec<OutboxEventRow> = db::all(
-        db,
-        &format!(
-            "{} WHERE state IN ('queued', 'retrying', 'unknown') AND lease_token IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
-            outbox_select()
-        ),
-        vec![db::text(&now), db::number(BATCH_SIZE)],
-    )
-    .await?;
-
     let mut processed = 0;
-    for row in rows {
-        if let Some(claimed) = claim(db, &row).await? {
-            processed += 1;
-            if let Err(error) = process_claimed(db, env, &claimed, provider_config.clone()).await {
-                settle_processing_error(db, env, &claimed, &error).await?;
+    let mut first_unsettled_error = None;
+    while processed < BATCH_SIZE as usize {
+        let now = db::now_iso();
+        let remaining = BATCH_SIZE - processed as i64;
+        let rows: Vec<OutboxEventRow> = db::all(
+            db,
+            &due_outbox_sql(),
+            vec![db::text(&now), db::number(remaining)],
+        )
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+
+        let mut claimed_any = false;
+        for row in rows {
+            if let Some(claimed) = claim(db, &row).await? {
+                claimed_any = true;
+                processed += 1;
+                if let Err(error) = process_claimed(db, env, &claimed).await {
+                    let settlement = if claimed.topic == COMMAND_EXECUTE_TOPIC {
+                        settle_processing_error(db, env, &claimed, &error).await
+                    } else {
+                        // Wake processing settles known outcomes itself. An error
+                        // here means that durable settlement failed; leave the
+                        // lease intact for conservative stale-claim recovery.
+                        Err(error)
+                    };
+                    if let Err(error) = settlement {
+                        first_unsettled_error.get_or_insert(error);
+                    }
+                }
             }
         }
+        // Concurrent scheduled invocations can win every row in this page.
+        // Refreshing the same page without progress would only spin.
+        if !claimed_any {
+            break;
+        }
     }
-    Ok(processed)
+    match first_unsettled_error {
+        Some(error) => Err(error),
+        None => Ok(processed),
+    }
 }
 
-/// A Worker can terminate after claiming an outbox row but before it settles
-/// the command. If command execution never started, release the same outbox
-/// row so its owner-scoped, idempotent work can resume. If the command is
-/// already running, move it to the explicit unknown/retryable path and bump
-/// its version so the expired invocation cannot report a late success.
+/// Recover expired command and wake leases without guessing across an external
+/// side-effect boundary. Work that expired before a durable permit can retry;
+/// a running APNs attempt is retained as unknown and is never auto-claimed.
 async fn recover_stale_claims(db: &D1Database, env: &worker::Env) -> ApiResult<()> {
     let cutoff = db::add_seconds_iso(-LEASE_SECONDS);
     let now = db::now_iso();
@@ -417,6 +516,14 @@ async fn recover_stale_claims(db: &D1Database, env: &worker::Env) -> ApiResult<(
     .await?;
 
     for row in rows {
+        if row.topic == APNS_COMMAND_WAKEUP_TOPIC {
+            recover_expired_apns_wakeup(db, &row, &cutoff).await?;
+            continue;
+        }
+        if row.topic != COMMAND_EXECUTE_TOPIC {
+            settle_orphan(db, &row, "unsupported_outbox_topic").await?;
+            continue;
+        }
         let Some(user_id) = row.user_id.as_deref() else {
             settle_orphan(db, &row, "missing_user_scope").await?;
             continue;
@@ -542,7 +649,7 @@ async fn claim(db: &D1Database, row: &OutboxEventRow) -> ApiResult<Option<Outbox
     let lease_expires_at = db::add_seconds_iso(LEASE_SECONDS);
     let result = db::run(
         db,
-        "UPDATE outbox_events SET state = 'running', attempts = attempts + 1, lease_token = ?, lease_expires_at = ?, updated_at = ? WHERE id = ? AND state IN ('queued', 'retrying', 'unknown') AND lease_token IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
+        claim_outbox_sql(),
         vec![
             db::text(&lease_token),
             db::text(&lease_expires_at),
@@ -565,6 +672,18 @@ async fn claim(db: &D1Database, row: &OutboxEventRow) -> ApiResult<Option<Outbox
 }
 
 async fn process_claimed(
+    db: &D1Database,
+    env: &worker::Env,
+    row: &OutboxEventRow,
+) -> ApiResult<()> {
+    match row.topic.as_str() {
+        COMMAND_EXECUTE_TOPIC => process_command_claimed(db, env, row, providers::load(env)?).await,
+        APNS_COMMAND_WAKEUP_TOPIC => process_apns_command_wakeup(db, env, row).await,
+        _ => settle_orphan(db, row, "unsupported_outbox_topic").await,
+    }
+}
+
+async fn process_command_claimed(
     db: &D1Database,
     env: &worker::Env,
     row: &OutboxEventRow,
@@ -668,6 +787,575 @@ async fn process_claimed(
         Ok(result) => finish_success(db, env, row, user_id, &current, result).await,
         Err(failure) => finish_failure(db, env, row, user_id, &current, failure, "running").await,
     }
+}
+
+fn apns_wakeup_device_query() -> &'static str {
+    "SELECT push_token FROM devices WHERE id = ? AND user_id = ? AND platform = 'ios'"
+}
+
+fn enqueue_apns_wakeup_sql() -> &'static str {
+    "INSERT INTO outbox_events (id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, next_attempt_at, last_error, created_at, updated_at, lease_token, lease_expires_at) SELECT 'out_' || lower(hex(randomblob(16))), ?, 'command.wakeup.apns', ?, json_object('command_id', ?, 'command_version', ?, 'device_id', devices.id), ? || ':' || devices.id, 'queued', 0, NULL, NULL, ?, ?, NULL, NULL FROM devices WHERE devices.user_id = ? AND devices.platform = 'ios' AND devices.push_token IS NOT NULL AND devices.push_token != '' AND changes() = 1 ON CONFLICT(topic, idempotency_key) DO NOTHING"
+}
+
+fn prepare_apns_wakeup_statement(
+    db: &D1Database,
+    user_id: &str,
+    command_id: &str,
+    command_version: i64,
+    now: &str,
+) -> ApiResult<worker::D1PreparedStatement> {
+    let wake_key = command_wakeup_key(user_id, command_id, command_version);
+    db::prepare(
+        db,
+        enqueue_apns_wakeup_sql(),
+        vec![
+            db::text(user_id),
+            db::text(command_id),
+            db::text(command_id),
+            db::number(command_version),
+            db::text(&wake_key),
+            db::text(now),
+            db::text(now),
+            db::text(user_id),
+        ],
+    )
+}
+
+fn settle_active_wake_sql() -> &'static str {
+    "UPDATE outbox_events SET state = ?, next_attempt_at = ?, last_error = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND user_id IS ? AND topic = ? AND aggregate_id = ? AND idempotency_key = ? AND state = 'running' AND lease_token = ? AND lease_expires_at IS NOT NULL AND lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+}
+
+fn acquire_apns_wakeup_attempt_sql() -> String {
+    format!(
+        "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) SELECT ?, ?, ?, NULL, ?, ?, 'running', ?, NULL, 1, NULL, NULL, ?, ? WHERE {} ON CONFLICT(provider, provider_idempotency_key) DO UPDATE SET state = 'running', response_json = NULL, attempts = action_attempts.attempts + 1, next_attempt_at = NULL, last_error = NULL, updated_at = excluded.updated_at WHERE action_attempts.user_id = excluded.user_id AND action_attempts.command_id = excluded.command_id AND action_attempts.request_hash = excluded.request_hash AND action_attempts.state = 'retrying'",
+        active_wake_claim_fence_sql()
+    )
+}
+
+fn settle_apns_wakeup_attempt_sql() -> String {
+    format!(
+        "UPDATE action_attempts SET state = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE user_id = ? AND command_id = ? AND provider = ? AND provider_idempotency_key = ? AND request_hash = ? AND state = 'running' AND {}",
+        active_wake_claim_fence_sql()
+    )
+}
+
+fn settle_apns_wakeup_outbox_sql() -> &'static str {
+    "UPDATE outbox_events SET state = ?, next_attempt_at = ?, last_error = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND user_id = ? AND topic = ? AND aggregate_id = ? AND idempotency_key = ? AND state = 'running' AND changes() = 1 AND lease_token = ? AND lease_expires_at IS NOT NULL AND lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+}
+
+fn wake_claim_is_active(row: &OutboxEventRow, expected_topic: &str, now: &str) -> bool {
+    row.topic == expected_topic
+        && row.state == "running"
+        && row.lease_token.is_some()
+        && row
+            .lease_expires_at
+            .as_deref()
+            .is_some_and(|lease_expires_at| lease_expires_at > now)
+}
+
+fn apns_wakeup_payload_is_authorized(
+    row: &OutboxEventRow,
+    user_id: &str,
+    payload: &ApnsCommandWakePayload,
+) -> bool {
+    payload.command_version > 0
+        && !payload.device_id.trim().is_empty()
+        && payload.command_id == row.aggregate_id
+        && row.idempotency_key
+            == apns_command_wakeup_key(
+                &command_wakeup_key(user_id, &payload.command_id, payload.command_version),
+                &payload.device_id,
+            )
+}
+
+fn wake_mode(env: &worker::Env) -> Result<bool, WakeFailure> {
+    match config_value(env, "PUSH_MODE", "dev").as_str() {
+        "dev" => Ok(false),
+        "apns" | "both" => Ok(true),
+        _ => Err(WakeFailure::Permanent(ApiError::new(
+            500,
+            "push_configuration_error",
+            "PUSH_MODE must be dev, apns, or both",
+        ))),
+    }
+}
+
+async fn process_apns_command_wakeup(
+    db: &D1Database,
+    env: &worker::Env,
+    row: &OutboxEventRow,
+) -> ApiResult<()> {
+    match deliver_apns_command_wakeup(db, env, row).await {
+        Ok(()) => Ok(()),
+        Err((attempt_started, failure)) => {
+            settle_wake_failure(db, row, attempt_started, &failure).await
+        }
+    }
+}
+
+async fn deliver_apns_command_wakeup(
+    db: &D1Database,
+    env: &worker::Env,
+    row: &OutboxEventRow,
+) -> Result<(), (bool, WakeFailure)> {
+    let preflight = async {
+        let user_id = row.user_id.as_deref().ok_or_else(|| {
+            WakeFailure::Permanent(ApiError::validation("APNs wake is missing user scope"))
+        })?;
+        let payload: ApnsCommandWakePayload =
+            serde_json::from_str(&row.payload_json).map_err(|_| {
+                WakeFailure::Permanent(ApiError::validation("APNs wake payload is invalid"))
+            })?;
+        if !apns_wakeup_payload_is_authorized(row, user_id, &payload) {
+            return Err(WakeFailure::Permanent(ApiError::new(
+                422,
+                "apns_wakeup_not_authorized",
+                "APNs wake event identity is invalid",
+            )));
+        }
+        let command = commands::get_for_user(db, user_id, &payload.command_id)
+            .await
+            .map_err(WakeFailure::known)?
+            .ok_or_else(|| {
+                WakeFailure::Permanent(ApiError::not_found("APNs wake command was not found"))
+            })?;
+        if command.version < payload.command_version {
+            return Err(WakeFailure::Permanent(ApiError::new(
+                409,
+                "apns_wakeup_version_mismatch",
+                "APNs wake command version is invalid",
+            )));
+        }
+        let now = db::now_iso();
+        if !wake_claim_is_active(row, APNS_COMMAND_WAKEUP_TOPIC, &now) {
+            return Ok(None);
+        }
+        if !wake_mode(env)? {
+            settle_wake_outbox(db, row, "succeeded", None, None)
+                .await
+                .map_err(WakeFailure::known)?;
+            return Ok(None);
+        }
+        if !apns::is_ready(env) {
+            return Err(WakeFailure::Retryable(ApiError::new(
+                503,
+                "apns_configuration_unavailable",
+                "APNs signing configuration is not ready",
+            )));
+        }
+        let device = db::first::<ApnsWakeDeviceRow>(
+            db,
+            apns_wakeup_device_query(),
+            vec![db::text(&payload.device_id), db::text(user_id)],
+        )
+        .await
+        .map_err(WakeFailure::known)?
+        .ok_or_else(|| {
+            WakeFailure::Permanent(ApiError::new(
+                410,
+                "apns_device_unavailable",
+                "The APNs device is no longer registered",
+            ))
+        })?;
+        let token = device
+            .push_token
+            .filter(|token| apns::looks_like_token(token))
+            .ok_or_else(|| {
+                WakeFailure::Permanent(ApiError::new(
+                    410,
+                    "apns_token_unavailable",
+                    "The APNs token is no longer valid",
+                ))
+            })?;
+        Ok(Some((user_id, payload, token)))
+    }
+    .await;
+
+    let Some((user_id, payload, token)) = preflight.map_err(|failure| (false, failure))? else {
+        return Ok(());
+    };
+    if !acquire_apns_wakeup_attempt(db, row, user_id, &payload)
+        .await
+        .map_err(|error| (false, WakeFailure::known(error)))?
+    {
+        reconcile_unpermitted_apns_wakeup(db, row, user_id, &payload)
+            .await
+            .map_err(|error| (false, WakeFailure::known(error)))?;
+        return Ok(());
+    }
+
+    match apns::send_command_wakeup(env, &token).await {
+        Ok(()) => settle_apns_wakeup(db, row, user_id, &payload, "succeeded", None, None)
+            .await
+            .map_err(|error| (true, WakeFailure::Unknown(error))),
+        Err(failure) => Err((true, WakeFailure::from_apns(failure))),
+    }
+}
+
+async fn acquire_apns_wakeup_attempt(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    user_id: &str,
+    payload: &ApnsCommandWakePayload,
+) -> ApiResult<bool> {
+    let Some(lease_token) = row.lease_token.as_deref() else {
+        return Ok(false);
+    };
+    let now = db::now_iso();
+    let result = db::run(
+        db,
+        &acquire_apns_wakeup_attempt_sql(),
+        vec![
+            db::text(&new_id("attempt")?),
+            db::text(user_id),
+            db::text(&payload.command_id),
+            db::text(APNS_COMMAND_WAKEUP_PROVIDER),
+            db::text(&row.idempotency_key),
+            db::text(&row.idempotency_key),
+            db::text(&now),
+            db::text(&now),
+            db::text(&row.id),
+            db::text(user_id),
+            db::text(&row.topic),
+            db::text(&row.aggregate_id),
+            db::text(&row.idempotency_key),
+            db::text(lease_token),
+        ],
+    )
+    .await?;
+    Ok(db::changes(&result) == 1)
+}
+
+async fn reconcile_unpermitted_apns_wakeup(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    user_id: &str,
+    payload: &ApnsCommandWakePayload,
+) -> ApiResult<()> {
+    let attempt = db::first::<WakeAttemptRow>(
+        db,
+        "SELECT state FROM action_attempts WHERE user_id = ? AND command_id = ? AND provider = ? AND provider_idempotency_key = ? AND request_hash = ?",
+        vec![
+            db::text(user_id),
+            db::text(&payload.command_id),
+            db::text(APNS_COMMAND_WAKEUP_PROVIDER),
+            db::text(&row.idempotency_key),
+            db::text(&row.idempotency_key),
+        ],
+    )
+    .await?;
+    match attempt.as_ref().map(|attempt| attempt.state.as_str()) {
+        Some("succeeded") => settle_wake_outbox(db, row, "succeeded", None, None).await,
+        Some("failed") => {
+            settle_wake_outbox(db, row, "failed", None, Some("apns_attempt_failed")).await
+        }
+        Some("running") => {
+            settle_apns_wakeup(
+                db,
+                row,
+                user_id,
+                payload,
+                "unknown",
+                None,
+                Some("apns_delivery_unknown"),
+            )
+            .await
+        }
+        Some("unknown") => {
+            settle_wake_outbox(db, row, "unknown", None, Some("apns_delivery_unknown")).await
+        }
+        Some("queued" | "retrying") | None => Ok(()),
+        Some(_) => settle_wake_outbox(db, row, "failed", None, Some("invalid_attempt_state")).await,
+    }
+}
+
+fn wake_failure_transition(failure: &WakeFailure, attempts: i32) -> (&'static str, bool) {
+    match failure {
+        WakeFailure::Retryable(_) if attempts.max(1) < MAX_ATTEMPTS => ("retrying", true),
+        WakeFailure::Retryable(_) | WakeFailure::Permanent(_) => ("failed", false),
+        WakeFailure::Unknown(_) => ("unknown", false),
+    }
+}
+
+async fn settle_wake_failure(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    attempt_started: bool,
+    failure: &WakeFailure,
+) -> ApiResult<()> {
+    let (state, retry) = wake_failure_transition(failure, row.attempts);
+    let retry_at = retry.then(|| db::add_seconds_iso(backoff_seconds(row.attempts)));
+    let error_code = failure.error().code.as_str();
+    if let (true, Some(user_id)) = (attempt_started, row.user_id.as_deref()) {
+        let payload = serde_json::from_str::<ApnsCommandWakePayload>(&row.payload_json)
+            .map_err(|_| ApiError::validation("APNs wake payload is invalid"))?;
+        settle_apns_wakeup(
+            db,
+            row,
+            user_id,
+            &payload,
+            state,
+            retry_at.as_deref(),
+            Some(error_code),
+        )
+        .await
+    } else {
+        settle_wake_outbox(db, row, state, retry_at.as_deref(), Some(error_code)).await
+    }
+}
+
+fn prepare_settle_active_wake(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    state: &str,
+    next_attempt_at: Option<&str>,
+    last_error: Option<&str>,
+    now: &str,
+) -> ApiResult<worker::D1PreparedStatement> {
+    db::prepare(
+        db,
+        settle_active_wake_sql(),
+        vec![
+            db::text(state),
+            db::optional_text(next_attempt_at),
+            db::optional_text(last_error),
+            db::text(now),
+            db::text(&row.id),
+            db::optional_text(row.user_id.as_deref()),
+            db::text(&row.topic),
+            db::text(&row.aggregate_id),
+            db::text(&row.idempotency_key),
+            db::optional_text(row.lease_token.as_deref()),
+        ],
+    )
+}
+
+async fn settle_wake_outbox(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    state: &str,
+    next_attempt_at: Option<&str>,
+    last_error: Option<&str>,
+) -> ApiResult<()> {
+    let statement =
+        prepare_settle_active_wake(db, row, state, next_attempt_at, last_error, &db::now_iso())?;
+    statement.run().await?;
+    Ok(())
+}
+
+async fn settle_apns_wakeup(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    user_id: &str,
+    payload: &ApnsCommandWakePayload,
+    state: &str,
+    next_attempt_at: Option<&str>,
+    last_error: Option<&str>,
+) -> ApiResult<()> {
+    let Some(lease_token) = row.lease_token.as_deref() else {
+        return Ok(());
+    };
+    let now = db::now_iso();
+    let statements = vec![
+        db::prepare(
+            db,
+            &settle_apns_wakeup_attempt_sql(),
+            vec![
+                db::text(state),
+                db::optional_text(next_attempt_at),
+                db::optional_text(last_error),
+                db::text(&now),
+                db::text(user_id),
+                db::text(&payload.command_id),
+                db::text(APNS_COMMAND_WAKEUP_PROVIDER),
+                db::text(&row.idempotency_key),
+                db::text(&row.idempotency_key),
+                db::text(&row.id),
+                db::text(user_id),
+                db::text(&row.topic),
+                db::text(&row.aggregate_id),
+                db::text(&row.idempotency_key),
+                db::text(lease_token),
+            ],
+        )?,
+        db::prepare(
+            db,
+            settle_apns_wakeup_outbox_sql(),
+            vec![
+                db::text(state),
+                db::optional_text(next_attempt_at),
+                db::optional_text(last_error),
+                db::text(&now),
+                db::text(&row.id),
+                db::text(user_id),
+                db::text(&row.topic),
+                db::text(&row.aggregate_id),
+                db::text(&row.idempotency_key),
+                db::text(lease_token),
+            ],
+        )?,
+    ];
+    db.batch(statements).await?;
+    Ok(())
+}
+
+fn settle_expired_wake_sql() -> &'static str {
+    "UPDATE outbox_events SET state = ?, next_attempt_at = ?, last_error = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND user_id IS ? AND topic = ? AND aggregate_id = ? AND idempotency_key = ? AND state = 'running' AND (lease_token = ? OR (lease_token IS NULL AND ? IS NULL)) AND ((lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')) OR (lease_expires_at IS NULL AND updated_at <= ?))"
+}
+
+async fn settle_expired_wake_outbox(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    cutoff: &str,
+    state: &str,
+    next_attempt_at: Option<&str>,
+    last_error: &str,
+) -> ApiResult<()> {
+    db::run(
+        db,
+        settle_expired_wake_sql(),
+        vec![
+            db::text(state),
+            db::optional_text(next_attempt_at),
+            db::text(last_error),
+            db::text(&db::now_iso()),
+            db::text(&row.id),
+            db::optional_text(row.user_id.as_deref()),
+            db::text(&row.topic),
+            db::text(&row.aggregate_id),
+            db::text(&row.idempotency_key),
+            db::optional_text(row.lease_token.as_deref()),
+            db::optional_text(row.lease_token.as_deref()),
+            db::text(cutoff),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+fn expired_wake_retry(row: &OutboxEventRow) -> (&'static str, Option<String>, &'static str) {
+    if row.attempts.max(1) < MAX_ATTEMPTS {
+        (
+            "retrying",
+            Some(db::add_seconds_iso(backoff_seconds(row.attempts))),
+            "worker_lease_expired_before_delivery",
+        )
+    } else {
+        ("failed", None, "worker_lease_exhausted_before_delivery")
+    }
+}
+
+async fn recover_expired_apns_wakeup(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    cutoff: &str,
+) -> ApiResult<()> {
+    let Some(user_id) = row.user_id.as_deref() else {
+        return settle_expired_wake_outbox(db, row, cutoff, "failed", None, "missing_user_scope")
+            .await;
+    };
+    let Ok(payload) = serde_json::from_str::<ApnsCommandWakePayload>(&row.payload_json) else {
+        return settle_expired_wake_outbox(
+            db,
+            row,
+            cutoff,
+            "failed",
+            None,
+            "invalid_apns_wakeup_payload",
+        )
+        .await;
+    };
+    if !apns_wakeup_payload_is_authorized(row, user_id, &payload) {
+        return settle_expired_wake_outbox(
+            db,
+            row,
+            cutoff,
+            "failed",
+            None,
+            "apns_wakeup_not_authorized",
+        )
+        .await;
+    }
+    let attempt = db::first::<WakeAttemptRow>(
+        db,
+        "SELECT state FROM action_attempts WHERE user_id = ? AND command_id = ? AND provider = ? AND provider_idempotency_key = ? AND request_hash = ?",
+        vec![
+            db::text(user_id),
+            db::text(&payload.command_id),
+            db::text(APNS_COMMAND_WAKEUP_PROVIDER),
+            db::text(&row.idempotency_key),
+            db::text(&row.idempotency_key),
+        ],
+    )
+    .await?;
+    match attempt.as_ref().map(|attempt| attempt.state.as_str()) {
+        Some("running" | "unknown") => {
+            settle_expired_apns_unknown(db, row, user_id, &payload, cutoff).await
+        }
+        Some("succeeded") => {
+            settle_expired_wake_outbox(db, row, cutoff, "succeeded", None, "").await
+        }
+        Some("failed") => {
+            settle_expired_wake_outbox(db, row, cutoff, "failed", None, "apns_attempt_failed").await
+        }
+        Some("queued" | "retrying") | None => {
+            let (state, retry_at, error) = expired_wake_retry(row);
+            settle_expired_wake_outbox(db, row, cutoff, state, retry_at.as_deref(), error).await
+        }
+        Some(_) => {
+            settle_expired_wake_outbox(db, row, cutoff, "failed", None, "invalid_attempt_state")
+                .await
+        }
+    }
+}
+
+async fn settle_expired_apns_unknown(
+    db: &D1Database,
+    row: &OutboxEventRow,
+    user_id: &str,
+    payload: &ApnsCommandWakePayload,
+    cutoff: &str,
+) -> ApiResult<()> {
+    let now = db::now_iso();
+    let statements = vec![
+        db::prepare(
+            db,
+            "UPDATE action_attempts SET state = 'unknown', next_attempt_at = NULL, last_error = 'apns_delivery_unknown', updated_at = ? WHERE user_id = ? AND command_id = ? AND provider = ? AND provider_idempotency_key = ? AND request_hash = ? AND state IN ('running', 'unknown') AND EXISTS (SELECT 1 FROM outbox_events AS wake_claim WHERE wake_claim.id = ? AND wake_claim.user_id = ? AND wake_claim.topic = ? AND wake_claim.aggregate_id = ? AND wake_claim.idempotency_key = ? AND wake_claim.state = 'running' AND (wake_claim.lease_token = ? OR (wake_claim.lease_token IS NULL AND ? IS NULL)) AND ((wake_claim.lease_expires_at IS NOT NULL AND wake_claim.lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')) OR (wake_claim.lease_expires_at IS NULL AND wake_claim.updated_at <= ?)))",
+            vec![
+                db::text(&now),
+                db::text(user_id),
+                db::text(&payload.command_id),
+                db::text(APNS_COMMAND_WAKEUP_PROVIDER),
+                db::text(&row.idempotency_key),
+                db::text(&row.idempotency_key),
+                db::text(&row.id),
+                db::text(user_id),
+                db::text(&row.topic),
+                db::text(&row.aggregate_id),
+                db::text(&row.idempotency_key),
+                db::optional_text(row.lease_token.as_deref()),
+                db::optional_text(row.lease_token.as_deref()),
+                db::text(cutoff),
+            ],
+        )?,
+        db::prepare(
+            db,
+            "UPDATE outbox_events SET state = 'unknown', next_attempt_at = NULL, last_error = 'apns_delivery_unknown', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND user_id = ? AND topic = ? AND aggregate_id = ? AND idempotency_key = ? AND state = 'running' AND changes() = 1 AND (lease_token = ? OR (lease_token IS NULL AND ? IS NULL)) AND ((lease_expires_at IS NOT NULL AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')) OR (lease_expires_at IS NULL AND updated_at <= ?))",
+            vec![
+                db::text(&now),
+                db::text(&row.id),
+                db::text(user_id),
+                db::text(&row.topic),
+                db::text(&row.aggregate_id),
+                db::text(&row.idempotency_key),
+                db::optional_text(row.lease_token.as_deref()),
+                db::optional_text(row.lease_token.as_deref()),
+                db::text(cutoff),
+            ],
+        )?,
+    ];
+    db.batch(statements).await?;
+    Ok(())
 }
 
 fn validated_command_args(intent: &str, args_json: &str) -> ApiResult<Map<String, Value>> {
@@ -854,14 +1542,14 @@ fn settle_deleted_command_sql() -> String {
 
 async fn settle_deleted_command(
     db: &D1Database,
-    env: &worker::Env,
+    _env: &worker::Env,
     row: &OutboxEventRow,
     user_id: &str,
     command: &CommandRow,
 ) -> ApiResult<bool> {
     let now = db::now_iso();
     let next_version = command.version + 1;
-    let statements = vec![
+    let mut statements = vec![
         prepare_active_claimed_command_transition(
             db,
             &settle_deleted_command_sql(),
@@ -918,15 +1606,14 @@ async fn settle_deleted_command(
             ],
         )?,
     ];
-    let results = db.batch(statements).await?;
-    notify_terminal_transition(
+    statements.push(prepare_apns_wakeup_statement(
         db,
-        env,
         user_id,
-        "cancelled",
-        results.first().map(db::changes).unwrap_or(0),
-    )
-    .await;
+        &command.id,
+        next_version,
+        &now,
+    )?);
+    let results = db.batch(statements).await?;
     Ok(results.first().map(db::changes).unwrap_or(0) == 1)
 }
 
@@ -1071,7 +1758,7 @@ fn finish_success_command_sql() -> String {
 
 async fn finish_success(
     db: &D1Database,
-    env: &worker::Env,
+    _env: &worker::Env,
     row: &OutboxEventRow,
     user_id: &str,
     command: &CommandRow,
@@ -1079,7 +1766,7 @@ async fn finish_success(
 ) -> ApiResult<()> {
     let now = db::now_iso();
     let version = command.version + 1;
-    let statements = vec![
+    let mut statements = vec![
         prepare_active_claimed_command_transition(
             db,
             &finish_success_command_sql(),
@@ -1140,15 +1827,14 @@ async fn finish_success(
             ],
         )?,
     ];
-    let results = db.batch(statements).await?;
-    notify_terminal_transition(
+    statements.push(prepare_apns_wakeup_statement(
         db,
-        env,
         user_id,
-        "succeeded",
-        results.first().map(db::changes).unwrap_or(0),
-    )
-    .await;
+        &command.id,
+        version,
+        &now,
+    )?);
+    db.batch(statements).await?;
     Ok(())
 }
 
@@ -1167,7 +1853,7 @@ enum FailureTransitionFence<'a> {
 
 async fn finish_failure(
     db: &D1Database,
-    env: &worker::Env,
+    _env: &worker::Env,
     row: &OutboxEventRow,
     user_id: &str,
     command: &CommandRow,
@@ -1177,7 +1863,6 @@ async fn finish_failure(
     let transition_now = db::now_iso();
     finish_failure_with_fence(
         db,
-        env,
         row,
         user_id,
         command,
@@ -1191,7 +1876,7 @@ async fn finish_failure(
 
 async fn finish_recovery_failure(
     db: &D1Database,
-    env: &worker::Env,
+    _env: &worker::Env,
     row: &OutboxEventRow,
     user_id: &str,
     command: &CommandRow,
@@ -1200,7 +1885,6 @@ async fn finish_recovery_failure(
 ) -> ApiResult<()> {
     finish_failure_with_fence(
         db,
-        env,
         row,
         user_id,
         command,
@@ -1217,7 +1901,6 @@ async fn finish_recovery_failure(
 #[allow(clippy::too_many_arguments)]
 async fn finish_failure_with_fence(
     db: &D1Database,
-    env: &worker::Env,
     row: &OutboxEventRow,
     user_id: &str,
     command: &CommandRow,
@@ -1380,70 +2063,17 @@ async fn finish_failure_with_fence(
             ],
         )?);
     }
-    let results = db.batch(statements).await?;
-    notify_terminal_transition(
-        db,
-        env,
-        user_id,
-        command_state,
-        results.first().map(db::changes).unwrap_or(0),
-    )
-    .await;
+    if command_state == "failed" {
+        statements.push(prepare_apns_wakeup_statement(
+            db,
+            user_id,
+            &command.id,
+            version,
+            transition_now,
+        )?);
+    }
+    db.batch(statements).await?;
     Ok(())
-}
-
-fn should_attempt_command_wakeup(command_state: &str, transition_changes: usize) -> bool {
-    transition_changes == 1 && matches!(command_state, "succeeded" | "failed" | "cancelled")
-}
-
-fn command_wakeup_attempt<T>(
-    command_state: &str,
-    transition_changes: usize,
-    attempt: impl FnOnce() -> T,
-) -> Option<T> {
-    should_attempt_command_wakeup(command_state, transition_changes).then(attempt)
-}
-
-async fn notify_terminal_transition(
-    db: &D1Database,
-    env: &worker::Env,
-    user_id: &str,
-    command_state: &str,
-    transition_changes: usize,
-) {
-    if let Some(attempt) = command_wakeup_attempt(command_state, transition_changes, || {
-        attempt_command_wakeup(db, env, user_id)
-    }) {
-        attempt.await;
-    }
-}
-
-fn command_wakeup_token_query() -> &'static str {
-    "SELECT push_token FROM devices WHERE user_id = ? AND platform = 'ios' AND push_token IS NOT NULL AND push_token != ''"
-}
-
-async fn attempt_command_wakeup(db: &D1Database, env: &worker::Env, user_id: &str) {
-    let push_mode = config_value(env, "PUSH_MODE", "dev");
-    if !matches!(push_mode.as_str(), "apns" | "both") || !apns::is_ready(env) {
-        return;
-    }
-
-    let rows: Vec<CommandWakeTokenRow> =
-        match db::all(db, command_wakeup_token_query(), vec![db::text(user_id)]).await {
-            Ok(rows) => rows,
-            Err(_) => return,
-        };
-    let mut tokens = rows
-        .into_iter()
-        .filter_map(|row| row.push_token)
-        .filter(|token| apns::looks_like_token(token))
-        .collect::<Vec<_>>();
-    tokens.sort();
-    tokens.dedup();
-
-    for token in tokens {
-        let _ = apns::send_command_wakeup(env, &token).await;
-    }
 }
 
 fn backoff_seconds(attempts: i32) -> i64 {
@@ -1551,7 +2181,6 @@ async fn settle_orphan(db: &D1Database, row: &OutboxEventRow, reason: &str) -> A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
 
     fn test_command(needs_confirmation: bool) -> CommandRow {
         CommandRow {
@@ -1692,27 +2321,105 @@ mod tests {
     }
 
     #[test]
-    fn terminal_transition_attempts_wakeup_exactly_once() {
-        let attempts = Cell::new(0);
-        for transition_changes in [1, 0] {
-            let _ = command_wakeup_attempt("succeeded", transition_changes, || {
-                attempts.set(attempts.get() + 1);
-            });
-        }
+    fn terminal_transition_enqueues_deduplicated_apns_wakeups() {
+        let query = enqueue_apns_wakeup_sql();
+        assert!(query.contains("SELECT 'out_' || lower(hex(randomblob(16))), ?"));
+        assert!(query.contains("json_object('command_id', ?"));
+        assert!(query.contains("FROM devices WHERE devices.user_id = ?"));
+        assert!(query.contains("changes() = 1"));
+        assert!(query.ends_with("ON CONFLICT(topic, idempotency_key) DO NOTHING"));
+        assert_eq!(sql_parameter_count(query), 8);
 
-        assert_eq!(attempts.get(), 1);
-        assert!(should_attempt_command_wakeup("failed", 1));
-        assert!(should_attempt_command_wakeup("cancelled", 1));
-        assert!(!should_attempt_command_wakeup("retryable", 1));
-        assert!(!should_attempt_command_wakeup("unknown", 1));
+        let key = command_wakeup_key("usr_test", "cmd_test", 4);
+        assert_eq!(key, command_wakeup_key("usr_test", "cmd_test", 4));
+        assert_ne!(key, command_wakeup_key("usr_test", "cmd_test", 5));
+    }
+
+    #[test]
+    fn wake_payloads_are_bound_to_owner_command_version_and_device() {
+        let command = test_command(false);
+        let mut wake = test_claim(&command, "wake_lease");
+        wake.topic = APNS_COMMAND_WAKEUP_TOPIC.to_string();
+        let wake_key = command_wakeup_key(&command.user_id, &command.id, 4);
+        wake.idempotency_key = apns_command_wakeup_key(&wake_key, "dev_1");
+        let delivery = ApnsCommandWakePayload {
+            command_id: command.id.clone(),
+            command_version: 4,
+            device_id: "dev_1".to_string(),
+        };
+        assert!(apns_wakeup_payload_is_authorized(
+            &wake,
+            &command.user_id,
+            &delivery
+        ));
+
+        let wrong_device = ApnsCommandWakePayload {
+            device_id: "dev_2".to_string(),
+            ..delivery
+        };
+        assert!(!apns_wakeup_payload_is_authorized(
+            &wake,
+            &command.user_id,
+            &wrong_device
+        ));
     }
 
     #[test]
     fn command_wakeup_tokens_are_scoped_to_the_authenticated_owner() {
-        let query = command_wakeup_token_query();
+        let enqueue_query = enqueue_apns_wakeup_sql();
+        assert!(enqueue_query.contains("devices.user_id = ?"));
+        assert!(enqueue_query.contains("devices.platform = 'ios'"));
+        let delivery_query = apns_wakeup_device_query();
+        assert!(delivery_query.contains("id = ? AND user_id = ?"));
+        assert!(delivery_query.contains("platform = 'ios'"));
+    }
 
-        assert!(query.contains("WHERE user_id = ?"));
-        assert!(query.contains("platform = 'ios'"));
+    #[test]
+    fn unknown_apns_results_are_not_automatically_claimable() {
+        for query in [due_outbox_sql(), claim_outbox_sql().to_string()] {
+            assert!(query.contains("state = 'unknown' AND topic = 'command.execute'"));
+            assert!(!query.contains("'queued', 'retrying', 'unknown'"));
+        }
+    }
+
+    #[test]
+    fn wake_retries_are_bounded_and_unknown_is_never_retried() {
+        let retryable = WakeFailure::Retryable(ApiError::new(503, "retry", "retry"));
+        assert_eq!(wake_failure_transition(&retryable, 1), ("retrying", true));
+        assert_eq!(wake_failure_transition(&retryable, 3), ("failed", false));
+
+        let poison = WakeFailure::Permanent(ApiError::validation("poison"));
+        assert_eq!(wake_failure_transition(&poison, 1), ("failed", false));
+
+        let unknown = WakeFailure::Unknown(ApiError::new(502, "unknown", "unknown"));
+        assert_eq!(wake_failure_transition(&unknown, 1), ("unknown", false));
+    }
+
+    #[test]
+    fn apns_delivery_requires_a_durable_attempt_permit() {
+        let acquire = acquire_apns_wakeup_attempt_sql();
+        assert!(acquire.starts_with("INSERT INTO action_attempts"));
+        assert!(acquire.contains("'running', ?, NULL, 1"));
+        assert!(acquire.contains("action_attempts.attempts + 1"));
+        assert!(acquire.contains("action_attempts.state = 'retrying'"));
+        assert!(acquire.contains(active_wake_claim_fence_sql()));
+        assert!(acquire.contains(&format!("lease_expires_at > {}", db_now_sql())));
+        assert_eq!(sql_parameter_count(&acquire), 14);
+
+        let fanout = enqueue_apns_wakeup_sql();
+        assert!(fanout.contains("changes() = 1"));
+        assert!(fanout.ends_with("ON CONFLICT(topic, idempotency_key) DO NOTHING"));
+        assert_eq!(sql_parameter_count(fanout), 8);
+
+        let settle_attempt = settle_apns_wakeup_attempt_sql();
+        assert!(settle_attempt.contains("state = 'running'"));
+        assert!(settle_attempt.contains(active_wake_claim_fence_sql()));
+        assert_eq!(sql_parameter_count(&settle_attempt), 15);
+
+        assert!(settle_apns_wakeup_outbox_sql().contains("changes() = 1"));
+        assert_eq!(sql_parameter_count(settle_apns_wakeup_outbox_sql()), 10);
+        assert_eq!(sql_parameter_count(settle_active_wake_sql()), 10);
+        assert_eq!(sql_parameter_count(settle_expired_wake_sql()), 12);
     }
 
     #[test]

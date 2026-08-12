@@ -10,6 +10,24 @@ use worker::{Fetch, Headers, Method, Request, RequestInit};
 use crate::auth::{config_value, secret_value};
 use crate::error::{ApiError, ApiResult};
 
+#[derive(Debug)]
+pub(crate) enum CommandWakeFailure {
+    Known(ApiError),
+    Unknown(ApiError),
+}
+
+impl CommandWakeFailure {
+    pub(crate) fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
+
+    pub(crate) fn into_error(self) -> ApiError {
+        match self {
+            Self::Known(error) | Self::Unknown(error) => error,
+        }
+    }
+}
+
 pub fn is_ready(env: &worker::Env) -> bool {
     let key = secret_value(env, "APNS_KEY").unwrap_or_default();
     let key_is_valid = decode_private_key(&key)
@@ -101,9 +119,20 @@ fn command_wakeup_payload() -> String {
     .to_string()
 }
 
-pub async fn send_command_wakeup(env: &worker::Env, token: &str) -> ApiResult<()> {
+pub async fn send_command_wakeup(env: &worker::Env, token: &str) -> Result<(), CommandWakeFailure> {
     let payload = command_wakeup_payload();
-    send_payload(env, token, &payload, "background", Some("5")).await
+    let request = payload_request(env, token, &payload, "background", Some("5"))
+        .map_err(CommandWakeFailure::Known)?;
+    let response = Fetch::Request(request).send().await.map_err(|error| {
+        CommandWakeFailure::Unknown(ApiError::new(
+            502,
+            "apns_delivery_unknown",
+            format!("APNs request outcome is unknown: {error:?}"),
+        ))
+    })?;
+    require_success(response, true)
+        .await
+        .map_err(CommandWakeFailure::Known)
 }
 
 async fn send_payload(
@@ -113,6 +142,18 @@ async fn send_payload(
     push_type: &str,
     priority: Option<&str>,
 ) -> ApiResult<()> {
+    let request = payload_request(env, token, payload, push_type, priority)?;
+    let response = Fetch::Request(request).send().await?;
+    require_success(response, false).await
+}
+
+fn payload_request(
+    env: &worker::Env,
+    token: &str,
+    payload: &str,
+    push_type: &str,
+    priority: Option<&str>,
+) -> ApiResult<Request> {
     if !looks_like_token(token) {
         return Err(ApiError::new(
             400,
@@ -142,17 +183,20 @@ async fn send_payload(
     init.with_method(Method::Post)
         .with_headers(headers)
         .with_body(Some(worker::wasm_bindgen::JsValue::from_str(payload)));
-    let request = Request::new_with_init(url.as_str(), &init)?;
-    let mut response = Fetch::Request(request).send().await?;
-    if response.status_code() != 200 {
+    Ok(Request::new_with_init(url.as_str(), &init)?)
+}
+
+async fn require_success(mut response: worker::Response, preserve_status: bool) -> ApiResult<()> {
+    let status = response.status_code();
+    if status != 200 {
         let details = response
             .text()
             .await
             .unwrap_or_else(|_| "APNs rejected the request".into());
         return Err(ApiError::new(
-            502,
+            if preserve_status { status } else { 502 },
             "apns_delivery_error",
-            format!("APNs returned {}: {details}", response.status_code()),
+            format!("APNs returned {status}: {details}"),
         ));
     }
     Ok(())
@@ -186,5 +230,16 @@ mod tests {
         ] {
             assert!(!encoded.contains(sensitive_key));
         }
+    }
+
+    #[test]
+    fn command_wakeup_failure_preserves_unknown_delivery_certainty() {
+        let known = CommandWakeFailure::Known(ApiError::new(503, "known", "retry"));
+        let unknown = CommandWakeFailure::Unknown(ApiError::new(502, "unknown", "reconcile"));
+
+        assert!(!known.is_unknown());
+        assert!(known.into_error().retryable);
+        assert!(unknown.is_unknown());
+        assert_eq!(unknown.into_error().code, "unknown");
     }
 }
