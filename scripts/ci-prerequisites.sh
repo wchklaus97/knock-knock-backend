@@ -68,7 +68,7 @@ case "${profile}" in
     require_commands bash curl jq grep sed awk mktemp seq sleep
     ;;
   backup)
-    require_commands bash npm sed grep gpg shred wrangler
+    require_commands bash npm sed grep gpg shred wrangler cmp sha256sum awk
     ;;
   ios)
     require_commands bash xcodebuild xcrun

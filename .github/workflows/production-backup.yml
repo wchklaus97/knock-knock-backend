@@ -59,3 +59,19 @@ jobs:
           wrangler r2 object put "$BACKUP_BUCKET/$object_key" \
             --config "$KNOCK_KNOCK_PRODUCTION_CONFIG" \
             --remote --file "$encrypted" --content-type application/octet-stream --force
+          downloaded="$backup_dir/roundtrip.sql.gpg"
+          restored="$backup_dir/roundtrip.sql"
+          wrangler r2 object get "$BACKUP_BUCKET/$object_key" \
+            --config "$KNOCK_KNOCK_PRODUCTION_CONFIG" \
+            --remote --file "$downloaded"
+          cmp "$encrypted" "$downloaded"
+          printf '%s' "$BACKUP_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 --decrypt --output "$restored" "$downloaded"
+          test -s "$restored"
+          grep -q "CREATE TABLE" "$restored"
+          sha256sum "$encrypted" | awk '{print $1}' > "$backup_dir/ciphertext.sha256"
+          wrangler r2 object put "$BACKUP_BUCKET/${object_key}.sha256" \
+            --config "$KNOCK_KNOCK_PRODUCTION_CONFIG" \
+            --remote --file "$backup_dir/ciphertext.sha256" --content-type text/plain --force
+          shred -u "$restored" "$downloaded" "$encrypted" "$backup_dir/ciphertext.sha256"
+          echo "encrypted production D1 backup round-trip restore verification passed"
