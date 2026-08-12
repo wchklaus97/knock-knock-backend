@@ -1074,14 +1074,14 @@ fn expirable_state(state: &str) -> bool {
 fn command_ttl_expiration_condition() -> String {
     format!(
         "expires_at IS NOT NULL AND expires_at <= ? AND NOT {}",
-        RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
+        ACTION_EFFECT_MAY_HAVE_STARTED_SQL
     )
 }
 
 fn confirmation_token_expiration_condition() -> String {
     format!(
         "state = 'awaiting_confirmation' AND EXISTS (SELECT 1 FROM confirmation_tokens WHERE command_id = commands.id AND user_id = commands.user_id AND used_at IS NULL AND expires_at <= ?) AND NOT {}",
-        RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
+        ACTION_EFFECT_MAY_HAVE_STARTED_SQL
     )
 }
 
@@ -2039,24 +2039,23 @@ mod tests {
     }
 
     #[test]
-    fn command_ttl_never_expires_authoritative_or_reconcilable_attempts() {
+    fn command_ttl_preserves_only_effects_that_may_have_started() {
         let condition = command_ttl_expiration_condition();
         let query = expire_due_candidates_sql();
 
         for sql in [&condition, &query] {
-            assert!(sql.contains("recovery_attempt.command_id = commands.id"));
-            assert!(sql.contains("recovery_attempt.user_id = commands.user_id"));
+            assert!(sql.contains("started_attempt.command_id = commands.id"));
+            assert!(sql.contains("started_attempt.user_id = commands.user_id"));
+            assert!(sql.contains("started_attempt.state = 'succeeded'"));
             assert!(sql.contains(
-                "recovery_attempt.state IN ('succeeded', 'running', 'unknown', 'retrying')"
+                "started_attempt.state IN ('running', 'unknown', 'retrying') AND started_attempt.attempts >= 1"
             ));
             assert!(sql.contains("AND NOT EXISTS"));
+            assert!(!sql.contains(RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL));
         }
         assert_eq!(condition.matches('?').count(), 1);
         assert_eq!(query.matches('?').count(), 2);
-        assert_eq!(
-            query.matches(RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL).count(),
-            2
-        );
+        assert_eq!(query.matches(ACTION_EFFECT_MAY_HAVE_STARTED_SQL).count(), 2);
         assert!(query.contains("state = 'awaiting_confirmation' AND EXISTS"));
     }
 

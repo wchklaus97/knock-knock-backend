@@ -17,7 +17,9 @@ grep -Fq "claim.lease_expires_at <= ${DB_NOW}" "${ROOT_DIR}/src/outbox.rs"
 grep -Fq "active_claim.lease_expires_at > ${DB_NOW}" "${ROOT_DIR}/src/action_effects.rs"
 grep -Fq "RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL" "${ROOT_DIR}/src/commands.rs"
 grep -Fq "ACTION_EFFECT_MAY_HAVE_STARTED_SQL" "${ROOT_DIR}/src/commands.rs"
-grep -Fq "commands::RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL" "${ROOT_DIR}/src/outbox.rs"
+grep -Fq "commands::ACTION_EFFECT_MAY_HAVE_STARTED_SQL" "${ROOT_DIR}/src/outbox.rs"
+grep -Fq "permit_session.deleted_at IS NULL" "${ROOT_DIR}/src/outbox.rs"
+grep -Fq "effect_session.deleted_at IS NULL" "${ROOT_DIR}/src/action_effects.rs"
 
 sqlite3 "${DB_FILE}" <<'SQL'
 PRAGMA foreign_keys = ON;
@@ -180,6 +182,186 @@ UPDATE commands SET state = 'retryable', version = 5
    );
 INSERT INTO results VALUES ('expired_recovery', changes());
 
+-- A session can disappear after the Worker validated the loaded command. The
+-- durable permit must recheck liveness and cannot create attempts=0 authority.
+INSERT INTO sessions VALUES ('ses_deleted_before_permit', 'usr', NULL);
+INSERT INTO commands VALUES (
+  'cmd_deleted_before_permit', 'usr', 'ses_deleted_before_permit',
+  'create_reminder', 'idem_deleted_before_permit', 0, 'running',
+  'hash_deleted_before_permit', 4, '2099-01-01T00:00:00.000Z', NULL,
+  '2000-01-01T00:00:00.000Z'
+);
+INSERT INTO outbox_events (
+  id, user_id, topic, aggregate_id, idempotency_key, state,
+  lease_token, lease_expires_at, updated_at
+) VALUES (
+  'out_deleted_before_permit', 'usr', 'command.execute',
+  'cmd_deleted_before_permit', 'outbox_deleted_before_permit', 'running',
+  'lease_deleted_before_permit', '2099-01-01T00:00:00.000Z',
+  '2000-01-01T00:00:00.000Z'
+);
+UPDATE sessions SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+ WHERE id = 'ses_deleted_before_permit' AND user_id = 'usr';
+UPDATE commands SET version = version
+ WHERE id = 'cmd_deleted_before_permit' AND user_id = 'usr'
+   AND state = 'running' AND version = 4
+   AND (
+     session_id IS NULL
+     OR EXISTS (
+       SELECT 1 FROM sessions AS permit_session
+        WHERE permit_session.id = commands.session_id
+          AND permit_session.user_id = commands.user_id
+          AND permit_session.deleted_at IS NULL
+     )
+     OR EXISTS (
+       SELECT 1 FROM action_attempts AS started_attempt
+        WHERE started_attempt.command_id = commands.id
+          AND started_attempt.user_id = commands.user_id
+          AND (
+            started_attempt.state = 'succeeded'
+            OR (
+              started_attempt.state IN ('running', 'unknown', 'retrying')
+              AND started_attempt.attempts >= 1
+            )
+          )
+     )
+   )
+   AND EXISTS (
+     SELECT 1 FROM outbox_events AS claim
+      WHERE claim.id = 'out_deleted_before_permit'
+        AND claim.user_id = commands.user_id
+        AND claim.aggregate_id = commands.id
+        AND claim.state = 'running'
+        AND claim.lease_token = 'lease_deleted_before_permit'
+        AND claim.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+   );
+INSERT INTO results VALUES ('deleted_before_permit', changes());
+
+-- Deletion can also race after the attempts=0 permit transaction. The exact
+-- begin fence rejects that never-started row, but permits attempts>=1 evidence
+-- so an already-started effect can be truthfully reconciled.
+INSERT INTO sessions VALUES ('ses_deleted_before_begin', 'usr', NULL);
+INSERT INTO commands VALUES (
+  'cmd_deleted_before_begin', 'usr', 'ses_deleted_before_begin',
+  'create_reminder', 'idem_deleted_before_begin', 0, 'running',
+  'hash_deleted_before_begin', 4, '2099-01-01T00:00:00.000Z', NULL,
+  '2000-01-01T00:00:00.000Z'
+);
+INSERT INTO outbox_events (
+  id, user_id, topic, aggregate_id, idempotency_key, state,
+  lease_token, lease_expires_at, updated_at
+) VALUES (
+  'out_deleted_before_begin', 'usr', 'command.execute',
+  'cmd_deleted_before_begin', 'outbox_deleted_before_begin', 'running',
+  'lease_deleted_before_begin', '2099-01-01T00:00:00.000Z',
+  '2000-01-01T00:00:00.000Z'
+);
+UPDATE commands SET version = version
+ WHERE id = 'cmd_deleted_before_begin' AND user_id = 'usr'
+   AND state = 'running' AND version = 4
+   AND EXISTS (
+     SELECT 1 FROM sessions AS permit_session
+      WHERE permit_session.id = commands.session_id
+        AND permit_session.user_id = commands.user_id
+        AND permit_session.deleted_at IS NULL
+   )
+   AND EXISTS (
+     SELECT 1 FROM outbox_events AS claim
+      WHERE claim.id = 'out_deleted_before_begin'
+        AND claim.user_id = commands.user_id
+        AND claim.aggregate_id = commands.id
+        AND claim.state = 'running'
+        AND claim.lease_token = 'lease_deleted_before_begin'
+        AND claim.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+   );
+INSERT INTO results VALUES ('live_before_delete_permit', changes());
+INSERT INTO action_attempts (
+  command_id, user_id, state, provider, provider_idempotency_key,
+  request_hash, attempts, last_error, updated_at
+) VALUES (
+  'cmd_deleted_before_begin', 'usr', 'running', 'action.reminder',
+  'provider_deleted_before_begin', 'hash_deleted_before_begin', 0,
+  'execution_permit', '2000-01-01T00:00:00.000Z'
+);
+UPDATE sessions SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+ WHERE id = 'ses_deleted_before_begin' AND user_id = 'usr';
+UPDATE action_attempts
+   SET attempts = attempts + 1, last_error = NULL
+ WHERE command_id = 'cmd_deleted_before_begin' AND user_id = 'usr'
+   AND provider = 'action.reminder'
+   AND provider_idempotency_key = 'provider_deleted_before_begin'
+   AND request_hash = 'hash_deleted_before_begin'
+   AND state IN ('running', 'retrying', 'unknown')
+   AND EXISTS (
+     SELECT 1
+       FROM commands AS active_command
+       JOIN outbox_events AS active_claim
+         ON active_claim.user_id = active_command.user_id
+        AND active_claim.aggregate_id = active_command.id
+      WHERE active_command.id = 'cmd_deleted_before_begin'
+        AND active_command.user_id = 'usr'
+        AND active_command.state = 'running'
+        AND active_command.version = 4
+        AND (
+          active_command.session_id IS NULL
+          OR EXISTS (
+            SELECT 1 FROM sessions AS effect_session
+             WHERE effect_session.id = active_command.session_id
+               AND effect_session.user_id = active_command.user_id
+               AND effect_session.deleted_at IS NULL
+          )
+          OR EXISTS (
+            SELECT 1 FROM action_attempts AS started_attempt
+             WHERE started_attempt.command_id = active_command.id
+               AND started_attempt.user_id = active_command.user_id
+               AND (
+                 started_attempt.state = 'succeeded'
+                 OR (
+                   started_attempt.state IN ('running', 'unknown', 'retrying')
+                   AND started_attempt.attempts >= 1
+                 )
+               )
+          )
+        )
+        AND active_claim.id = 'out_deleted_before_begin'
+        AND active_claim.state = 'running'
+        AND active_claim.lease_token = 'lease_deleted_before_begin'
+        AND active_claim.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+   );
+INSERT INTO results VALUES ('deleted_before_begin', changes());
+UPDATE action_attempts SET attempts = 1
+ WHERE command_id = 'cmd_deleted_before_begin' AND user_id = 'usr';
+UPDATE action_attempts
+   SET attempts = attempts + 1, last_error = NULL
+ WHERE command_id = 'cmd_deleted_before_begin' AND user_id = 'usr'
+   AND provider = 'action.reminder'
+   AND provider_idempotency_key = 'provider_deleted_before_begin'
+   AND request_hash = 'hash_deleted_before_begin'
+   AND state IN ('running', 'retrying', 'unknown')
+   AND EXISTS (
+     SELECT 1
+       FROM commands AS active_command
+       JOIN outbox_events AS active_claim
+         ON active_claim.user_id = active_command.user_id
+        AND active_claim.aggregate_id = active_command.id
+      WHERE active_command.id = 'cmd_deleted_before_begin'
+        AND active_command.user_id = 'usr'
+        AND active_command.state = 'running'
+        AND active_command.version = 4
+        AND EXISTS (
+          SELECT 1 FROM action_attempts AS started_attempt
+           WHERE started_attempt.command_id = active_command.id
+             AND started_attempt.user_id = active_command.user_id
+             AND started_attempt.state IN ('running', 'unknown', 'retrying')
+             AND started_attempt.attempts >= 1
+        )
+        AND active_claim.id = 'out_deleted_before_begin'
+        AND active_claim.state = 'running'
+        AND active_claim.lease_token = 'lease_deleted_before_begin'
+        AND active_claim.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+   );
+INSERT INTO results VALUES ('deleted_started_begin', changes());
+
 -- A genuinely live exact lease remains usable.
 INSERT INTO sessions VALUES ('ses_lease_live', 'usr', NULL);
 INSERT INTO commands VALUES (
@@ -198,6 +380,27 @@ INSERT INTO outbox_events (
 UPDATE commands SET version = version
  WHERE id = 'cmd_lease_live' AND user_id = 'usr'
    AND state = 'running' AND version = 4
+   AND (
+     session_id IS NULL
+     OR EXISTS (
+       SELECT 1 FROM sessions AS permit_session
+        WHERE permit_session.id = commands.session_id
+          AND permit_session.user_id = commands.user_id
+          AND permit_session.deleted_at IS NULL
+     )
+     OR EXISTS (
+       SELECT 1 FROM action_attempts AS started_attempt
+        WHERE started_attempt.command_id = commands.id
+          AND started_attempt.user_id = commands.user_id
+          AND (
+            started_attempt.state = 'succeeded'
+            OR (
+              started_attempt.state IN ('running', 'unknown', 'retrying')
+              AND started_attempt.attempts >= 1
+            )
+          )
+     )
+   )
    AND EXISTS (
      SELECT 1 FROM outbox_events AS claim
       WHERE claim.id = 'out_live' AND claim.user_id = 'usr'
@@ -238,6 +441,27 @@ UPDATE action_attempts
         AND active_command.user_id = 'usr'
         AND active_command.state = 'running'
         AND active_command.version = 4
+        AND (
+          active_command.session_id IS NULL
+          OR EXISTS (
+            SELECT 1 FROM sessions AS effect_session
+             WHERE effect_session.id = active_command.session_id
+               AND effect_session.user_id = active_command.user_id
+               AND effect_session.deleted_at IS NULL
+          )
+          OR EXISTS (
+            SELECT 1 FROM action_attempts AS started_attempt
+             WHERE started_attempt.command_id = active_command.id
+               AND started_attempt.user_id = active_command.user_id
+               AND (
+                 started_attempt.state = 'succeeded'
+                 OR (
+                   started_attempt.state IN ('running', 'unknown', 'retrying')
+                   AND started_attempt.attempts >= 1
+                 )
+               )
+          )
+        )
         AND active_claim.id = 'out_live'
         AND active_claim.user_id = 'usr'
         AND active_claim.topic = 'command.execute'
@@ -461,16 +685,43 @@ INSERT INTO action_attempts (command_id, user_id, state) VALUES ('cmd_ttl_succee
 INSERT INTO action_attempts (command_id, user_id, state) VALUES ('cmd_ttl_reconciling', 'usr', 'running');
 INSERT INTO action_attempts (command_id, user_id, state) VALUES ('cmd_ttl_unknown', 'usr', 'unknown');
 INSERT INTO action_attempts (command_id, user_id, state) VALUES ('cmd_ttl_retrying', 'usr', 'retrying');
+INSERT INTO action_attempts (command_id, user_id, state, attempts)
+VALUES ('cmd_ttl_fresh', 'usr', 'running', 0);
+
+UPDATE commands SET state = 'running', version = version + 1
+ WHERE id = 'cmd_ttl_fresh' AND user_id = 'usr' AND state = 'retryable'
+   AND (
+     expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     OR EXISTS (
+       SELECT 1 FROM action_attempts AS started_attempt
+        WHERE started_attempt.command_id = commands.id
+          AND started_attempt.user_id = commands.user_id
+          AND (
+            started_attempt.state = 'succeeded'
+            OR (
+              started_attempt.state IN ('running', 'unknown', 'retrying')
+              AND started_attempt.attempts >= 1
+            )
+          )
+     )
+   );
+INSERT INTO results VALUES ('ttl_permit_start', changes());
 
 UPDATE commands SET state = 'expired', version = version + 1
  WHERE state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable', 'unknown')
    AND expires_at IS NOT NULL
    AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
    AND NOT EXISTS (
-     SELECT 1 FROM action_attempts AS recovery_attempt
-      WHERE recovery_attempt.command_id = commands.id
-        AND recovery_attempt.user_id = commands.user_id
-        AND recovery_attempt.state IN ('succeeded', 'running', 'unknown', 'retrying')
+     SELECT 1 FROM action_attempts AS started_attempt
+      WHERE started_attempt.command_id = commands.id
+        AND started_attempt.user_id = commands.user_id
+        AND (
+          started_attempt.state = 'succeeded'
+          OR (
+            started_attempt.state IN ('running', 'unknown', 'retrying')
+            AND started_attempt.attempts >= 1
+          )
+        )
    );
 INSERT INTO results VALUES ('ttl_sweep_expired', changes());
 
@@ -479,10 +730,16 @@ UPDATE commands SET state = 'running', version = version + 1
    AND (
      expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
      OR EXISTS (
-       SELECT 1 FROM action_attempts AS recovery_attempt
-        WHERE recovery_attempt.command_id = commands.id
-          AND recovery_attempt.user_id = commands.user_id
-          AND recovery_attempt.state IN ('succeeded', 'running', 'unknown', 'retrying')
+       SELECT 1 FROM action_attempts AS started_attempt
+        WHERE started_attempt.command_id = commands.id
+          AND started_attempt.user_id = commands.user_id
+          AND (
+            started_attempt.state = 'succeeded'
+            OR (
+              started_attempt.state IN ('running', 'unknown', 'retrying')
+              AND started_attempt.attempts >= 1
+            )
+          )
      )
    );
 INSERT INTO results VALUES ('ttl_succeeded_start', changes());
@@ -492,10 +749,16 @@ UPDATE commands SET state = 'running', version = version + 1
    AND (
      expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
      OR EXISTS (
-       SELECT 1 FROM action_attempts AS recovery_attempt
-        WHERE recovery_attempt.command_id = commands.id
-          AND recovery_attempt.user_id = commands.user_id
-          AND recovery_attempt.state IN ('succeeded', 'running', 'unknown', 'retrying')
+       SELECT 1 FROM action_attempts AS started_attempt
+        WHERE started_attempt.command_id = commands.id
+          AND started_attempt.user_id = commands.user_id
+          AND (
+            started_attempt.state = 'succeeded'
+            OR (
+              started_attempt.state IN ('running', 'unknown', 'retrying')
+              AND started_attempt.attempts >= 1
+            )
+          )
      )
    );
 INSERT INTO results VALUES ('ttl_reconciling_start', changes());
@@ -505,8 +768,8 @@ UPDATE commands SET state = 'running', version = version + 1
    AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now');
 INSERT INTO results VALUES ('ttl_fresh_start', changes());
 
--- Even an inconsistent awaiting-confirmation row must preserve evidence of a
--- recoverable effect instead of letting token expiry erase it.
+-- Even an inconsistent awaiting-confirmation row preserves attempts>=1
+-- evidence, while a running attempts=0 permit cannot outlive token authority.
 INSERT INTO commands VALUES (
   'cmd_token_recovery', 'usr', NULL, 'send_message', 'idem_token_recovery', 1,
   'awaiting_confirmation', 'hash_token_recovery', 1,
@@ -528,12 +791,53 @@ UPDATE commands SET state = 'expired', version = version + 1
         AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
    )
    AND NOT EXISTS (
-     SELECT 1 FROM action_attempts AS recovery_attempt
-      WHERE recovery_attempt.command_id = commands.id
-        AND recovery_attempt.user_id = commands.user_id
-        AND recovery_attempt.state IN ('succeeded', 'running', 'unknown', 'retrying')
+     SELECT 1 FROM action_attempts AS started_attempt
+      WHERE started_attempt.command_id = commands.id
+        AND started_attempt.user_id = commands.user_id
+        AND (
+          started_attempt.state = 'succeeded'
+          OR (
+            started_attempt.state IN ('running', 'unknown', 'retrying')
+            AND started_attempt.attempts >= 1
+          )
+        )
    );
 INSERT INTO results VALUES ('token_recovery_expired', changes());
+
+INSERT INTO commands VALUES (
+  'cmd_token_permit', 'usr', NULL, 'send_message', 'idem_token_permit', 1,
+  'awaiting_confirmation', 'hash_token_permit', 1,
+  '2099-01-01T00:00:00.000Z', NULL, '2000-01-01T00:00:00.000Z'
+);
+INSERT INTO confirmation_tokens VALUES (
+  'tok_permit', 'cmd_token_permit', 'usr', 'token_permit_hash',
+  'hash_token_permit', '2000-01-01T00:00:00.000Z', NULL,
+  '2000-01-01T00:00:00.000Z'
+);
+INSERT INTO action_attempts (command_id, user_id, state, attempts)
+VALUES ('cmd_token_permit', 'usr', 'running', 0);
+UPDATE commands SET state = 'expired', version = version + 1
+ WHERE id = 'cmd_token_permit' AND user_id = 'usr'
+   AND state = 'awaiting_confirmation'
+   AND EXISTS (
+     SELECT 1 FROM confirmation_tokens
+      WHERE command_id = commands.id AND user_id = commands.user_id
+        AND used_at IS NULL
+        AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')
+   )
+   AND NOT EXISTS (
+     SELECT 1 FROM action_attempts AS started_attempt
+      WHERE started_attempt.command_id = commands.id
+        AND started_attempt.user_id = commands.user_id
+        AND (
+          started_attempt.state = 'succeeded'
+          OR (
+            started_attempt.state IN ('running', 'unknown', 'retrying')
+            AND started_attempt.attempts >= 1
+          )
+        )
+   );
+INSERT INTO results VALUES ('token_permit_expired', changes());
 
 -- Cancellation is not an Undo. Once an effect may exist, cancellation must
 -- leave both the command and outbox available for reconciliation.
@@ -564,17 +868,17 @@ UPDATE outbox_events SET state = 'failed'
 SQL
 
 checks="$(sqlite3 "${DB_FILE}" "SELECT name || '=' || value FROM results ORDER BY name;")"
-expected=$'expired_active_permit=0\nexpired_direct_queue=0\nexpired_recovery=1\nexpired_replay_command=0\nexpired_replay_token=0\nlive_active_permit=1\nlive_effect_begin=1\npost_permit_attempt=1\npost_permit_cancel=0\npost_permit_deleted_cancel=1\npost_permit_recovery=1\nstale_effect_begin=0\nstarted_effect_deleted_cancel=0\nstarted_effect_reconcile_start=1\nstarted_effect_recovery=1\ntoken_recovery_expired=0\nttl_fresh_start=0\nttl_reconciling_start=1\nttl_succeeded_start=1\nttl_sweep_expired=1'
+expected=$'deleted_before_begin=0\ndeleted_before_permit=0\ndeleted_started_begin=1\nexpired_active_permit=0\nexpired_direct_queue=0\nexpired_recovery=1\nexpired_replay_command=0\nexpired_replay_token=0\nlive_active_permit=1\nlive_before_delete_permit=1\nlive_effect_begin=1\npost_permit_attempt=1\npost_permit_cancel=0\npost_permit_deleted_cancel=1\npost_permit_recovery=1\nstale_effect_begin=0\nstarted_effect_deleted_cancel=0\nstarted_effect_reconcile_start=1\nstarted_effect_recovery=1\ntoken_permit_expired=1\ntoken_recovery_expired=0\nttl_fresh_start=0\nttl_permit_start=0\nttl_reconciling_start=1\nttl_succeeded_start=1\nttl_sweep_expired=1'
 
 if [[ "${checks}" != "${expected}" ]]; then
   printf 'execution-time authority smoke failed:\n%s\n' "${checks}" >&2
   exit 1
 fi
 
-state_checks="$(sqlite3 "${DB_FILE}" "SELECT version || ':' || state FROM commands WHERE id = 'cmd_confirm'; SELECT used_at IS NULL FROM confirmation_tokens WHERE id = 'tok_expired'; SELECT version || ':' || state FROM commands WHERE id = 'cmd_lease_expired'; SELECT version || ':' || state FROM commands WHERE id = 'cmd_post_permit'; SELECT COUNT(*) FROM action_attempts WHERE command_id = 'cmd_post_permit' AND state = 'running'; SELECT id || ':' || version || ':' || state FROM commands WHERE id LIKE 'cmd_ttl_%' ORDER BY id; SELECT version || ':' || state FROM commands WHERE id = 'cmd_token_recovery'; SELECT version || ':' || state FROM commands WHERE id = 'cmd_cancel_recovery'; SELECT state FROM outbox_events WHERE id = 'out_cancel_recovery';")"
-if [[ "${state_checks}" != $'2:awaiting_confirmation\n1\n5:retryable\n6:cancelled\n1\ncmd_ttl_fresh:2:expired\ncmd_ttl_reconciling:2:running\ncmd_ttl_retrying:1:retryable\ncmd_ttl_succeeded:2:running\ncmd_ttl_unknown:1:unknown\n1:awaiting_confirmation\n1:retryable\nretrying' ]]; then
+state_checks="$(sqlite3 "${DB_FILE}" "SELECT version || ':' || state FROM commands WHERE id = 'cmd_confirm'; SELECT used_at IS NULL FROM confirmation_tokens WHERE id = 'tok_expired'; SELECT version || ':' || state FROM commands WHERE id = 'cmd_lease_expired'; SELECT version || ':' || state FROM commands WHERE id = 'cmd_post_permit'; SELECT COUNT(*) FROM action_attempts WHERE command_id = 'cmd_post_permit' AND state = 'running'; SELECT COUNT(*) FROM action_attempts WHERE command_id = 'cmd_deleted_before_permit'; SELECT attempts FROM action_attempts WHERE command_id = 'cmd_deleted_before_begin'; SELECT id || ':' || version || ':' || state FROM commands WHERE id LIKE 'cmd_ttl_%' ORDER BY id; SELECT id || ':' || version || ':' || state FROM commands WHERE id LIKE 'cmd_token_%' ORDER BY id; SELECT version || ':' || state FROM commands WHERE id = 'cmd_cancel_recovery'; SELECT state FROM outbox_events WHERE id = 'out_cancel_recovery';")"
+if [[ "${state_checks}" != $'2:awaiting_confirmation\n1\n5:retryable\n6:cancelled\n1\n0\n2\ncmd_ttl_fresh:2:expired\ncmd_ttl_reconciling:2:running\ncmd_ttl_retrying:1:retryable\ncmd_ttl_succeeded:2:running\ncmd_ttl_unknown:1:unknown\ncmd_token_permit:2:expired\ncmd_token_recovery:1:awaiting_confirmation\n1:retryable\nretrying' ]]; then
   printf 'execution-time authority state check failed:\n%s\n' "${state_checks}" >&2
   exit 1
 fi
 
-echo "execution-time authority smoke passed: DB-time expiry, exact pre-effect fencing, deleted-session reconciliation, zero-attempt cancellation, and command-TTL recovery hold"
+echo "execution-time authority smoke passed: DB-time expiry, attempts=0 TTL denial, attempts>=1 reconciliation, deletion-race permit/begin fences, and exact claim authority"

@@ -10,9 +10,16 @@ PASSWORD="${SMOKE_PASSWORD:-password123}"
 EMAIL="${SMOKE_EMAIL:-provider-lifecycle-$(date +%s)-$$@local.test}"
 WAIT_SECONDS="${PROVIDER_RECONCILE_WAIT_SECONDS:-6}"
 PROVIDER_LOG="${PROVIDER_LOG:-}"
-PROVIDER_STRICT_RESOURCE_IDENTITY="${PROVIDER_STRICT_RESOURCE_IDENTITY:-false}"
 PROVIDER_PERSIST_TO="${PROVIDER_PERSIST_TO:-}"
 PROVIDER_ENV_FILE="${PROVIDER_ENV_FILE:-}"
+PROVIDER_STRICT_RESOURCE_IDENTITY="${PROVIDER_STRICT_RESOURCE_IDENTITY:-auto}"
+if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "auto" ]]; then
+  if [[ -n "${PROVIDER_LOG}" && -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
+    PROVIDER_STRICT_RESOURCE_IDENTITY=true
+  else
+    PROVIDER_STRICT_RESOURCE_IDENTITY=false
+  fi
+fi
 
 http_json() {
   local body_file error_file
@@ -74,6 +81,84 @@ assert_structured_command_error() {
     (.error.message | type == "string" and length > 0)
   ' <<<"${body}" >/dev/null
 }
+
+assert_atomic_message_identity_sqlite_fence() {
+  local sqlite_db sqlite_output expected
+  if ! grep -Fq \
+    'AND (? IS NULL OR provider_message_id IS NULL OR provider_message_id = ?)' \
+    "${ROOT_DIR}/src/action_effects.rs"; then
+    echo "provider lifecycle failed: message identity update is missing its compare-and-set fence" >&2
+    return 1
+  fi
+
+  sqlite_db="$(mktemp "${TMPDIR:-/tmp}/knock-knock-message-identity.XXXXXX")"
+  if ! sqlite_output="$(sqlite3 -batch -noheader "${sqlite_db}" <<'SQL'
+CREATE TABLE outbound_messages (
+  user_id TEXT NOT NULL,
+  command_id TEXT NOT NULL,
+  delivery_state TEXT NOT NULL,
+  provider_message_id TEXT,
+  updated_at TEXT NOT NULL,
+  UNIQUE (user_id, command_id)
+);
+INSERT INTO outbound_messages
+  (user_id, command_id, delivery_state, provider_message_id, updated_at)
+VALUES ('user-1', 'failed-status', 'queued', 'provider-a', 'before');
+UPDATE outbound_messages
+SET delivery_state = 'failed',
+    provider_message_id = COALESCE(provider_message_id, 'provider-b'),
+    updated_at = 'mismatch'
+WHERE user_id = 'user-1'
+  AND command_id = 'failed-status'
+  AND ('provider-b' IS NULL OR provider_message_id IS NULL OR provider_message_id = 'provider-b');
+SELECT changes(), delivery_state, provider_message_id
+FROM outbound_messages WHERE command_id = 'failed-status';
+UPDATE outbound_messages
+SET delivery_state = 'failed',
+    provider_message_id = COALESCE(provider_message_id, 'provider-a'),
+    updated_at = 'matching'
+WHERE user_id = 'user-1'
+  AND command_id = 'failed-status'
+  AND ('provider-a' IS NULL OR provider_message_id IS NULL OR provider_message_id = 'provider-a');
+SELECT changes(), delivery_state, provider_message_id
+FROM outbound_messages WHERE command_id = 'failed-status';
+INSERT INTO outbound_messages
+  (user_id, command_id, delivery_state, provider_message_id, updated_at)
+VALUES ('user-1', 'overlap', 'queued', NULL, 'before');
+UPDATE outbound_messages
+SET delivery_state = 'sent',
+    provider_message_id = COALESCE(provider_message_id, 'provider-a'),
+    updated_at = 'winner'
+WHERE user_id = 'user-1'
+  AND command_id = 'overlap'
+  AND ('provider-a' IS NULL OR provider_message_id IS NULL OR provider_message_id = 'provider-a');
+SELECT changes(), delivery_state, provider_message_id
+FROM outbound_messages WHERE command_id = 'overlap';
+UPDATE outbound_messages
+SET delivery_state = 'failed',
+    provider_message_id = COALESCE(provider_message_id, 'provider-b'),
+    updated_at = 'loser'
+WHERE user_id = 'user-1'
+  AND command_id = 'overlap'
+  AND ('provider-b' IS NULL OR provider_message_id IS NULL OR provider_message_id = 'provider-b');
+SELECT changes(), delivery_state, provider_message_id
+FROM outbound_messages WHERE command_id = 'overlap';
+SQL
+)"; then
+    rm -f "${sqlite_db}"
+    echo "provider lifecycle failed: message identity SQLite fence did not execute" >&2
+    return 1
+  fi
+  rm -f "${sqlite_db}"
+
+  expected=$'0|queued|provider-a\n1|failed|provider-a\n1|sent|provider-a\n0|sent|provider-a'
+  if [[ "${sqlite_output}" != "${expected}" ]]; then
+    echo "provider lifecycle failed: message identity SQLite fence changed canonical state" >&2
+    return 1
+  fi
+}
+
+assert_atomic_message_identity_sqlite_fence
 
 auth="$(json -X POST "${BASE_URL}/v1/auth/register" \
   -d "$(jq -nc --arg email "${EMAIL}" --arg password "${PASSWORD}" \
@@ -140,6 +225,15 @@ d1_execute_fixture() {
     --command "${sql}" >/dev/null
 }
 
+replace_message_provider_id_fixture() {
+  local command_id="$1"
+  local provider_message_id="$2"
+  [[ "${command_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${provider_message_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  d1_execute_fixture \
+    "UPDATE outbound_messages SET provider_message_id = '${provider_message_id}' WHERE user_id = '${user_id}' AND command_id = '${command_id}'"
+}
+
 expire_command_ttl_fixture() {
   local command_id="$1"
   [[ "${command_id}" =~ ^[A-Za-z0-9._-]+$ ]]
@@ -176,6 +270,15 @@ insert_zero_attempt_permit_fixture() {
   [[ "${command_id}" =~ ^[A-Za-z0-9._-]+$ ]]
   d1_execute_fixture \
     "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) SELECT 'attempt-${command_id}', user_id, id, NULL, 'action.reminder', 'permit-${command_id}', 'running', command_hash, NULL, 0, NULL, 'execution_permit', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM commands WHERE id = '${command_id}' AND user_id = '${user_id}'"
+}
+
+insert_succeeded_cancel_fixture() {
+  local command_id="$1"
+  local response_provider_id="$2"
+  [[ "${command_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${response_provider_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  d1_execute_fixture \
+    "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) SELECT 'attempt-cancel-${command_id}', user_id, id, NULL, 'external.reminder.cancel', 'cancel-fixture-${command_id}', 'succeeded', command_hash, '{\"provider_id\":\"${response_provider_id}\",\"state\":\"succeeded\"}', 1, NULL, NULL, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM commands WHERE id = '${command_id}' AND user_id = '${user_id}'"
 }
 
 create_message() {
@@ -433,6 +536,32 @@ if [[ -n "${PROVIDER_LOG}" ]]; then
 fi
 
 if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
+  # A malformed succeeded row represents the crash/replay boundary. Local
+  # finalization must reject its mismatched resource without a provider call.
+  cancel_replay_id="cmd-cancel-replay-mismatch-$(date +%s%N)"
+  cancel_replay_key="idem-cancel-replay-mismatch-$(date +%s%N)"
+  cancel_replay="$(create_reminder "${cancel_replay_id}" "${cancel_replay_key}")"
+  test "$(jq -r '.state' <<<"${cancel_replay}")" = "queued"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  cancel_replay_first="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${cancel_replay_id}")"
+  test "$(jq -r '.state' <<<"${cancel_replay_first}")" = "succeeded"
+  insert_succeeded_cancel_fixture \
+    "${cancel_replay_id}" "mock-rem-not-the-requested-resource"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    cancel_replay_calls_before="$(count_provider_requests '/reminders/cancel' "${PROVIDER_LOG}")"
+  fi
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  cancel_replay_final="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${cancel_replay_id}")"
+  test "$(jq -r '.state' <<<"${cancel_replay_final}")" = "succeeded"
+  jq -e '.result.status == "scheduled" and (.result.undo? == null)' \
+    <<<"${cancel_replay_final}" >/dev/null
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    cancel_replay_calls_after="$(count_provider_requests '/reminders/cancel' "${PROVIDER_LOG}")"
+    test "${cancel_replay_calls_after}" = "${cancel_replay_calls_before}"
+  fi
+
   cancel_missing_id="cmd-cancel-missing-id-$(date +%s%N)"
   cancel_missing_key="idem-cancel-missing-id-$(date +%s%N)"
   cancel_missing="$(create_reminder "${cancel_missing_id}" "${cancel_missing_key}")"
@@ -449,6 +578,19 @@ if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
   cancel_missing_body="${cancel_missing_response%$'\n'*}"
   test "${cancel_missing_status}" = "503"
   assert_error_response "${cancel_missing_body}" provider_cancel_mismatch
+  cancel_missing_replay="$(curl --silent --show-error --max-time "${HTTP_TIMEOUT_SECONDS:-10}" \
+    -H 'content-type: application/json' "${user_auth[@]}" \
+    -X POST "${BASE_URL}/v1/phone/commands/${cancel_missing_id}/undo" \
+    -w $'\n%{http_code}')" || {
+      echo "provider lifecycle failed: missing-ID cancellation replay had a transport failure" >&2
+      exit 1
+    }
+  test "${cancel_missing_replay##*$'\n'}" = "503"
+  assert_error_response "${cancel_missing_replay%$'\n'*}" provider_cancel_mismatch
+  cancel_missing_final="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${cancel_missing_id}")"
+  jq -e '.result.status == "scheduled" and (.result.undo? == null)' \
+    <<<"${cancel_missing_final}" >/dev/null
 
   cancel_mismatch_id="cmd-cancel-mismatch-$(date +%s%N)"
   cancel_mismatch_key="idem-cancel-mismatch-$(date +%s%N)"
@@ -466,9 +608,50 @@ if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
   cancel_mismatch_body="${cancel_mismatch_response%$'\n'*}"
   test "${cancel_mismatch_status}" = "503"
   assert_error_response "${cancel_mismatch_body}" provider_cancel_mismatch
+  cancel_mismatch_final="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${cancel_mismatch_id}")"
+  jq -e '.result.status == "scheduled" and (.result.undo? == null)' \
+    <<<"${cancel_mismatch_final}" >/dev/null
+
+  message_mismatch_id="cmd-message-status-mismatch-$(date +%s%N)"
+  message_mismatch_key="idem-message-status-mismatch-$(date +%s%N)"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    message_mismatch_delivery_before="$(count_provider_requests '/messages/deliver' "${PROVIDER_LOG}")"
+    message_mismatch_status_before="$(count_provider_requests '/messages/status' "${PROVIDER_LOG}")"
+  fi
+  message_mismatch="$(create_message "${message_mismatch_id}" "${message_mismatch_key}")"
+  test "$(jq -r '.state' <<<"${message_mismatch}")" = "awaiting_confirmation"
+  message_mismatch_token="$(jq -r '.confirmation_token' <<<"${message_mismatch}")"
+  json "${user_auth[@]}" -X POST \
+    "${BASE_URL}/v1/phone/commands/${message_mismatch_id}/confirm" \
+    -d "$(jq -nc --arg token "${message_mismatch_token}" '{confirmation_token:$token}')" >/dev/null
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  message_mismatch_first="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${message_mismatch_id}")"
+  jq -e '(.state == "unknown" or .state == "retryable")' \
+    <<<"${message_mismatch_first}" >/dev/null
+  test "$(jq -r '.error.code' <<<"${message_mismatch_first}")" = "provider_pending"
+  replace_message_provider_id_fixture \
+    "${message_mismatch_id}" "canonical-provider-message"
+  sleep "${WAIT_SECONDS}"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  message_mismatch_final="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${message_mismatch_id}")"
+  assert_structured_command_error "${message_mismatch_final}"
+  test "$(jq -r '.error.code' <<<"${message_mismatch_final}")" = "provider_id_mismatch"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    message_mismatch_delivery_after="$(count_provider_requests '/messages/deliver' "${PROVIDER_LOG}")"
+    message_mismatch_status_after="$(count_provider_requests '/messages/status' "${PROVIDER_LOG}")"
+    test "${message_mismatch_delivery_after}" = "$((message_mismatch_delivery_before + 1))"
+    test "${message_mismatch_status_after}" = "$((message_mismatch_status_before + 1))"
+  fi
 
   message_missing_id="cmd-message-missing-id-$(date +%s%N)"
   message_missing_key="idem-message-missing-id-$(date +%s%N)"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    message_missing_delivery_before="$(count_provider_requests '/messages/deliver' "${PROVIDER_LOG}")"
+    message_missing_status_before="$(count_provider_requests '/messages/status' "${PROVIDER_LOG}")"
+  fi
   message_missing="$(create_message "${message_missing_id}" "${message_missing_key}")"
   test "$(jq -r '.state' <<<"${message_missing}")" = "awaiting_confirmation"
   message_missing_token="$(jq -r '.confirmation_token' <<<"${message_missing}")"
@@ -477,14 +660,27 @@ if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
     -d "$(jq -nc --arg token "${message_missing_token}" '{confirmation_token:$token}')" >/dev/null
   curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
   message_missing_final="$(get_json "${user_auth[@]}" "${BASE_URL}/v1/phone/commands/${message_missing_id}")"
-jq -e '(.state == "unknown" or .state == "retryable")' <<<"${message_missing_final}" >/dev/null
+  jq -e '(.state == "unknown" or .state == "retryable")' <<<"${message_missing_final}" >/dev/null
   test "$(jq -r '.error.code' <<<"${message_missing_final}")" = "provider_missing_id"
+  sleep "${WAIT_SECONDS}"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  message_missing_reconciled="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${message_missing_id}")"
+  test "$(jq -r '.state' <<<"${message_missing_reconciled}")" = "succeeded"
+  test "$(jq -r '.result.delivery_state' <<<"${message_missing_reconciled}")" = "sent"
+  test "$(jq -r '.result.provider_id' <<<"${message_missing_reconciled}")" != "null"
+  if [[ -n "${PROVIDER_LOG}" ]]; then
+    message_missing_delivery_after="$(count_provider_requests '/messages/deliver' "${PROVIDER_LOG}")"
+    message_missing_status_after="$(count_provider_requests '/messages/status' "${PROVIDER_LOG}")"
+    test "${message_missing_delivery_after}" = "$((message_missing_delivery_before + 1))"
+    test "${message_missing_status_after}" = "$((message_missing_status_before + 1))"
+  fi
 else
   echo "provider lifecycle smoke: strict provider-resource identity checks are disabled for this backend base"
 fi
 
 if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
-  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, structured failures, and strict resource-identity fail-closed behavior'
+  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, atomic message identity, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, structured failures, and strict resource-identity fail-closed behavior'
 else
-  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, and structured failures (strict resource-identity checks opt-in)'
+  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, atomic message identity, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, and structured failures (strict resource-identity checks opt-in)'
 fi
