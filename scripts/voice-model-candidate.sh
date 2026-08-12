@@ -5,8 +5,8 @@ readonly DEFAULT_MODEL_TIER="default-1b"
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/voice-model-candidate.sh [--tier default-1b|iphone13-270m] [--preflight]
-       scripts/voice-model-candidate.sh [--tier default-1b|iphone13-270m] --download --output /absolute/outside-git/model.litertlm
+usage: scripts/voice-model-candidate.sh [--tier default-1b] [--preflight]
+       scripts/voice-model-candidate.sh [--tier default-1b] --download --output /absolute/outside-git/model.litertlm
 
 Checks access to the pinned official LiteRT Gemma candidate using the existing
 `hf auth login` state. With no arguments, only an authenticated Hugging Face
@@ -27,7 +27,7 @@ while (($# > 0)); do
   case "$1" in
     --tier)
       if (($# < 2)) || [[ -z "${2:-}" ]]; then
-        echo "--tier requires default-1b or iphone13-270m" >&2
+        echo "--tier requires default-1b" >&2
         exit 64
       fi
       model_tier="$2"
@@ -70,14 +70,15 @@ case "$model_tier" in
     readonly MODEL_EXPECTED_SHA256="1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be"
     ;;
   iphone13-270m)
-    readonly MODEL_REPOSITORY="litert-community/gemma-3-270m-it"
-    readonly MODEL_REVISION="9d2093270fb5aa49a986b49b5779d763dde7b630"
-    readonly MODEL_FILENAME="gemma3-270m-it-q8.litertlm"
-    readonly MODEL_EXPECTED_SIZE_BYTES="304005120"
-    readonly MODEL_EXPECTED_SHA256="757e9119fa5bd667a2774fb470ac4afcd3190a21c677f8e69a5d6bc908abdd63"
+    cat >&2 <<'EOF'
+iphone13-270m is rejected and cannot be acquired by this release tool.
+Its best controlled 32-example result was 0.500 semantic accuracy, below the
+0.950 release threshold. No preflight or download was performed.
+EOF
+    exit 78
     ;;
   *)
-    echo "--tier must be default-1b or iphone13-270m" >&2
+    echo "--tier must be default-1b" >&2
     exit 64
     ;;
 esac

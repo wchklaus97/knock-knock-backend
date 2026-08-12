@@ -10,11 +10,32 @@ APNs rollout, provider rollout, or model rollout was performed
 
 | Repository | Branch | Base commit | Tested implementation head | Draft PR |
 |---|---|---|---|---|
-| iOS | `agent/voice-workflow-completion-ios-20260811` | `931c6bf54a328d067759daf1b243e75ae28bddcc` | `94669e9e97251c301d05fffbac79f237857f5946` | [frontend #16](https://github.com/wchklaus97/knock-knock-frontend/pull/16) |
-| Backend | `agent/voice-workflow-completion-backend-20260811` | `c83b04d6f71dbb0749f8dbaff641509b0d242f08` | `6d98166f0634f47c8a1a03243f0ae7a85eb394f4` | [backend #28](https://github.com/wchklaus97/knock-knock-backend/pull/28) |
+| iOS | `agent/voice-goal-completion-ios-20260812` | `1757009` (merged frontend #15) | `d7d0390` after the #15 merge update | [frontend #17](https://github.com/wchklaus97/knock-knock-frontend/pull/17) |
+| Backend | `main` plus `agent/reject-unqualified-270m-20260812` | `bbb4a82` (merged backend #29) | `bbb4a82` plus the model-policy follow-up | Follow-up PR pending creation |
 
-Both worktrees were fetched immediately before handoff and matched
-`origin/main`. The changes remain unmerged until paired draft PR review.
+Backend PR #29 and frontend PR #15 are merged. Frontend #17 remains the only
+iOS voice PR to review; frontend #16 and backend #28 are superseded and must
+not be merged. No production deployment or model rollout was performed.
+
+## Superseding model and release-safety evidence
+
+- Gemma 3 1B completed the checked-in 32-example semantic gate at 1.000
+  accuracy with zero high-risk false executions. On iPhone 17 Pro Max its
+  command p95 was 1.546 seconds, so it is the accepted model tier for that
+  device class, pending publication and release approval.
+- Gemma 3 270M initialized successfully, but scored 0.125 with the original
+  prompt, 0.000 with unsupported constrained decoding, and at best 0.500 with
+  the shortened prompt. It is rejected for iPhone 13, staging, and production.
+- iPhone 13 remains on deterministic parsing plus clarification. The 1B tier
+  was accurate there but missed the latency target with command p95 4.844
+  seconds.
+- Release builds now require a valid private public-key file path and matching
+  private Info.plist. Missing, invalid, symlinked, or mismatched inputs fail
+  the build. A downloaded model is never marked Ready until LiteRT-LM opens it;
+  startup failure quarantines the candidate and restores a verified predecessor.
+- The final iOS unit run completed 186 tests: 183 passed, 3 optional tests
+  skipped, and 0 failed. The isolated local Worker/D1 UI suite completed 4
+  tests: 3 passed, the opt-in physical voice test skipped, and 0 failed.
 
 ## Fifteen-step workflow evidence
 
@@ -207,20 +228,19 @@ Both worktrees were fetched immediately before handoff and matched
 
 ## Intentionally open release gates
 
-The skipped test is
-`VoiceModelGoldenEvaluationTests.testSignedModelMeetsAccuracySafetyAndLatencyGates`.
-It requires an approved real `.litertlm` Gemma artifact, a pinned production
-public key, and signed descriptor inputs. No placeholder model is accepted.
-The repository/artifact audit found no real `.litertlm` file, the exact Staging
-build has a zero-length `KNOCK_MODEL_PUBLIC_KEY_BASE64`, and deployed staging
-reports `knock_knock_model_enabled 0`. The skip is therefore the expected
-fail-closed release boundary, not an unexplained test failure.
+The 1B model has local golden and physical-device performance evidence, but it
+has not been published to staging R2 or approved for rollout. Normal automated
+test runs therefore continue to skip the opt-in real-model test when its
+private model, manifest, and trust-key paths are absent. That is the expected
+fail-closed boundary.
 
-- [ ] Approve and publish a real signed `gemma-command` artifact to non-public
-  staging R2, then run the 20–100-example golden suite with at least 95%
-  intent accuracy and zero high-risk false execution.
+- [ ] Approve, sign, and publish the already-qualified 1B `gemma-command`
+  artifact to non-public staging R2, then repeat the golden gate from the exact
+  staged descriptor and binary.
 - [ ] Run real microphone → STT → Gemma → CommandEnvelope → backend → TTS UAT
-  on iPhone 13 Pro, including Chinese, English, and Cantonese locale labels.
+  on iPhone 17 Pro Max, including Chinese, English, and Cantonese locale labels.
+- [ ] Validate deterministic parsing plus clarification on iPhone 13 Pro; do
+  not install the rejected 270M model there.
 - [ ] Measure physical-device latency, peak memory, thermal state, battery
   impact, cancellation during inference, and repeated-session crash behavior.
 - [ ] Verify real APNs delivery rather than configuration readiness only.

@@ -1,6 +1,6 @@
 # Voice Model Release Runbook
 
-> **中文摘要：** 代码已经支持 LiteRT-LM、签名验证、私有 R2 下载和回滚；真正的 Gemma 模型文件不能由 CI 自动取得。发布负责人必须先在 Hugging Face 接受 Gemma 许可，下载官方 `.litertlm`，在仓库外用 Ed25519 私钥签名，再通过受保护的 staging 配置发布。私钥、Hugging Face token 和模型文件都不得提交到 Git。
+> **中文摘要：** 代码已经支持 LiteRT-LM、签名验证、私有 R2 下载和回滚。Gemma 3 1B 是当前唯一通过准确率门禁的设备模型；270M 最佳准确率只有 50%，已被明确拒绝，不能下载或发布。发布负责人必须在仓库外处理模型和 Ed25519 私钥，再通过受保护的 staging 配置发布。私钥、Hugging Face token 和模型文件都不得提交到 Git。
 
 ## Scope
 
@@ -9,21 +9,30 @@ signed descriptor consumed by Knock Knock. It does not authorize a production
 rollout. The application is currently pinned to the LiteRT-LM `v0.12.0` C
 framework so the main target can retain its iOS 15 deployment floor.
 
-The default artifact and the smaller iPhone 13 candidate are pinned to the
-official LiteRT community sources below. Both Hugging Face repositories are
-publicly listed but gated by the Gemma license. A human must accept each
-repository's license grant and authenticate the `hf` CLI; neither the
+The approved default artifact is pinned to the official LiteRT community
+source below. The Hugging Face repository is gated by the Gemma license. A
+human must accept its license grant and authenticate the `hf` CLI; neither the
 repository nor CI may bypass that step.
 
 | Tier | Repository | Revision | Filename | Size | SHA-256 |
 |---|---|---|---|---:|---|
 | `default-1b` | `litert-community/Gemma3-1B-IT` | `6d54daa71cfbffba6b2843c08eeb1a27e7430bf0` | `gemma3-1b-it-int4.litertlm` | 584417280 | `1325ae366d31950f137c9c357b9fa89448b176d76998180c08ceaca78bba98be` |
-| `iphone13-270m` | `litert-community/gemma-3-270m-it` | `9d2093270fb5aa49a986b49b5779d763dde7b630` | `gemma3-270m-it-q8.litertlm` | 304005120 | `757e9119fa5bd667a2774fb470ac4afcd3190a21c677f8e69a5d6bc908abdd63` |
 
-The 270M artifact is only a candidate until the same signed 32-example gate
-proves at least 95% semantic accuracy, zero high-risk false executions, and the
-approved iPhone 13 latency/memory/thermal limits. A smaller file does not waive
-those gates or grant the model any execution authority.
+### Rejected 270M tier
+
+The pinned 304,005,120-byte Gemma 3 270M q8 artifact was evaluated against the
+same checked-in 32-example synthetic command set. The original prompt scored
+0.125 with command p95 2.469 seconds. JSON-schema constrained decoding scored
+0.000 because the model vocabulary is unsupported by the LiteRT FST constraint
+provider. A shortened unconstrained prompt improved accuracy to 0.500 with
+command p95 1.533 seconds. Every run recorded zero high-risk false executions,
+but none met the 0.950 accuracy threshold.
+
+The `iphone13-270m` tier is therefore rejected for iPhone 13, staging, and
+production. `voice-model-candidate.sh` exits 78 before authentication,
+preflight, or download when that tier is requested. iPhone 13 remains on the
+deterministic parser plus clarification path until a future model passes a new
+reviewed RFC and all release gates.
 
 ## Security boundaries
 
@@ -32,8 +41,11 @@ those gates or grant the model any execution authority.
 - Upload the model under `models/{model_id}/...litertlm` in a private R2
   bucket. The API exposes an authenticated same-origin download route and
   never returns the R2 object key.
-- Pin the raw 32-byte Ed25519 public key into the reviewed iOS build setting
-  `KNOCK_MODEL_PUBLIC_KEY_BASE64`.
+- Keep the raw 32-byte Ed25519 public key in a private file outside Git. The
+  reviewed iOS archive/UAT scripts receive only that file path and a matching
+  private Info.plist path. Release builds fail when either file is missing,
+  invalid, symlinked, or mismatched; key contents are never passed as an
+  `xcodebuild` command-line argument.
 - The app accepts artifacts from 1 byte through 2 GiB and activates one only
   after manifest shape, artifact size, SHA-256, Ed25519 signature, capability,
   and rollback checks pass. Both active and rollback artifacts are reverified
@@ -62,9 +74,10 @@ into the current release target:
   own verified Gemma 4 path requires `Gemma4PromptFormatter`; that mismatch must
   be corrected before treating the sample as a trustworthy device baseline.
 
-Keep Gemma 3 1B INT4 as the verified default tier. Evaluate the pinned Gemma 3
-270M IT artifact as the iPhone 13 tier because the 1B artifact passes semantic
-and safety checks there but misses the two-second latency target. A future
+Keep Gemma 3 1B INT4 as the verified default tier on supported newer devices.
+Do not install a local LLM on iPhone 13 in this release; use deterministic
+parsing and clarification because 1B misses its latency target and 270M misses
+the accuracy target. A future
 Gemma 4 RFC may introduce a separately feature-flagged adapter for newer
 devices after artifact size, prompt formatting, cancellation, memory, thermal,
 and golden-set gates pass. Every tier must continue to emit only
@@ -83,12 +96,6 @@ and golden-set gates pass. Every tier must continue to emit only
    ./scripts/voice-model-candidate.sh
    ```
 
-   For the iPhone 13 candidate, use the explicit tier on every invocation:
-
-   ```bash
-   ./scripts/voice-model-candidate.sh --tier iphone13-270m --preflight
-   ```
-
    Exit 77 with an “Accept the Gemma license” message means the logged-in
    account has not been granted access. Accept the license in the browser and
    rerun the same preflight. Do not add `--token`.
@@ -101,17 +108,6 @@ and golden-set gates pass. Every tier must continue to emit only
    ./scripts/voice-model-candidate.sh \
      --download \
      --output /secure/path/gemma3-1b-it-candidate/gemma3-1b-it-int4.litertlm
-   ```
-
-   The equivalent iPhone 13 candidate command is:
-
-   ```bash
-   umask 077
-   mkdir -p /secure/path/gemma3-270m-it-candidate
-   ./scripts/voice-model-candidate.sh \
-     --tier iphone13-270m \
-     --download \
-     --output /secure/path/gemma3-270m-it-candidate/gemma3-270m-it-q8.litertlm
    ```
 
    The script pins repository, revision, and filename; refuses an output in a
@@ -174,21 +170,25 @@ manifest's `model_id`.
 2. Configure staging with `VOICE_MODEL_ENABLED=true`, the private
    `VOICE_MODEL_R2_KEY`, and the exact one-line `VOICE_MODEL_MANIFEST_JSON`.
    Do not configure an external public URL when private R2 is used.
-3. Build the Staging iOS configuration with the emitted public key in
-   `KNOCK_MODEL_PUBLIC_KEY_BASE64`.
+3. Build the Staging iOS configuration through the reviewed frontend
+   archive/UAT script, supplying the emitted public-key file and a matching
+   private Info.plist by path. Do not put key contents in shell arguments or
+   commit either file.
 4. Run `scripts/voice-model-r2-smoke.sh`, the staging contract gate, the iOS
    signed-download/rollback tests, and the real-model golden suite.
 5. Attach per-locale accuracy, zero high-risk false-execution evidence, p50 and
    p95 intent latency, peak memory, thermal state, crash count, and iPhone 13
    screenshots/logs to the release ticket.
 
-The real-model test is opt-in and requires only local paths and a public key:
+The real-model test is opt-in and uses only private local paths. Use the
+frontend repository's `scripts/ios-voice-model-uat.sh`; it validates and
+injects the public key through the protected path-based build flow:
 
 ```bash
-KNOCK_VOICE_MODEL_PATH=/secure/path/model.litertlm \
-KNOCK_VOICE_MODEL_MANIFEST_PATH=/secure/path/manifest.json \
-KNOCK_MODEL_PUBLIC_KEY_BASE64="$(tr -d '\n' </secure/path/public-key.base64)" \
-xcodebuild test ...
+./scripts/ios-voice-model-uat.sh \
+  --model /secure/path/model.litertlm \
+  --manifest /secure/path/manifest.json \
+  --public-key /secure/path/public-key.base64
 ```
 
 Do not export the Hugging Face token or private signing key to the test
