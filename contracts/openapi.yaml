@@ -809,6 +809,8 @@ paths:
     post:
       tags: [Phone]
       operationId: undoPhoneCommand
+      description: Idempotently compensates a reversible command. The first Undo request must arrive less than 600 seconds after successful completion; unavailable or expired Undo requests return a conflict.
+      x-undo-window-seconds: 600
       parameters:
         - $ref: '#/components/parameters/CommandId'
       responses:
@@ -835,6 +837,24 @@ paths:
                 $ref: '#/components/schemas/ModelArtifactDescriptor'
         default:
           $ref: '#/components/responses/Error'
+  /v1/phone/models/{model_id}/artifact:
+    get:
+      tags: [Phone]
+      operationId: downloadPhoneModelArtifact
+      description: Streams an authenticated signed model from private R2. The storage key is never returned.
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      responses:
+        '200':
+          description: Signed model artifact bytes. The client must verify the manifest before activation.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        default:
+          $ref: '#/components/responses/Error'
   /v1/phone/search:
     get:
       tags: [Phone]
@@ -843,7 +863,8 @@ paths:
         - name: q
           in: query
           required: true
-          schema: { type: string, minLength: 1, maxLength: 200 }
+          description: Runtime validation trims surrounding whitespace.
+          schema: { type: string, minLength: 1, maxLength: 200, pattern: '.*\S.*' }
         - $ref: '#/components/parameters/BeforeCursor'
         - $ref: '#/components/parameters/PageLimit'
       responses:
@@ -1135,9 +1156,101 @@ components:
               score: { type: [number, 'null'] }
               content_hash: { type: string, minLength: 1, maxLength: 256 }
               r2_key: { type: [string, 'null'] }
+    SearchHistoryCommandArgs:
+      type: object
+      additionalProperties: false
+      description: Use canonical `q`. Runtime validation trims surrounding whitespace and requires at least one character. Compatibility aliases `query` and `text` are accepted, but exactly one name may be present.
+      properties:
+        q: { type: string, minLength: 1, maxLength: 200, pattern: '.*\S.*' }
+        query: { type: string, minLength: 1, maxLength: 200, pattern: '.*\S.*', deprecated: true }
+        text: { type: string, minLength: 1, maxLength: 200, pattern: '.*\S.*', deprecated: true }
+      oneOf:
+        - required: [q]
+        - required: [query]
+        - required: [text]
+    CreateReminderCommandArgs:
+      type: object
+      additionalProperties: false
+      description: Use canonical `title` and `due_at`. Compatibility aliases are accepted one-at-a-time for each field.
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        text: { type: string, minLength: 1, maxLength: 200, deprecated: true }
+        message: { type: string, minLength: 1, maxLength: 200, deprecated: true }
+        due_at: { type: string, minLength: 1, maxLength: 64 }
+        time: { type: string, minLength: 1, maxLength: 64, deprecated: true }
+        datetime: { type: string, minLength: 1, maxLength: 64, deprecated: true }
+      allOf:
+        - oneOf:
+            - required: [title]
+            - required: [text]
+            - required: [message]
+        - oneOf:
+            - required: [due_at]
+            - required: [time]
+            - required: [datetime]
+    CreateDraftCommandArgs:
+      type: object
+      additionalProperties: false
+      description: Use canonical `body`, `title`, and `recipient`. The latter two are optional; compatibility aliases are accepted one-at-a-time.
+      properties:
+        body: { type: string, minLength: 1, maxLength: 8000 }
+        content: { type: string, minLength: 1, maxLength: 8000, deprecated: true }
+        text: { type: string, minLength: 1, maxLength: 8000, deprecated: true }
+        title: { type: string, maxLength: 200 }
+        subject: { type: string, maxLength: 200, deprecated: true }
+        recipient: { type: string, maxLength: 320 }
+        to: { type: string, maxLength: 320, deprecated: true }
+      allOf:
+        - oneOf:
+            - required: [body]
+            - required: [content]
+            - required: [text]
+        - not:
+            required: [title, subject]
+        - not:
+            required: [recipient, to]
+    SendMessageCommandArgs:
+      type: object
+      additionalProperties: false
+      description: Use canonical `body` and `recipient`. Compatibility aliases are accepted one-at-a-time for each field.
+      properties:
+        body: { type: string, minLength: 1, maxLength: 8000 }
+        message: { type: string, minLength: 1, maxLength: 8000, deprecated: true }
+        text: { type: string, minLength: 1, maxLength: 8000, deprecated: true }
+        recipient: { type: string, minLength: 1, maxLength: 320 }
+        to: { type: string, minLength: 1, maxLength: 320, deprecated: true }
+        email: { type: string, minLength: 1, maxLength: 320, deprecated: true }
+        phone: { type: string, minLength: 1, maxLength: 320, deprecated: true }
+      allOf:
+        - oneOf:
+            - required: [body]
+            - required: [message]
+            - required: [text]
+        - oneOf:
+            - required: [recipient]
+            - required: [to]
+            - required: [email]
+            - required: [phone]
     CommandEnvelope:
       type: object
       additionalProperties: false
+      oneOf:
+        - title: Search history command
+          properties:
+            intent: { const: search_history }
+            args: { $ref: '#/components/schemas/SearchHistoryCommandArgs' }
+        - title: Create reminder command
+          properties:
+            intent: { const: create_reminder }
+            args: { $ref: '#/components/schemas/CreateReminderCommandArgs' }
+        - title: Create draft command
+          properties:
+            intent: { const: create_draft }
+            args: { $ref: '#/components/schemas/CreateDraftCommandArgs' }
+        - title: Send message command
+          properties:
+            intent: { const: send_message }
+            args: { $ref: '#/components/schemas/SendMessageCommandArgs' }
       required:
         - schema_version
         - command_id
@@ -1152,10 +1265,12 @@ components:
       properties:
         schema_version: { type: integer, const: 1 }
         command_id: { type: string, minLength: 1, maxLength: 128 }
-        intent: { type: string, minLength: 1, maxLength: 128 }
+        intent:
+          type: string
+          enum: [search_history, create_reminder, create_draft, send_message]
         args:
           type: object
-          additionalProperties: true
+          description: Strictly validated according to `intent`; unknown keys, duplicate aliases, and non-string values are rejected.
         risk_level:
           type: string
           enum: [low, medium, high, destructive]
@@ -1179,9 +1294,20 @@ components:
         risk: { type: string, enum: [low, medium, high, destructive] }
         confirm_required: { type: boolean }
         reversible: { type: boolean }
+    CommandPresentation:
+      type: object
+      additionalProperties: false
+      required: [schema_version, code, locale, display_text, voice_script, terminal]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        code: { type: string, minLength: 1, maxLength: 128 }
+        locale: { type: string, minLength: 2, maxLength: 32 }
+        display_text: { type: string, minLength: 1, maxLength: 512 }
+        voice_script: { type: [string, 'null'], maxLength: 512 }
+        terminal: { type: boolean }
     CommandResponse:
       type: object
-      required: [command_id, state, version, created_at, updated_at]
+      required: [command_id, state, presentation, undo_command_id, version, created_at, updated_at]
       properties:
         command_id: { type: string }
         state:
@@ -1192,6 +1318,8 @@ components:
           oneOf:
             - $ref: '#/components/schemas/CommandActionMetadata'
             - type: 'null'
+        presentation:
+          $ref: '#/components/schemas/CommandPresentation'
         confirmation_token: { type: [string, 'null'] }
         result:
           type: [object, 'null']
@@ -1199,13 +1327,19 @@ components:
         error:
           type: [object, 'null']
           additionalProperties: true
-        undo_command_id: { type: [string, 'null'] }
+        undo_command_id:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: Equal to `command_id` only for a succeeded reversible command whose first Undo window is still open; null after 600 seconds, after Undo, or whenever Undo is unavailable.
+          x-undo-window-seconds: 600
         version: { type: integer, minimum: 0 }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     CommandSummary:
       type: object
-      required: [command_id, intent, risk_level, needs_confirmation, state, version, created_at, updated_at]
+      description: Lightweight command-list item. Full command arguments, raw results, and raw errors are detail-only.
+      required: [command_id, intent, risk_level, needs_confirmation, state, presentation, version, created_at, updated_at]
       properties:
         command_id: { type: string }
         session_id: { type: [string, 'null'] }
@@ -1214,12 +1348,8 @@ components:
         needs_confirmation: { type: boolean }
         state:
           $ref: '#/components/schemas/CommandState'
-        result:
-          type: [object, 'null']
-          additionalProperties: true
-        error:
-          type: [object, 'null']
-          additionalProperties: true
+        presentation:
+          $ref: '#/components/schemas/CommandPresentation'
         expires_at: { type: [string, 'null'], format: date-time }
         version: { type: integer, minimum: 0 }
         created_at: { type: string, format: date-time }
@@ -1239,7 +1369,9 @@ components:
       additionalProperties: false
       required: [model_id, manifest, download_url]
       properties:
-        model_id: { type: string }
+        model_id:
+          type: string
+          description: Must exactly equal manifest.model_id.
         manifest:
           $ref: '#/components/schemas/ModelManifest'
         download_url: { type: string, format: uri }
@@ -1251,10 +1383,17 @@ components:
       properties:
         schema_version: { type: integer, const: 1 }
         model_id: { type: string, minLength: 1, maxLength: 128 }
-        model_version: { type: string, pattern: '^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$' }
+        model_version:
+          type: string
+          maxLength: 128
+          pattern: '^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)([.](0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?([+]([0-9A-Za-z-]+([.][0-9A-Za-z-]+)*))?$'
         sha256: { type: string, pattern: '^[0-9a-fA-F]{64}$' }
-        signature: { type: string, minLength: 1 }
-        size_bytes: { type: integer, minimum: 1 }
+        signature:
+          type: string
+          minLength: 88
+          maxLength: 88
+          description: Base64 Ed25519 signature over the deterministic com.knockknock.voice-model-manifest.ed25519.v1 payload documented in the release runbook.
+        size_bytes: { type: integer, minimum: 1, maximum: 2147483648 }
         minimum_capability: { type: string, minLength: 1, maxLength: 64 }
     ConfirmationRequest:
       type: object

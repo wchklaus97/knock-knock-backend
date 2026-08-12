@@ -31,7 +31,10 @@ jobs:
       STAGING_R2_BUCKET: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
       STAGING_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_STAGING_SUPABASE_URL }}
       STAGING_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_STAGING_CORS_ORIGIN }}
-      STAGING_RELEASE_VERSION: ${{ vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION }}
+      # Bind health/version evidence to the exact immutable revision selected
+      # for this workflow run; a mutable environment variable is not release
+      # provenance.
+      STAGING_RELEASE_VERSION: ${{ github.sha }}
       STAGING_URL: ${{ inputs.staging_url }}
     steps:
       - name: Check out the requested backend revision
@@ -143,10 +146,11 @@ jobs:
           set -euo pipefail
           staging_url="${STAGING_URL%/}"
           health="$(curl --fail-with-body --silent --show-error --max-time 20 "${staging_url}/health")"
-          jq -e '
+          jq -e --arg expected_version "$STAGING_RELEASE_VERSION" '
             (.ok == true) and
             (.api == "rust") and
             (.runtime == "cloudflare-worker") and
+            (.version == $expected_version) and
             (.push_mode == "both") and
             (.apns_ready == true) and
             (.apns_production == false) and
@@ -179,7 +183,7 @@ jobs:
       STAGING_R2_BUCKET: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
       STAGING_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_STAGING_SUPABASE_URL }}
       STAGING_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_STAGING_CORS_ORIGIN }}
-      STAGING_RELEASE_VERSION: ${{ vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION }}
+      STAGING_RELEASE_VERSION: ${{ github.sha }}
     steps:
       - name: Check out the requested backend revision
         uses: actions/checkout@v4

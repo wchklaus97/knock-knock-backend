@@ -35,6 +35,7 @@ grep -q '^binding = "R2"$' "$PRODUCTION_EXAMPLE"
 grep -q '^bucket_name = "REPLACE_WITH_R2_BUCKET_NAME"$' "$PRODUCTION_EXAMPLE"
 grep -q '^VOICE_MODEL_ENABLED = "true"$' "$PRODUCTION_EXAMPLE"
 grep -q '^VOICE_MODEL_URL = "REPLACE_WITH_SIGNED_MODEL_URL"$' "$PRODUCTION_EXAMPLE"
+grep -q '^VOICE_MODEL_R2_KEY = "REPLACE_WITH_SIGNED_MODEL_R2_KEY"$' "$PRODUCTION_EXAMPLE"
 grep -q '^VOICE_MODEL_MANIFEST_JSON = "REPLACE_WITH_SIGNED_MODEL_MANIFEST_JSON"$' "$PRODUCTION_EXAMPLE"
 grep -q '^NODE_ENV = "staging"$' "$STAGING_EXAMPLE"
 grep -q '^AUTH_PROVIDER = "supabase"$' "$STAGING_EXAMPLE"
@@ -68,5 +69,13 @@ grep -q 'PUSH_MODE must be apns or both in production' "$ROOT/src/auth.rs"
 grep -q 'PUSH_MODE must be dev, apns, or both in staging' "$ROOT/src/auth.rs"
 grep -q 'APNS_PRODUCTION must be false in staging' "$ROOT/src/auth.rs"
 grep -q 'SUPABASE_PUBLISHABLE_KEY must be configured' "$ROOT/src/auth.rs"
+
+grep -Fq 'STAGING_RELEASE_VERSION: ${{ github.sha }}' "$ROOT/.github/workflows/staging-deploy.yml"
+grep -Fq 'STAGING_RELEASE_VERSION: ${{ github.sha }}' "$ROOT/.github/workflows/staging-contract-gate.yml"
+if grep -Fq 'vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION' "$ROOT/.github/workflows/staging-deploy.yml" \
+  || grep -Fq 'vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION' "$ROOT/.github/workflows/staging-contract-gate.yml"; then
+  echo "staging release identity must come from github.sha, not a mutable repository variable" >&2
+  exit 1
+fi
 
 echo "production config smoke passed: local defaults are explicit and production is fail-closed"

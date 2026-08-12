@@ -6,13 +6,14 @@ use crate::auth::new_id;
 use crate::commands;
 use crate::db;
 use crate::error::{ApiError, ApiResult};
-use crate::models::CommandRow;
+use crate::models::{CommandRow, OutboxEventRow};
 use crate::providers::{self, ActionProviderConfig};
 
 const MAX_TITLE: usize = 200;
 const MAX_RECIPIENT: usize = 320;
 const MAX_BODY: usize = 8_000;
 const CANCEL_LEASE_SECONDS: i64 = 300;
+const REMINDER_EFFECT_SQL: &str = "SELECT id, status, provider, provider_reminder_id FROM reminders WHERE user_id = ? AND command_id = ?";
 
 #[derive(Debug, Clone, Deserialize)]
 struct EffectAttemptRow {
@@ -20,6 +21,80 @@ struct EffectAttemptRow {
     provider_idempotency_key: String,
     state: String,
     response_json: Option<String>,
+    attempts: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MaterializedReminderRow {
+    id: String,
+    status: String,
+    title: String,
+    due_at: String,
+    timezone: String,
+    provider: String,
+    provider_reminder_id: Option<String>,
+}
+
+fn materialized_reminder_response(row: &MaterializedReminderRow) -> Value {
+    let external = row.provider != "local.reminder";
+    json!({
+        "kind": "reminder",
+        "reminder_id": row.id,
+        "status": row.status,
+        "title": row.title,
+        "due_at": row.due_at,
+        "timezone": row.timezone,
+        "provider": row.provider,
+        "external_delivery": external.then_some("accepted"),
+        "provider_id": row.provider_reminder_id,
+    })
+}
+
+async fn recover_materialized_reminder(
+    db: &D1Database,
+    user_id: &str,
+    command: &CommandRow,
+) -> ApiResult<Option<Value>> {
+    if command.intent != "create_reminder" {
+        return Ok(None);
+    }
+    let Some(row) = db::first::<MaterializedReminderRow>(
+        db,
+        "SELECT id, status, title, due_at, timezone, provider, provider_reminder_id FROM reminders WHERE user_id = ? AND command_id = ? LIMIT 1",
+        vec![db::text(user_id), db::text(&command.id)],
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let response = materialized_reminder_response(&row);
+    record_attempt(db, user_id, command, &row.provider, &response)
+        .await
+        .map(Some)
+}
+
+fn reusable_succeeded_response(attempt: &EffectAttemptRow) -> ApiResult<Option<Value>> {
+    if attempt.state == "succeeded" {
+        parse_response(attempt.response_json.as_deref()).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_execution_permit_only(attempt: &EffectAttemptRow) -> bool {
+    attempt.state == "running" && attempt.attempts == 0
+}
+
+fn validate_args_for_effect(
+    intent: &str,
+    args: &Map<String, Value>,
+    recovered_provider_success: bool,
+) -> Result<(), commands::CommandValidationError> {
+    if recovered_provider_success {
+        commands::validate_action_args_shape(intent, args)
+    } else {
+        commands::validate_action_args(intent, args)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +108,14 @@ struct CancelAttemptRow {
 struct CancelReconciliationRow {
     user_id: String,
     command_id: String,
+    attempt_state: String,
+    attempt_response_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum CancelAttemptClaim {
+    CallProvider,
+    ReuseSucceeded(providers::ProviderResponse),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +128,220 @@ struct EffectRow {
     provider_reminder_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct MessageEffectRow {
+    id: String,
+    delivery_state: String,
+    provider_message_id: Option<String>,
+}
+
+fn message_effect_sql() -> &'static str {
+    "SELECT id, delivery_state, provider_message_id FROM outbound_messages WHERE user_id = ? AND command_id = ? LIMIT 1"
+}
+
+fn bind_message_delivery_sql() -> &'static str {
+    "UPDATE outbound_messages SET delivery_state = ?, provider_message_id = COALESCE(provider_message_id, ?), updated_at = ? WHERE user_id = ? AND command_id = ? AND (? IS NULL OR provider_message_id IS NULL OR provider_message_id = ?)"
+}
+
+fn message_delivery_state(
+    external: bool,
+    provider_state: providers::ProviderDeliveryState,
+) -> &'static str {
+    if !external {
+        return "queued";
+    }
+    match provider_state {
+        providers::ProviderDeliveryState::Succeeded => "sent",
+        providers::ProviderDeliveryState::Failed => "failed",
+        providers::ProviderDeliveryState::Pending | providers::ProviderDeliveryState::Unknown => {
+            "queued"
+        }
+    }
+}
+
+fn materialized_message_response(
+    effect: &MessageEffectRow,
+    provider: &str,
+    external: bool,
+) -> Value {
+    let external_delivery = if !external {
+        "not_configured"
+    } else {
+        match effect.delivery_state.as_str() {
+            "sent" => "sent",
+            "failed" => "rejected",
+            _ => "accepted",
+        }
+    };
+    json!({
+        "kind": "message",
+        "message_id": effect.id,
+        "delivery_state": effect.delivery_state,
+        "provider": provider,
+        "external_delivery": external_delivery,
+        "provider_id": effect.provider_message_id,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct UndoFinalization {
+    result: Value,
+    command_result: Value,
+    next_version: i64,
+}
+
+fn succeeded_cancel_reconciliation_sql() -> &'static str {
+    "SELECT attempt.user_id, attempt.command_id, attempt.state AS attempt_state, attempt.response_json AS attempt_response_json FROM action_attempts AS attempt INNER JOIN reminders AS reminder ON reminder.user_id = attempt.user_id AND reminder.command_id = attempt.command_id INNER JOIN commands AS command ON command.id = attempt.command_id AND command.user_id = attempt.user_id WHERE attempt.provider = 'external.reminder.cancel' AND attempt.user_id IS NOT NULL AND attempt.command_id IS NOT NULL AND reminder.status = 'scheduled' AND command.state = 'succeeded' AND attempt.state = 'succeeded' ORDER BY attempt.updated_at ASC LIMIT 20"
+}
+
+fn pending_cancel_reconciliation_sql() -> &'static str {
+    "SELECT attempt.user_id, attempt.command_id, attempt.state AS attempt_state, attempt.response_json AS attempt_response_json FROM action_attempts AS attempt INNER JOIN reminders AS reminder ON reminder.user_id = attempt.user_id AND reminder.command_id = attempt.command_id INNER JOIN commands AS command ON command.id = attempt.command_id AND command.user_id = attempt.user_id WHERE attempt.provider = 'external.reminder.cancel' AND attempt.user_id IS NOT NULL AND attempt.command_id IS NOT NULL AND reminder.status = 'scheduled' AND command.state = 'succeeded' AND (attempt.state IN ('unknown', 'retrying') OR (attempt.state = 'running' AND attempt.updated_at <= ?)) ORDER BY attempt.updated_at ASC LIMIT 20"
+}
+
+fn is_succeeded_cancel_reconciliation_row(row: &CancelReconciliationRow) -> bool {
+    row.attempt_state == "succeeded"
+}
+
+fn is_pending_cancel_reconciliation_row(row: &CancelReconciliationRow) -> bool {
+    matches!(
+        row.attempt_state.as_str(),
+        "unknown" | "retrying" | "running"
+    )
+}
+
+fn pending_cancel_reconciliation_enabled(mode: providers::ActionProviderMode) -> bool {
+    mode == providers::ActionProviderMode::External
+}
+
+fn undo_effect_update_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} SET status = 'cancelled', updated_at = ? WHERE user_id = ? AND command_id = ? AND status IN ('scheduled', 'draft') AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)"
+    )
+}
+
+fn undo_command_update_sql() -> &'static str {
+    "UPDATE commands SET result_json = ?, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ? AND changes() = 1"
+}
+
+fn undo_audit_insert_sql() -> &'static str {
+    "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.undo', ?, ? WHERE changes() = 1"
+}
+
+fn undo_phone_change_insert_sql() -> &'static str {
+    "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1"
+}
+
+fn build_undo_finalization(
+    command: &CommandRow,
+    effect_id: &str,
+    provider: &str,
+) -> UndoFinalization {
+    let result = json!({
+        "kind": "undo",
+        "provider": provider,
+        "effect_id": effect_id,
+        "status": "cancelled",
+        "already_cancelled": false,
+    });
+    let mut command_result = command
+        .result_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = command_result.as_object_mut() {
+        object.insert("undo".to_string(), result.clone());
+    } else {
+        command_result = json!({"value": command_result, "undo": result});
+    }
+    UndoFinalization {
+        result,
+        command_result,
+        next_version: command.version + 1,
+    }
+}
+
+async fn finalize_undo_transaction(
+    db: &D1Database,
+    user_id: &str,
+    command: &CommandRow,
+    effect: &EffectRow,
+    provider: &str,
+    table: &str,
+    id_sql: &str,
+) -> ApiResult<Value> {
+    let now = db::now_iso();
+    let finalization = build_undo_finalization(command, &effect.id, provider);
+    let command_result_json = finalization.command_result.to_string();
+    let statements = vec![
+        db::prepare(
+            db,
+            &undo_effect_update_sql(table),
+            vec![
+                db::text(&now),
+                db::text(user_id),
+                db::text(&command.id),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(command.version),
+            ],
+        )?,
+        db::prepare(
+            db,
+            undo_command_update_sql(),
+            vec![
+                db::text(&command_result_json),
+                db::number(finalization.next_version),
+                db::text(&now),
+                db::text(&command.id),
+                db::text(user_id),
+                db::number(command.version),
+            ],
+        )?,
+        db::prepare(
+            db,
+            undo_audit_insert_sql(),
+            vec![
+                db::text(&new_id("aud")?),
+                db::text(user_id),
+                db::optional_text(command.session_id.as_deref()),
+                db::text(&json!({"command_id": command.id, "effect_id": effect.id, "version": finalization.next_version}).to_string()),
+                db::text(&now),
+            ],
+        )?,
+        db::prepare(
+            db,
+            undo_phone_change_insert_sql(),
+            vec![
+                db::text(user_id),
+                db::text(&command.id),
+                db::optional_text(command.session_id.as_deref()),
+                db::number(finalization.next_version),
+                db::text(&now),
+            ],
+        )?,
+    ];
+    let results = db.batch(statements).await?;
+    if results.get(1).map(db::changes).unwrap_or(0) == 0 {
+        let current =
+            db::first::<EffectRow>(db, id_sql, vec![db::text(user_id), db::text(&command.id)])
+                .await?;
+        if current
+            .as_ref()
+            .is_some_and(|row| row.status == "cancelled")
+        {
+            return Ok(json!({
+                "kind": "undo",
+                "provider": provider,
+                "effect_id": effect.id,
+                "status": "cancelled",
+                "already_cancelled": true,
+            }));
+        }
+        return Err(ApiError::conflict("Command was already undone or changed"));
+    }
+    Ok(finalization.result)
+}
+
 /// Execute an action whose effect is fully represented in D1.
 ///
 /// The caller is the Outbox worker, so this function must be safe to invoke
@@ -55,15 +352,27 @@ pub async fn execute(
     db: &D1Database,
     user_id: &str,
     command: &CommandRow,
+    claim: &OutboxEventRow,
     args: &Map<String, Value>,
     provider_config: ActionProviderConfig,
 ) -> ApiResult<Value> {
     let mut reconciled_provider_response = None;
     if let Some(previous) = previous_attempt(db, user_id, command).await? {
+        if let Some(response) = reusable_succeeded_response(&previous)? {
+            return Ok(response);
+        }
+        let execution_permit_only = is_execution_permit_only(&previous);
+        if !execution_permit_only
+            && matches!(previous.state.as_str(), "running" | "unknown" | "retrying")
+        {
+            if let Some(response) = recover_materialized_reminder(db, user_id, command).await? {
+                return Ok(response);
+            }
+        }
         match previous.state.as_str() {
-            "succeeded" => return parse_response(previous.response_json.as_deref()),
             "running" | "unknown" | "retrying"
-                if provider_config.mode() == providers::ActionProviderMode::External =>
+                if !execution_permit_only
+                    && provider_config.mode() == providers::ActionProviderMode::External =>
             {
                 let provider_idempotency_key = previous.provider_idempotency_key.clone();
                 let status = providers::status(
@@ -95,14 +404,12 @@ pub async fn execute(
                     }
                     providers::ProviderDeliveryState::Failed => {
                         if command.intent == "send_message" {
-                            mark_message_delivery(
-                                db,
-                                user_id,
-                                &command.id,
-                                "failed",
-                                status.provider_id.as_deref(),
-                            )
-                            .await?;
+                            let response = providers::ProviderResponse {
+                                provider_id: status.provider_id,
+                                state: status.state,
+                            };
+                            bind_message_delivery(db, user_id, &command.id, "failed", &response)
+                                .await?;
                         }
                         return Err(ApiError::new(
                             424,
@@ -120,7 +427,7 @@ pub async fn execute(
                 }
             }
             "running" | "unknown" | "retrying"
-                if !provider_config.mode().local_effects_allowed() =>
+                if !execution_permit_only && !provider_config.mode().local_effects_allowed() =>
             {
                 return Err(ApiError::new(
                     503,
@@ -135,18 +442,23 @@ pub async fn execute(
         }
     }
 
-    commands::validate_action_args(&command.intent, args)
+    let recovered_provider_success = reconciled_provider_response.is_some();
+    validate_args_for_effect(&command.intent, args, recovered_provider_success)
         .map_err(|error| ApiError::validation(error.to_string()))?;
 
-    // Persist the provider-level running fence before making any external
-    // request. If the Worker stops during the request, the next outbox retry
-    // can reconcile this durable key through the provider status endpoint
-    // instead of blindly issuing a second send.
-    if matches!(
-        command.intent.as_str(),
-        "create_reminder" | "create_draft" | "send_message"
-    ) {
-        mark_attempt_running(db, user_id, command).await?;
+    // The outbox permit transaction already persisted an attempts=0 row under
+    // the exact command generation and lease. Advancing it to attempts>=1 is
+    // the boundary after which recovery must reconcile rather than assume no
+    // effect started. It never overwrites a concurrently succeeded attempt.
+    if reconciled_provider_response.is_none()
+        && matches!(
+            command.intent.as_str(),
+            "create_reminder" | "create_draft" | "send_message"
+        )
+    {
+        if let Some(response) = begin_effect_attempt(db, user_id, command, claim).await? {
+            return Ok(response);
+        }
     }
 
     match command.intent.as_str() {
@@ -199,7 +511,7 @@ pub async fn undo(
         "create_reminder" => (
             "reminders",
             "local.reminder",
-            "SELECT id, status, provider, provider_reminder_id FROM reminders WHERE user_id = ? AND command_id = ?",
+            REMINDER_EFFECT_SQL,
         ),
         "create_draft" => (
             "drafts",
@@ -209,7 +521,6 @@ pub async fn undo(
         _ => return Err(ApiError::conflict("Command is not currently undoable")),
     };
 
-    let now = db::now_iso();
     let effect = db::first::<EffectRow>(db, id_sql, vec![db::text(user_id), db::text(&command.id)])
         .await?
         .ok_or_else(|| ApiError::not_found("Command effect was not found"))?;
@@ -248,11 +559,10 @@ pub async fn undo(
             "command_idempotency_key": command.idempotency_key,
             "provider_id": provider_id,
         });
-        let existing = claim_cancel_attempt(db, user_id, command, &cancel_key).await?;
-        let response = if let Some(response) = existing {
-            response
-        } else {
-            match providers::cancel(
+        let claim = claim_cancel_attempt(db, user_id, command, &cancel_key).await?;
+        let response = match claim {
+            CancelAttemptClaim::ReuseSucceeded(response) => response,
+            CancelAttemptClaim::CallProvider => match providers::cancel(
                 env,
                 &provider_config,
                 "create_reminder",
@@ -276,129 +586,111 @@ pub async fn undo(
                     finish_cancel_attempt(db, &cancel_key, state, None, Some(&error)).await?;
                     return Err(error);
                 }
-            }
+            },
         };
+        providers::validate_cancellation_resource_identity(provider_id, &response)?;
         if let Some(error) = cancel_state_error(response.state) {
             return Err(error);
         }
     }
 
-    let result = json!({
-        "kind": "undo",
-        "provider": provider,
-        "effect_id": effect.id,
-        "status": "cancelled",
-        "already_cancelled": false,
-    });
-    let mut command_result = command
-        .result_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .unwrap_or_else(|| json!({}));
-    if let Some(object) = command_result.as_object_mut() {
-        object.insert("undo".to_string(), result.clone());
-    } else {
-        command_result = json!({"value": command_result, "undo": result});
-    }
-    let next_version = command.version + 1;
-    let statements = vec![
-        db::prepare(
-            db,
-            &format!(
-                "UPDATE {table} SET status = 'cancelled', updated_at = ? WHERE user_id = ? AND command_id = ? AND status IN ('scheduled', 'draft') AND EXISTS (SELECT 1 FROM commands WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ?)"
-            ),
-            vec![
-                db::text(&now),
-                db::text(user_id),
-                db::text(&command.id),
-                db::text(&command.id),
-                db::text(user_id),
-                db::number(command.version),
-            ],
-        )?,
-        db::prepare(
-            db,
-            "UPDATE commands SET result_json = ?, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state = 'succeeded' AND version = ? AND changes() = 1",
-            vec![
-                db::text(&command_result.to_string()),
-                db::number(next_version),
-                db::text(&now),
-                db::text(&command.id),
-                db::text(user_id),
-                db::number(command.version),
-            ],
-        )?,
-        db::prepare(
-            db,
-            "INSERT INTO audit_logs (id, user_id, session_id, action, metadata_json, created_at) SELECT ?, ?, ?, 'command.undo', ?, ? WHERE changes() = 1",
-            vec![
-                db::text(&new_id("aud")?),
-                db::text(user_id),
-                db::optional_text(command.session_id.as_deref()),
-                db::text(&json!({"command_id": command.id, "effect_id": effect.id, "version": next_version}).to_string()),
-                db::text(&now),
-            ],
-        )?,
-        db::prepare(
-            db,
-            "INSERT INTO phone_changes (user_id, entity_type, entity_id, session_id, version, created_at) SELECT ?, 'command', ?, ?, ?, ? WHERE changes() = 1",
-            vec![
-                db::text(user_id),
-                db::text(&command.id),
-                db::optional_text(command.session_id.as_deref()),
-                db::number(next_version),
-                db::text(&now),
-            ],
-        )?,
-    ];
-    let results = db.batch(statements).await?;
-    if results.get(1).map(db::changes).unwrap_or(0) == 0 {
-        let current =
-            db::first::<EffectRow>(db, id_sql, vec![db::text(user_id), db::text(&command.id)])
-                .await?;
-        if current
-            .as_ref()
-            .is_some_and(|row| row.status == "cancelled")
-        {
-            return Ok(json!({
-                "kind": "undo",
-                "provider": provider,
-                "effect_id": effect.id,
-                "status": "cancelled",
-                "already_cancelled": true,
-            }));
-        }
-        return Err(ApiError::conflict("Command was already undone or changed"));
-    }
-    Ok(result)
+    finalize_undo_transaction(db, user_id, command, &effect, &provider, table, id_sql).await
 }
 
-/// Reconcile external reminder cancellations after an inline Undo request
+/// Finish the local transaction for provider cancellations that already
+/// succeeded. This path deliberately needs neither an Env nor provider
+/// configuration: the external side effect is terminal and must be reflected
+/// in D1 regardless of its age or the current adapter configuration.
+pub async fn reconcile_succeeded_cancellations(db: &D1Database) -> ApiResult<usize> {
+    let rows: Vec<CancelReconciliationRow> =
+        db::all(db, succeeded_cancel_reconciliation_sql(), vec![]).await?;
+
+    let mut processed = 0;
+    for row in rows {
+        if !is_succeeded_cancel_reconciliation_row(&row) {
+            continue;
+        }
+        let Some(command) = commands::get_for_user(db, &row.user_id, &row.command_id).await? else {
+            continue;
+        };
+        if command.state != "succeeded" || command.intent != "create_reminder" {
+            continue;
+        }
+        let Some(effect) = db::first::<EffectRow>(
+            db,
+            REMINDER_EFFECT_SQL,
+            vec![db::text(&row.user_id), db::text(&row.command_id)],
+        )
+        .await?
+        else {
+            continue;
+        };
+        if effect.status != "scheduled" {
+            continue;
+        }
+        let Some(expected_provider_id) = effect.provider_reminder_id.as_deref() else {
+            continue;
+        };
+        let response = succeeded_cancel_response(row.attempt_response_json.as_deref());
+        if providers::validate_cancellation_resource_identity(expected_provider_id, &response)
+            .is_err()
+        {
+            continue;
+        }
+        let provider = effect
+            .provider
+            .as_deref()
+            .unwrap_or("external.reminder")
+            .to_string();
+        if finalize_undo_transaction(
+            db,
+            &row.user_id,
+            &command,
+            &effect,
+            &provider,
+            "reminders",
+            REMINDER_EFFECT_SQL,
+        )
+        .await
+        .is_ok()
+        {
+            processed += 1;
+        }
+    }
+    Ok(processed)
+}
+
+/// Reconcile nonterminal external reminder cancellations after an inline Undo
 /// returned pending/unknown or the Worker stopped while the provider call was
-/// in flight. The provider idempotency key is retained in action_attempts;
-/// calling undo again reuses that key and only changes local state after the
-/// provider reports a terminal cancellation state.
+/// in flight. This path may call the provider and therefore only runs with an
+/// explicitly external provider configuration.
 pub async fn reconcile_external_cancellations(
     env: &Env,
     db: &D1Database,
     provider_config: ActionProviderConfig,
 ) -> ApiResult<usize> {
-    if provider_config.mode() != providers::ActionProviderMode::External {
+    if !pending_cancel_reconciliation_enabled(provider_config.mode()) {
         return Ok(0);
     }
     let cutoff = db::add_seconds_iso(-CANCEL_LEASE_SECONDS);
     let rows: Vec<CancelReconciliationRow> = db::all(
         db,
-        "SELECT user_id, command_id FROM action_attempts WHERE provider = 'external.reminder.cancel' AND user_id IS NOT NULL AND command_id IS NOT NULL AND (state IN ('unknown', 'retrying') OR (state = 'running' AND updated_at <= ?)) ORDER BY updated_at ASC LIMIT 20",
+        pending_cancel_reconciliation_sql(),
         vec![db::text(&cutoff)],
     )
     .await?;
 
     let mut processed = 0;
     for row in rows {
+        if !is_pending_cancel_reconciliation_row(&row) {
+            continue;
+        }
         let Some(command) = commands::get_for_user(db, &row.user_id, &row.command_id).await? else {
             continue;
         };
+        if command.state != "succeeded" || command.intent != "create_reminder" {
+            continue;
+        }
         let _ = undo(env, db, &row.user_id, &command, provider_config.clone()).await;
         processed += 1;
     }
@@ -419,7 +711,10 @@ async fn create_reminder(
     }
     let title = required_string(args, &["title", "text", "message"], MAX_TITLE, "title")?;
     let due_at = required_string(args, &["due_at", "time", "datetime"], 64, "due_at")?;
-    if db::is_expired(due_at) {
+    // A fresh effect must never create a past reminder. A reconciled provider
+    // success is different: the external effect already happened, so recovery
+    // must materialize that exact result without another delivery call.
+    if reconciled_provider_response.is_none() && db::is_expired(due_at) {
         return Err(ApiError::validation("due_at must be in the future"));
     }
     let external = provider_config.mode() == providers::ActionProviderMode::External;
@@ -621,6 +916,12 @@ async fn queue_message(
     } else {
         None
     };
+    if let Some(response) = provider_response.as_ref() {
+        // Validate response-local requirements before the INSERT can bind a
+        // newly materialized row. Existing identities are checked atomically
+        // by bind_message_delivery and then against its canonical readback.
+        providers::validate_message_resource_identity(None, response)?;
+    }
     if !external && !provider_config.mode().local_effects_allowed() {
         return Err(providers::unavailable(
             provider_config.mode(),
@@ -638,13 +939,7 @@ async fn queue_message(
         .as_ref()
         .map(|response| response.state)
         .unwrap_or(providers::ProviderDeliveryState::Succeeded);
-    let delivery_state = match provider_state {
-        providers::ProviderDeliveryState::Succeeded => "sent",
-        providers::ProviderDeliveryState::Failed => "failed",
-        providers::ProviderDeliveryState::Pending | providers::ProviderDeliveryState::Unknown => {
-            "queued"
-        }
-    };
+    let delivery_state = message_delivery_state(external, provider_state);
     db::run(
         db,
         "INSERT OR IGNORE INTO outbound_messages (id, user_id, command_id, session_id, recipient, body, provider, delivery_state, provider_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -667,47 +962,24 @@ async fn queue_message(
         ],
     )
     .await?;
-    if external {
-        db::run(
+    let effect = if let Some(provider_response) = provider_response.as_ref() {
+        bind_message_delivery(db, user_id, &command.id, delivery_state, provider_response).await?
+    } else {
+        db::first(
             db,
-            "UPDATE outbound_messages SET delivery_state = ?, provider_message_id = COALESCE(?, provider_message_id), updated_at = ? WHERE user_id = ? AND command_id = ?",
-            vec![
-                db::text(delivery_state),
-                db::optional_text(
-                    provider_response
-                        .as_ref()
-                        .and_then(|value| value.provider_id.as_deref()),
-                ),
-                db::text(&now),
-                db::text(user_id),
-                db::text(&command.id),
-            ],
+            message_effect_sql(),
+            vec![db::text(user_id), db::text(&command.id)],
         )
-        .await?;
+        .await?
     }
-    let effect: EffectRow = db::first(
-        db,
-        "SELECT id, delivery_state AS status, NULL AS provider FROM outbound_messages WHERE user_id = ? AND command_id = ?",
-        vec![db::text(user_id), db::text(&command.id)],
-    )
-    .await?
-    .ok_or_else(|| ApiError::new(500, "effect_error", "Message queue record was not persisted"))?;
-    let response = json!({
-        "kind": "message",
-        "message_id": effect.id,
-        "delivery_state": effect.status,
-        "provider": provider,
-        "external_delivery": if !external {
-            "not_configured"
-        } else if provider_state == providers::ProviderDeliveryState::Succeeded {
-            "sent"
-        } else if provider_state == providers::ProviderDeliveryState::Failed {
-            "rejected"
-        } else {
-            "accepted"
-        },
-        "provider_id": provider_response.as_ref().and_then(|value| value.provider_id.clone()),
-    });
+    .ok_or_else(|| {
+        ApiError::new(
+            500,
+            "effect_error",
+            "Message queue record was not persisted",
+        )
+    })?;
+    let response = materialized_message_response(&effect, provider, external);
     if external && provider_state != providers::ProviderDeliveryState::Succeeded {
         return Err(provider_state_error("message", provider_state)
             .expect("non-success provider state must have an error"));
@@ -751,26 +1023,45 @@ fn provider_state_error(effect: &str, state: providers::ProviderDeliveryState) -
     }
 }
 
-async fn mark_message_delivery(
+async fn bind_message_delivery(
     db: &D1Database,
     user_id: &str,
     command_id: &str,
     delivery_state: &str,
-    provider_id: Option<&str>,
-) -> ApiResult<()> {
+    response: &providers::ProviderResponse,
+) -> ApiResult<Option<MessageEffectRow>> {
+    // This catches a succeeded response with no stable identity before any
+    // local mutation. A returned identity is compared inside the UPDATE so a
+    // response for B cannot change the delivery state or identity of A.
+    providers::validate_message_resource_identity(None, response)?;
+    let provider_id = response.provider_id.as_deref();
     db::run(
         db,
-        "UPDATE outbound_messages SET delivery_state = ?, provider_message_id = COALESCE(?, provider_message_id), updated_at = ? WHERE user_id = ? AND command_id = ?",
+        bind_message_delivery_sql(),
         vec![
             db::text(delivery_state),
             db::optional_text(provider_id),
             db::text(&db::now_iso()),
             db::text(user_id),
             db::text(command_id),
+            db::optional_text(provider_id),
+            db::optional_text(provider_id),
         ],
     )
     .await?;
-    Ok(())
+    let effect = db::first::<MessageEffectRow>(
+        db,
+        message_effect_sql(),
+        vec![db::text(user_id), db::text(command_id)],
+    )
+    .await?;
+    if let Some(effect) = effect.as_ref() {
+        providers::validate_message_resource_identity(
+            effect.provider_message_id.as_deref(),
+            response,
+        )?;
+    }
+    Ok(effect)
 }
 
 async fn previous_attempt(
@@ -780,17 +1071,31 @@ async fn previous_attempt(
 ) -> ApiResult<Option<EffectAttemptRow>> {
     db::first(
         db,
-        "SELECT provider, provider_idempotency_key, state, response_json FROM action_attempts WHERE command_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT provider, provider_idempotency_key, state, response_json, attempts FROM action_attempts WHERE command_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1",
         vec![db::text(&command.id), db::text(user_id)],
     )
     .await
 }
 
-async fn mark_attempt_running(
+fn begin_effect_attempt_sql() -> String {
+    let effect_may_have_started =
+        commands::ACTION_EFFECT_MAY_HAVE_STARTED_SQL.replace("commands.", "active_command.");
+    format!(
+        "UPDATE action_attempts SET state = 'running', attempts = attempts + 1, response_json = NULL, next_attempt_at = NULL, last_error = NULL, updated_at = ? WHERE user_id = ? AND command_id = ? AND provider = ? AND provider_idempotency_key = ? AND request_hash = ? AND state IN ('running', 'retrying', 'unknown') AND EXISTS (SELECT 1 FROM commands AS active_command JOIN outbox_events AS active_claim ON active_claim.user_id = active_command.user_id AND active_claim.aggregate_id = active_command.id WHERE active_command.id = ? AND active_command.user_id = ? AND active_command.state = 'running' AND active_command.version = ? AND (active_command.session_id IS NULL OR EXISTS (SELECT 1 FROM sessions AS effect_session WHERE effect_session.id = active_command.session_id AND effect_session.user_id = active_command.user_id AND effect_session.deleted_at IS NULL) OR {effect_may_have_started}) AND active_claim.id = ? AND active_claim.user_id = ? AND active_claim.topic = ? AND active_claim.topic = 'command.execute' AND active_claim.aggregate_id = ? AND active_claim.idempotency_key = ? AND active_claim.state = 'running' AND active_claim.lease_token = ? AND active_claim.lease_expires_at IS NOT NULL AND active_claim.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+    )
+}
+
+async fn begin_effect_attempt(
     db: &D1Database,
     user_id: &str,
     command: &CommandRow,
-) -> ApiResult<()> {
+    claim: &OutboxEventRow,
+) -> ApiResult<Option<Value>> {
+    let Some(lease_token) = claim.lease_token.as_deref() else {
+        return Err(ApiError::conflict(
+            "The durable effect permit has no active outbox lease",
+        ));
+    };
     let provider =
         providers::action_attempt_provider(&command.intent).unwrap_or(command.intent.as_str());
     let provider_idempotency_key = providers::scoped_action_idempotency_key(
@@ -798,23 +1103,40 @@ async fn mark_attempt_running(
         &command.intent,
         &command.idempotency_key,
     );
-    let now = db::now_iso();
-    db::run(
+    let sql = begin_effect_attempt_sql();
+    let result = db::run(
         db,
-        "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?, 'running', ?, NULL, 1, NULL, NULL, ?, ?) ON CONFLICT(provider, provider_idempotency_key) DO UPDATE SET state = 'running', attempts = action_attempts.attempts + 1, response_json = NULL, next_attempt_at = NULL, last_error = NULL, updated_at = excluded.updated_at",
+        &sql,
         vec![
-            db::text(&new_id("attempt")?),
+            db::text(&db::now_iso()),
             db::text(user_id),
             db::text(&command.id),
             db::text(provider),
             db::text(&provider_idempotency_key),
             db::text(&command.command_hash),
-            db::text(&command.created_at),
-            db::text(&now),
+            db::text(&command.id),
+            db::text(user_id),
+            db::number(command.version),
+            db::text(&claim.id),
+            db::text(user_id),
+            db::text(&claim.topic),
+            db::text(&claim.aggregate_id),
+            db::text(&claim.idempotency_key),
+            db::text(lease_token),
         ],
     )
     .await?;
-    Ok(())
+    if db::changes(&result) == 1 {
+        return Ok(None);
+    }
+    if let Some(current) = previous_attempt(db, user_id, command).await? {
+        if let Some(response) = reusable_succeeded_response(&current)? {
+            return Ok(Some(response));
+        }
+    }
+    Err(ApiError::conflict(
+        "The durable effect permit is no longer active",
+    ))
 }
 
 async fn record_attempt(
@@ -881,7 +1203,7 @@ async fn claim_cancel_attempt(
     user_id: &str,
     command: &CommandRow,
     provider_idempotency_key: &str,
-) -> ApiResult<Option<providers::ProviderResponse>> {
+) -> ApiResult<CancelAttemptClaim> {
     let provider = "external.reminder.cancel";
     let now = db::now_iso();
     let inserted = db::run(
@@ -900,7 +1222,7 @@ async fn claim_cancel_attempt(
     )
     .await?;
     if db::changes(&inserted) == 1 {
-        return Ok(None);
+        return Ok(CancelAttemptClaim::CallProvider);
     }
 
     let existing: CancelAttemptRow = db::first(
@@ -911,21 +1233,8 @@ async fn claim_cancel_attempt(
     .await?
     .ok_or_else(|| ApiError::new(500, "provider_cancel_error", "Cancellation fence disappeared"))?;
 
-    if existing.state == "succeeded" {
-        let provider_id = existing
-            .response_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|value| {
-                value
-                    .get("provider_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-        return Ok(Some(providers::ProviderResponse {
-            provider_id,
-            state: providers::ProviderDeliveryState::Succeeded,
-        }));
+    if let Some(claim) = succeeded_cancel_claim(&existing) {
+        return Ok(claim);
     }
 
     if existing.state == "running"
@@ -943,7 +1252,7 @@ async fn claim_cancel_attempt(
         )
         .await?;
         if db::changes(&reclaimed) == 1 {
-            return Ok(None);
+            return Ok(CancelAttemptClaim::CallProvider);
         }
     }
 
@@ -959,7 +1268,7 @@ async fn claim_cancel_attempt(
         )
         .await?;
         if db::changes(&reclaimed) == 1 {
-            return Ok(None);
+            return Ok(CancelAttemptClaim::CallProvider);
         }
     }
 
@@ -968,6 +1277,32 @@ async fn claim_cancel_attempt(
         "provider_cancel_in_progress",
         "Another request is already cancelling this reminder",
     ))
+}
+
+fn succeeded_cancel_claim(existing: &CancelAttemptRow) -> Option<CancelAttemptClaim> {
+    if existing.state != "succeeded" {
+        return None;
+    }
+    Some(CancelAttemptClaim::ReuseSucceeded(
+        succeeded_cancel_response(existing.response_json.as_deref()),
+    ))
+}
+
+fn succeeded_cancel_response(response_json: Option<&str>) -> providers::ProviderResponse {
+    let provider_id = response_json
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("provider_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+    providers::ProviderResponse {
+        provider_id,
+        state: providers::ProviderDeliveryState::Succeeded,
+    }
 }
 
 async fn finish_cancel_attempt(
@@ -1041,6 +1376,41 @@ fn optional_string<'a>(
 mod tests {
     use super::*;
 
+    fn succeeded_reminder_command(version: i64) -> CommandRow {
+        CommandRow {
+            id: "cmd_post_crash".to_string(),
+            user_id: "usr_test".to_string(),
+            device_id: None,
+            session_id: Some("ses_test".to_string()),
+            schema_version: 1,
+            intent: "create_reminder".to_string(),
+            args_json: json!({"title": "Call John", "due_at": "2026-08-12T13:00:00Z"}).to_string(),
+            risk_level: "low".to_string(),
+            needs_confirmation: 0,
+            idempotency_key: "idem_post_crash".to_string(),
+            confidence: None,
+            locale: "en".to_string(),
+            timezone: "Asia/Hong_Kong".to_string(),
+            state: "succeeded".to_string(),
+            command_hash: "hash_post_crash".to_string(),
+            result_json: Some(
+                json!({
+                    "kind": "reminder",
+                    "provider": "external.reminder",
+                    "provider_id": "provider-reminder-1",
+                    "status": "scheduled",
+                })
+                .to_string(),
+            ),
+            error_code: None,
+            expires_at: None,
+            model_version: None,
+            version,
+            created_at: "2026-08-11T23:00:00.000Z".to_string(),
+            updated_at: "2026-08-11T23:00:00.000Z".to_string(),
+        }
+    }
+
     #[test]
     fn required_fields_accept_aliases_and_trim_input() {
         let args = serde_json::from_value::<Map<String, Value>>(json!({
@@ -1061,6 +1431,118 @@ mod tests {
     }
 
     #[test]
+    fn succeeded_attempt_reuses_exact_result_after_reminder_deadline_elapsed() {
+        let args = serde_json::from_value::<Map<String, Value>>(json!({
+            "title": "Call John",
+            "due_at": "2020-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        assert!(commands::validate_action_args_shape("create_reminder", &args).is_ok());
+        assert!(commands::validate_action_args("create_reminder", &args).is_err());
+
+        let expected = json!({
+            "kind": "reminder",
+            "provider": "external.reminder",
+            "provider_id": "provider-reminder-1",
+            "status": "scheduled",
+        });
+        let attempt = EffectAttemptRow {
+            provider: "action.reminder".to_string(),
+            provider_idempotency_key: "scoped-idem".to_string(),
+            state: "succeeded".to_string(),
+            response_json: Some(expected.to_string()),
+            attempts: 1,
+        };
+
+        let mut provider_calls = 0;
+        let result = match reusable_succeeded_response(&attempt).unwrap() {
+            Some(response) => response,
+            None => {
+                provider_calls += 1;
+                json!(null)
+            }
+        };
+        assert_eq!(provider_calls, 0);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn zero_attempt_running_row_is_a_permit_not_an_unknown_provider_call() {
+        let mut attempt = EffectAttemptRow {
+            provider: "action.reminder".to_string(),
+            provider_idempotency_key: "scoped-idem".to_string(),
+            state: "running".to_string(),
+            response_json: None,
+            attempts: 0,
+        };
+        assert!(is_execution_permit_only(&attempt));
+
+        attempt.attempts = 1;
+        assert!(!is_execution_permit_only(&attempt));
+        attempt.attempts = 0;
+        attempt.state = "retrying".to_string();
+        assert!(!is_execution_permit_only(&attempt));
+    }
+
+    #[test]
+    fn beginning_an_effect_requires_exact_active_claim_and_command_generation() {
+        let sql = begin_effect_attempt_sql();
+        assert!(sql.contains("active_command.state = 'running'"));
+        assert!(sql.contains("active_command.version = ?"));
+        assert!(sql.contains("effect_session.id = active_command.session_id"));
+        assert!(sql.contains("effect_session.user_id = active_command.user_id"));
+        assert!(sql.contains("effect_session.deleted_at IS NULL"));
+        assert!(sql.contains("started_attempt.command_id = active_command.id"));
+        assert!(sql.contains("started_attempt.user_id = active_command.user_id"));
+        assert!(sql.contains("started_attempt.attempts >= 1"));
+        assert!(sql.contains("active_claim.topic = 'command.execute'"));
+        assert!(sql.contains("active_claim.aggregate_id = active_command.id"));
+        assert!(sql.contains("active_claim.lease_token = ?"));
+        assert!(
+            sql.contains("active_claim.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+        );
+        assert_eq!(sql.bytes().filter(|byte| *byte == b'?').count(), 15);
+    }
+
+    #[test]
+    fn reconciled_provider_success_bypasses_only_elapsed_deadline() {
+        let past_due = serde_json::from_value::<Map<String, Value>>(json!({
+            "title": "Call John",
+            "due_at": "2020-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        assert!(validate_args_for_effect("create_reminder", &past_due, true).is_ok());
+        assert!(validate_args_for_effect("create_reminder", &past_due, false).is_err());
+
+        let malformed = serde_json::from_value::<Map<String, Value>>(json!({
+            "title": "Call John",
+            "due_at": "not-a-timestamp",
+        }))
+        .unwrap();
+        assert!(validate_args_for_effect("create_reminder", &malformed, true).is_err());
+    }
+
+    #[test]
+    fn materialized_reminder_recovery_preserves_elapsed_effect_without_redelivery() {
+        let row = MaterializedReminderRow {
+            id: "rem_local".to_string(),
+            status: "scheduled".to_string(),
+            title: "Call John".to_string(),
+            due_at: "2020-01-01T00:00:00Z".to_string(),
+            timezone: "UTC".to_string(),
+            provider: "local.reminder".to_string(),
+            provider_reminder_id: None,
+        };
+        let response = materialized_reminder_response(&row);
+
+        assert_eq!(response["reminder_id"], json!("rem_local"));
+        assert_eq!(response["due_at"], json!("2020-01-01T00:00:00Z"));
+        assert_eq!(response["provider"], json!("local.reminder"));
+        assert_eq!(response["external_delivery"], Value::Null);
+        assert_eq!(response["provider_id"], Value::Null);
+    }
+
+    #[test]
     fn external_provider_non_success_states_are_retryable_or_explicit_failure() {
         assert_eq!(
             provider_state_error("reminder", providers::ProviderDeliveryState::Pending)
@@ -1077,5 +1559,209 @@ mod tests {
         assert!(
             provider_state_error("reminder", providers::ProviderDeliveryState::Succeeded).is_none()
         );
+    }
+
+    #[test]
+    fn message_identity_binding_is_atomic_and_responses_use_the_canonical_id() {
+        let sql = bind_message_delivery_sql();
+        assert!(sql.contains("provider_message_id = COALESCE(provider_message_id, ?)"));
+        assert!(sql
+            .contains("AND (? IS NULL OR provider_message_id IS NULL OR provider_message_id = ?)"));
+        assert_eq!(sql.matches('?').count(), 7);
+
+        let canonical = MessageEffectRow {
+            id: "msg-local-1".to_string(),
+            delivery_state: "sent".to_string(),
+            provider_message_id: Some("provider-message-a".to_string()),
+        };
+        let response = materialized_message_response(&canonical, "external.message", true);
+        assert_eq!(response["message_id"], json!("msg-local-1"));
+        assert_eq!(response["delivery_state"], json!("sent"));
+        assert_eq!(response["external_delivery"], json!("sent"));
+        assert_eq!(response["provider_id"], json!("provider-message-a"));
+    }
+
+    #[test]
+    fn internal_message_simulation_stays_queued_and_non_delivered() {
+        assert_eq!(
+            message_delivery_state(false, providers::ProviderDeliveryState::Succeeded),
+            "queued"
+        );
+
+        let local = MessageEffectRow {
+            id: "msg-local-1".to_string(),
+            delivery_state: "queued".to_string(),
+            provider_message_id: None,
+        };
+        let response = materialized_message_response(&local, "internal.outbox", false);
+        assert_eq!(response["delivery_state"], json!("queued"));
+        assert_eq!(response["external_delivery"], json!("not_configured"));
+        assert_eq!(response["provider_id"], Value::Null);
+    }
+
+    #[test]
+    fn succeeded_cancel_attempt_reuses_response_without_another_provider_call() {
+        // This is the durable state left if the Worker stops after persisting
+        // provider success but before the local finalization batch.
+        let attempt = CancelAttemptRow {
+            state: "succeeded".to_string(),
+            response_json: Some(
+                json!({
+                    "provider_id": "provider-reminder-1",
+                    "state": "succeeded",
+                })
+                .to_string(),
+            ),
+            updated_at: "2026-08-11T23:00:00.000Z".to_string(),
+        };
+
+        let claim = succeeded_cancel_claim(&attempt).expect("success must be reusable");
+        let (provider_calls, response) = match claim {
+            CancelAttemptClaim::CallProvider => (1, None),
+            CancelAttemptClaim::ReuseSucceeded(response) => (0, Some(response)),
+        };
+
+        assert_eq!(provider_calls, 0);
+        let response = response.expect("the persisted response must be returned");
+        assert_eq!(response.provider_id.as_deref(), Some("provider-reminder-1"));
+        assert_eq!(response.state, providers::ProviderDeliveryState::Succeeded);
+        assert!(providers::validate_cancellation_resource_identity(
+            "provider-reminder-1",
+            &response
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn succeeded_cancel_replay_never_authorizes_a_different_resource() {
+        for response_json in [
+            json!({"state": "succeeded"}).to_string(),
+            json!({
+                "provider_id": "provider-reminder-other",
+                "state": "succeeded",
+            })
+            .to_string(),
+        ] {
+            let attempt = CancelAttemptRow {
+                state: "succeeded".to_string(),
+                response_json: Some(response_json),
+                updated_at: "2026-08-11T23:00:00.000Z".to_string(),
+            };
+            let claim = succeeded_cancel_claim(&attempt).expect("success is replayable");
+            let response = match claim {
+                CancelAttemptClaim::CallProvider => panic!("replay repeated the provider call"),
+                CancelAttemptClaim::ReuseSucceeded(response) => response,
+            };
+            assert_eq!(
+                providers::validate_cancellation_resource_identity(
+                    "provider-reminder-1",
+                    &response,
+                )
+                .unwrap_err()
+                .code,
+                "provider_cancel_mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn succeeded_cancel_reconciliation_is_provider_and_age_independent() {
+        let query = succeeded_cancel_reconciliation_sql();
+        assert!(query.contains("reminder.status = 'scheduled'"));
+        assert!(query.contains("command.state = 'succeeded'"));
+        assert!(query.contains("attempt.state = 'succeeded'"));
+        assert!(!query.contains("attempt.updated_at <="));
+        assert!(!query.contains('?'));
+
+        let mut row = CancelReconciliationRow {
+            user_id: "usr_test".to_string(),
+            command_id: "cmd_post_crash".to_string(),
+            attempt_state: "succeeded".to_string(),
+            attempt_response_json: Some(
+                json!({"provider_id": "provider-reminder-1", "state": "succeeded"}).to_string(),
+            ),
+        };
+        assert!(is_succeeded_cancel_reconciliation_row(&row));
+        assert!(query.contains("attempt.response_json AS attempt_response_json"));
+        assert!(providers::validate_cancellation_resource_identity(
+            "provider-reminder-1",
+            &succeeded_cancel_response(row.attempt_response_json.as_deref()),
+        )
+        .is_ok());
+        row.attempt_response_json = Some(
+            json!({"provider_id": "provider-reminder-other", "state": "succeeded"}).to_string(),
+        );
+        assert!(providers::validate_cancellation_resource_identity(
+            "provider-reminder-1",
+            &succeeded_cancel_response(row.attempt_response_json.as_deref()),
+        )
+        .is_err());
+        row.attempt_state = "unknown".to_string();
+        assert!(!is_succeeded_cancel_reconciliation_row(&row));
+
+        let command = succeeded_reminder_command(7);
+        let finalization = build_undo_finalization(&command, "reminder-1", "external.reminder");
+
+        assert_eq!(
+            finalization.result,
+            json!({
+                "kind": "undo",
+                "provider": "external.reminder",
+                "effect_id": "reminder-1",
+                "status": "cancelled",
+                "already_cancelled": false,
+            })
+        );
+        assert_eq!(finalization.command_result["undo"], finalization.result);
+        assert_eq!(finalization.next_version, 8);
+
+        let effect_update = undo_effect_update_sql("reminders");
+        let transaction_sql = [
+            effect_update.as_str(),
+            undo_command_update_sql(),
+            undo_audit_insert_sql(),
+            undo_phone_change_insert_sql(),
+        ];
+        assert!(effect_update.starts_with("UPDATE reminders SET status = 'cancelled'"));
+        assert!(effect_update.contains("status IN ('scheduled', 'draft')"));
+        assert!(effect_update.contains("state = 'succeeded' AND version = ?"));
+        assert!(undo_command_update_sql().contains("version = ? AND changes() = 1"));
+        assert_eq!(
+            transaction_sql
+                .iter()
+                .filter(|sql| sql.contains("INSERT INTO phone_changes"))
+                .count(),
+            1
+        );
+        assert!(undo_phone_change_insert_sql().ends_with("WHERE changes() = 1"));
+    }
+
+    #[test]
+    fn pending_cancel_reconciliation_requires_external_mode_and_running_lease_age() {
+        let query = pending_cancel_reconciliation_sql();
+        assert!(query.contains("attempt.state IN ('unknown', 'retrying')"));
+        assert!(query.contains("attempt.state = 'running' AND attempt.updated_at <= ?"));
+        assert!(!query.contains("attempt.state = 'succeeded'"));
+        assert_eq!(query.matches('?').count(), 1);
+
+        assert!(pending_cancel_reconciliation_enabled(
+            providers::ActionProviderMode::External
+        ));
+        assert!(!pending_cancel_reconciliation_enabled(
+            providers::ActionProviderMode::Internal
+        ));
+        assert!(!pending_cancel_reconciliation_enabled(
+            providers::ActionProviderMode::Disabled
+        ));
+
+        let mut row = CancelReconciliationRow {
+            user_id: "usr_test".to_string(),
+            command_id: "cmd_pending".to_string(),
+            attempt_state: "running".to_string(),
+            attempt_response_json: None,
+        };
+        assert!(is_pending_cancel_reconciliation_row(&row));
+        row.attempt_state = "succeeded".to_string();
+        assert!(!is_pending_cancel_reconciliation_row(&row));
     }
 }

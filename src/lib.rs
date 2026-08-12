@@ -18,6 +18,7 @@ mod reminders;
 mod sessions;
 mod skills;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -60,6 +61,18 @@ struct ConfirmationRequest {
     confirmation_token: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceModelManifest {
+    schema_version: i32,
+    model_id: String,
+    model_version: String,
+    sha256: String,
+    signature: String,
+    size_bytes: u64,
+    minimum_capability: String,
+}
+
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let origin = req.headers().get("origin").ok().flatten();
@@ -87,17 +100,63 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// adapters remain unknown/retryable instead of being reported as success.
 #[event(scheduled)]
 pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    if runtime_configuration(&env).is_err() {
+    if let Err(error) = runtime_configuration(&env) {
+        worker::console_error!(
+            "scheduled pass skipped: runtime configuration failed ({}; status {})",
+            error.code,
+            error.status
+        );
         return;
     }
-    if let Ok(db) = env.d1("DB") {
-        let _ = outbox::drain(&db, &env).await;
-        if let Ok(provider_config) = providers::load(&env) {
-            let _ =
-                action_effects::reconcile_external_cancellations(&env, &db, provider_config).await;
+    let Ok(db) = env.d1("DB") else {
+        worker::console_error!("scheduled pass skipped: DB binding is unavailable");
+        return;
+    };
+    if let Err(error) = action_effects::reconcile_succeeded_cancellations(&db).await {
+        worker::console_error!(
+            "scheduled cancellation reconciliation failed ({}; status {})",
+            error.code,
+            error.status
+        );
+    }
+    if let Err(error) = outbox::drain(&db, &env).await {
+        worker::console_error!(
+            "scheduled outbox drain left unsettled work ({}; status {})",
+            error.code,
+            error.status
+        );
+    }
+    match providers::load(&env) {
+        Ok(provider_config) => {
+            if let Err(error) =
+                action_effects::reconcile_external_cancellations(&env, &db, provider_config).await
+            {
+                worker::console_error!(
+                    "scheduled external cancellation reconciliation failed ({}; status {})",
+                    error.code,
+                    error.status
+                );
+            }
         }
-        let _ = reminders::drain_due(&db, &env).await;
-        let _ = history::purge_expired_all(&db, &env).await;
+        Err(error) => worker::console_error!(
+            "scheduled provider configuration failed ({}; status {})",
+            error.code,
+            error.status
+        ),
+    }
+    if let Err(error) = reminders::drain_due(&db, &env).await {
+        worker::console_error!(
+            "scheduled reminder drain failed ({}; status {})",
+            error.code,
+            error.status
+        );
+    }
+    if let Err(error) = history::purge_expired_all(&db, &env).await {
+        worker::console_error!(
+            "scheduled history purge failed ({}; status {})",
+            error.code,
+            error.status
+        );
     }
 }
 
@@ -249,6 +308,9 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         (Method::Get, ["v1", "phone", "models", model_id]) => {
             phone_model_descriptor(&req, &env, &db, model_id).await
         }
+        (Method::Get, ["v1", "phone", "models", model_id, "artifact"]) => {
+            phone_model_artifact(&req, &env, &db, model_id).await
+        }
         (Method::Get, ["v1", "phone", "retrievals", retrieval_id, "download"]) => {
             phone_retrieval_download(&req, &env, &db, retrieval_id).await
         }
@@ -350,7 +412,14 @@ fn decode_json<T: DeserializeOwned>(body: &[u8]) -> ApiResult<T> {
 }
 
 fn json_response(value: Value, status: u16) -> ApiResult<Response> {
-    Ok(Response::from_json(&value)?.with_status(status))
+    let mut response = Response::from_json(&value)?.with_status(status);
+    // Authenticated phone payloads can contain command arguments, messages,
+    // retrieval snippets, and tokens. iOS owns an explicit SQLite cache, so
+    // intermediary/browser HTTP caches must not retain API JSON implicitly.
+    response
+        .headers_mut()
+        .set("cache-control", "private, no-store")?;
+    Ok(response)
 }
 
 fn query_value(request: &Request, name: &str) -> ApiResult<Option<String>> {
@@ -1380,37 +1449,64 @@ async fn phone_model_descriptor(
     model_id: &str,
 ) -> ApiResult<Response> {
     let _user = require_user(req, env, db).await?;
-    if model_id.is_empty()
-        || model_id.len() > 128
-        || !model_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
-    {
+    if !valid_model_id(model_id) {
         return Err(ApiError::validation("Invalid model id"));
     }
 
+    if config_value(env, "VOICE_MODEL_ENABLED", "false") != "true" {
+        return Err(ApiError::new(
+            503,
+            "model_unavailable",
+            "This model is not enabled for the current release",
+        ));
+    }
+
     let manifest_json = config_value(env, "VOICE_MODEL_MANIFEST_JSON", "");
-    let download_url = config_value(env, "VOICE_MODEL_URL", "");
-    if manifest_json.trim().is_empty() || download_url.trim().is_empty() {
+    if manifest_json.trim().is_empty() {
         return Err(ApiError::new(
             503,
             "model_unavailable",
             "This model is not configured for the current release",
         ));
     }
-    if !download_url.starts_with("https://")
-        && config_value(env, "ALLOW_INSECURE_MODEL_URL", "false") != "true"
-    {
-        return Err(ApiError::new(
-            503,
-            "model_unavailable",
-            "The configured model URL is not secure",
-        ));
-    }
-
     let manifest: Value = serde_json::from_str(&manifest_json)
         .map_err(|_| ApiError::new(503, "model_unavailable", "The model manifest is invalid"))?;
     validate_model_manifest(&manifest, model_id)?;
+
+    let r2_key = config_value(env, "VOICE_MODEL_R2_KEY", "");
+    let external_url = config_value(env, "VOICE_MODEL_URL", "");
+    let download_url = if !r2_key.trim().is_empty() {
+        if !valid_model_r2_key(&r2_key, model_id) {
+            return Err(ApiError::new(
+                503,
+                "model_unavailable",
+                "The configured model object key is invalid",
+            ));
+        }
+        let mut url = req.url().map_err(|_| {
+            ApiError::new(
+                503,
+                "model_unavailable",
+                "The model artifact URL could not be created",
+            )
+        })?;
+        url.set_path(&format!("/v1/phone/models/{model_id}/artifact"));
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
+    } else {
+        if external_url.trim().is_empty()
+            || (!external_url.starts_with("https://")
+                && config_value(env, "ALLOW_INSECURE_MODEL_URL", "false") != "true")
+        {
+            return Err(ApiError::new(
+                503,
+                "model_unavailable",
+                "The configured model URL is not secure",
+            ));
+        }
+        external_url
+    };
 
     let expires_at = config_value(env, "VOICE_MODEL_EXPIRES_AT", "");
     json_response(
@@ -1425,30 +1521,31 @@ async fn phone_model_descriptor(
 }
 
 fn validate_model_manifest(manifest: &Value, model_id: &str) -> ApiResult<()> {
-    let valid = manifest.get("schema_version").and_then(Value::as_i64) == Some(1)
-        && manifest.get("model_id").and_then(Value::as_str) == Some(model_id)
+    decode_model_manifest(manifest, model_id)?;
+    Ok(())
+}
+
+fn decode_model_manifest(manifest: &Value, model_id: &str) -> ApiResult<VoiceModelManifest> {
+    let manifest: VoiceModelManifest = serde_json::from_value(manifest.clone())
+        .map_err(|_| ApiError::new(503, "model_unavailable", "The model manifest is invalid"))?;
+    let signature = STANDARD.decode(&manifest.signature).ok();
+    let valid = manifest.schema_version == 1
+        && manifest.model_id == model_id
+        && valid_model_id(&manifest.model_id)
+        && valid_semantic_version(&manifest.model_version)
+        && manifest.sha256.len() == 64
+        && manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && signature.as_ref().is_some_and(|value| value.len() == 64)
+        && manifest.size_bytes > 0
+        && !manifest.minimum_capability.is_empty()
+        && manifest.minimum_capability.len() <= 64
         && manifest
-            .get("model_version")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-        && manifest
-            .get("sha256")
-            .and_then(Value::as_str)
-            .is_some_and(|value| {
-                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-        && manifest
-            .get("signature")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-        && manifest
-            .get("size_bytes")
-            .and_then(Value::as_u64)
-            .is_some_and(|value| value > 0)
-        && manifest
-            .get("minimum_capability")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty() && value.len() <= 64);
+            .minimum_capability
+            .chars()
+            .enumerate()
+            .all(|(index, character)| {
+                character.is_ascii_alphanumeric() || (index > 0 && ".-_".contains(character))
+            });
     if !valid {
         return Err(ApiError::new(
             503,
@@ -1456,7 +1553,128 @@ fn validate_model_manifest(manifest: &Value, model_id: &str) -> ApiResult<()> {
             "The model manifest is invalid",
         ));
     }
-    Ok(())
+    Ok(manifest)
+}
+
+fn valid_model_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_alphanumeric() || (index > 0 && ".-_".contains(character))
+        })
+}
+
+fn valid_semantic_version(value: &str) -> bool {
+    let (core, suffix) = match value.find(['-', '+']) {
+        Some(index) => (&value[..index], Some(&value[index + 1..])),
+        None => (value, None),
+    };
+    let components = core.split('.').collect::<Vec<_>>();
+    components.len() == 3
+        && components.iter().all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && suffix.is_none_or(|suffix| {
+            !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        })
+}
+
+fn valid_model_r2_key(value: &str, model_id: &str) -> bool {
+    let prefix = format!("models/{model_id}/");
+    let artifact_name = value
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(".litertlm"))
+        .unwrap_or_default();
+    value.len() <= 512
+        && !artifact_name.is_empty()
+        && value.ends_with(".litertlm")
+        && !value.contains("..")
+        && !value.contains("//")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_'))
+}
+
+/// Streams a shared signed model from private R2 after normal user
+/// authentication. The object key never crosses the API boundary and the iOS
+/// client independently verifies size, SHA-256, and Ed25519 before activation.
+async fn phone_model_artifact(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    model_id: &str,
+) -> ApiResult<Response> {
+    let _user = require_user(req, env, db).await?;
+    if config_value(env, "VOICE_MODEL_ENABLED", "false") != "true" || !valid_model_id(model_id) {
+        return Err(ApiError::new(
+            503,
+            "model_unavailable",
+            "This model is not available for the current release",
+        ));
+    }
+
+    let manifest_json = config_value(env, "VOICE_MODEL_MANIFEST_JSON", "");
+    let manifest_value: Value = serde_json::from_str(&manifest_json)
+        .map_err(|_| ApiError::new(503, "model_unavailable", "The model manifest is invalid"))?;
+    let manifest = decode_model_manifest(&manifest_value, model_id)?;
+    let key = config_value(env, "VOICE_MODEL_R2_KEY", "");
+    if !valid_model_r2_key(&key, model_id) {
+        return Err(ApiError::new(
+            503,
+            "model_unavailable",
+            "The private model artifact is not configured",
+        ));
+    }
+
+    let bucket = env.bucket("R2").map_err(|_| {
+        ApiError::new(
+            503,
+            "model_storage_unavailable",
+            "Model storage is not configured for this environment",
+        )
+    })?;
+    let object = bucket
+        .get(key)
+        .execute()
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                502,
+                "model_storage_error",
+                "Model storage could not be read",
+            )
+        })?
+        .ok_or_else(|| ApiError::new(404, "model_not_found", "Model artifact not found"))?;
+    if object.size() != manifest.size_bytes {
+        return Err(ApiError::new(
+            503,
+            "model_artifact_invalid",
+            "Model artifact size does not match its manifest",
+        ));
+    }
+    let body = object
+        .body()
+        .ok_or_else(|| ApiError::new(502, "model_storage_error", "Model artifact has no body"))?
+        .response_body()
+        .map_err(|_| {
+            ApiError::new(
+                502,
+                "model_storage_error",
+                "Model artifact could not be streamed",
+            )
+        })?;
+    let headers = Headers::new();
+    headers.set("content-type", "application/octet-stream")?;
+    headers.set("cache-control", "private, no-store")?;
+    headers.set(
+        "content-disposition",
+        &format!("attachment; filename=\"{model_id}.litertlm\""),
+    )?;
+    headers.set("x-content-type-options", "nosniff")?;
+    Ok(Response::from_body(body)?.with_headers(headers))
 }
 
 async fn phone_mark_push_read(
@@ -1704,6 +1922,10 @@ async fn phone_history(
     )
 }
 
+fn retire_device_token_from_other_users_sql() -> &'static str {
+    "UPDATE devices SET push_token = NULL, updated_at = ? WHERE push_token = ? AND user_id != ?"
+}
+
 async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
     let body: DeviceRequest = read_json(req).await?;
@@ -1726,24 +1948,44 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
         .await?
     };
     let now = db::now_iso();
+    let push_token = body
+        .push_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut statements = Vec::new();
+    if let Some(push_token) = push_token {
+        // An APNs token identifies one current app installation. Transfer it
+        // away from any previous account before binding it to this owner so a
+        // shared device cannot keep receiving wakeups for an old account.
+        statements.push(db::prepare(
+            db,
+            retire_device_token_from_other_users_sql(),
+            vec![
+                db::text(&now),
+                db::text(push_token),
+                db::text(&user.user_id),
+            ],
+        )?);
+    }
     let device_id = if let Some(existing) = existing {
-        db::run(
+        statements.push(db::prepare(
             db,
             "UPDATE devices SET device_id = COALESCE(?, device_id), push_token = ?, locale = ?, timezone = ?, updated_at = ? WHERE id = ?",
             vec![
                 db::optional_text(body.device_id.as_deref()),
-                db::optional_text(body.push_token.as_deref()),
+                db::optional_text(push_token),
                 db::optional_text(body.locale.as_deref()),
                 db::optional_text(body.timezone.as_deref()),
                 db::text(&now),
                 db::text(&existing._id),
             ],
-        )
-        .await?;
+        )?);
+        db.batch(statements).await?;
         existing._id
     } else {
         let id = new_id("dev")?;
-        db::run(
+        statements.push(db::prepare(
             db,
             "INSERT INTO devices (id, user_id, platform, device_id, push_token, locale, timezone, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
@@ -1751,21 +1993,21 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
                 db::text(&user.user_id),
                 db::text(&body.platform),
                 db::optional_text(body.device_id.as_deref()),
-                db::optional_text(body.push_token.as_deref()),
+                db::optional_text(push_token),
                 db::optional_text(body.locale.as_deref()),
                 db::optional_text(body.timezone.as_deref()),
                 db::text(&now),
                 db::text(&now),
             ],
-        )
-        .await?;
+        )?);
+        db.batch(statements).await?;
         id
     };
     json_response(
         json!({
             "device_id": device_id,
             "platform": body.platform,
-            "push_token_registered": body.push_token.is_some(),
+            "push_token_registered": push_token.is_some(),
             "locale": body.locale,
             "timezone": body.timezone,
         }),
@@ -2041,7 +2283,11 @@ fn add_common_headers(
 
 #[cfg(test)]
 mod tests {
-    use super::{phone_change_event_type, valid_request_id, validate_model_manifest};
+    use super::{
+        phone_change_event_type, retire_device_token_from_other_users_sql, valid_model_r2_key,
+        valid_request_id, valid_semantic_version, validate_model_manifest,
+    };
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
 
     #[test]
@@ -2051,7 +2297,7 @@ mod tests {
             "model_id": "whisperkit-base",
             "model_version": "1.0.0",
             "sha256": "a".repeat(64),
-            "signature": "sig-ed25519",
+            "signature": STANDARD.encode([7_u8; 64]),
             "size_bytes": 1024,
             "minimum_capability": "iphone13"
         });
@@ -2060,6 +2306,41 @@ mod tests {
         let mut invalid = valid.clone();
         invalid["sha256"] = json!("not-a-hash");
         assert!(validate_model_manifest(&invalid, "whisperkit-base").is_err());
+
+        let mut unknown = valid.clone();
+        unknown["download_url"] = json!("https://example.test/model");
+        assert!(validate_model_manifest(&unknown, "whisperkit-base").is_err());
+
+        let mut short_signature = valid;
+        short_signature["signature"] = json!(STANDARD.encode([1_u8; 32]));
+        assert!(validate_model_manifest(&short_signature, "whisperkit-base").is_err());
+    }
+
+    #[test]
+    fn model_release_metadata_rejects_invalid_versions_and_object_keys() {
+        assert!(valid_semantic_version("1.2.3"));
+        assert!(valid_semantic_version("1.2.3-uat.1"));
+        assert!(valid_semantic_version("1.2.3+build.7"));
+        assert!(!valid_semantic_version("1.2"));
+        assert!(!valid_semantic_version("1.2.3-"));
+        assert!(!valid_semantic_version("1.2.3+bad+suffix"));
+
+        assert!(valid_model_r2_key(
+            "models/gemma-command/gemma-command-1.2.3.litertlm",
+            "gemma-command"
+        ));
+        assert!(!valid_model_r2_key(
+            "models/gemma-command/../secret.litertlm",
+            "gemma-command"
+        ));
+        assert!(!valid_model_r2_key(
+            "models/other/gemma-command.litertlm",
+            "gemma-command"
+        ));
+        assert!(!valid_model_r2_key(
+            "models/gemma-command/.litertlm",
+            "gemma-command"
+        ));
     }
 
     #[test]
@@ -2089,5 +2370,13 @@ mod tests {
     fn retrieval_changes_require_snapshot_reconciliation() {
         assert_eq!(phone_change_event_type("retrieval"), "sync.required");
         assert_eq!(phone_change_event_type("message"), "message.created");
+    }
+
+    #[test]
+    fn device_registration_transfers_one_apns_token_between_accounts() {
+        let sql = retire_device_token_from_other_users_sql();
+        assert!(sql.contains("SET push_token = NULL"));
+        assert!(sql.contains("WHERE push_token = ?"));
+        assert!(sql.contains("user_id != ?"));
     }
 }

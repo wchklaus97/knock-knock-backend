@@ -47,7 +47,7 @@ require_ruby_yaml() {
 
 case "${profile}" in
   static)
-    require_commands bash cargo rustc git grep sed awk ruby python3 sqlite3 gpg cmp mktemp seq sleep
+    require_commands bash cargo rustc git grep sed awk ruby python3 sqlite3 gpg cmp mktemp seq sleep openssl xxd
     require_wasm_target
     require_ruby_yaml
     if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -55,14 +55,14 @@ case "${profile}" in
     fi
     ;;
   dynamic)
-    require_commands bash cargo rustc curl jq python3 npm grep sed awk sqlite3 wrangler worker-build cmp mktemp seq sleep kill
+    require_commands bash cargo rustc curl jq python3 npm grep sed awk sqlite3 wrangler worker-build cmp mktemp seq sleep kill openssl xxd
     require_wasm_target
     ;;
   staging)
     require_commands bash curl jq npm wrangler grep sed awk mktemp seq sleep
     ;;
   storage)
-    require_commands bash curl jq wrangler grep sed awk cmp mktemp seq sleep
+    require_commands bash curl jq wrangler grep sed awk cmp mktemp seq sleep openssl xxd
     ;;
   health)
     require_commands bash curl jq grep sed awk mktemp seq sleep

@@ -12,6 +12,7 @@ BASE_URL="${BASE_URL%/}"
 : "${SMOKE_OTHER_PASSWORD:?Set SMOKE_OTHER_PASSWORD to the second staging Supabase UAT password}"
 : "${STAGING_WRANGLER_CONFIG:?Set STAGING_WRANGLER_CONFIG to a materialized staging Wrangler config}"
 : "${R2_SMOKE_BUCKET:?Set R2_SMOKE_BUCKET to the private staging R2 bucket}"
+: "${STAGING_RELEASE_VERSION:?Set STAGING_RELEASE_VERSION to the exact deployed commit SHA}"
 
 case "${BASE_URL}" in
   https://*) ;;
@@ -26,10 +27,11 @@ if [[ "${BASE_URL}" == *production* ]]; then
 fi
 
 health="$(curl --fail-with-body --silent --show-error "${BASE_URL}/health")"
-jq -e '
+jq -e --arg expected_version "${STAGING_RELEASE_VERSION}" '
   (.ok == true) and
   (.api == "rust") and
   (.runtime == "cloudflare-worker") and
+  (.version == $expected_version) and
   (.push_mode == "both") and
   (.apns_ready == true) and
   (.apns_production == false) and
