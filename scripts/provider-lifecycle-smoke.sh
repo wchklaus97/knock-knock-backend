@@ -225,6 +225,18 @@ d1_execute_fixture() {
     --command "${sql}" >/dev/null
 }
 
+d1_query_fixture() {
+  local sql="$1"
+  test -n "${PROVIDER_PERSIST_TO}"
+  test -n "${PROVIDER_ENV_FILE}"
+  wrangler d1 execute DB --local \
+    --persist-to "${PROVIDER_PERSIST_TO}" \
+    --config "${ROOT_DIR}/wrangler.toml" \
+    --env-file "${PROVIDER_ENV_FILE}" \
+    --command "${sql}" \
+    --json
+}
+
 replace_message_provider_id_fixture() {
   local command_id="$1"
   local provider_message_id="$2"
@@ -250,12 +262,44 @@ requeue_succeeded_command_fixture() {
 
 create_session_fixture() {
   local session_id="$1"
+  local fixture_user_id="${2:-${user_id}}"
   local agent_id="agt-${session_id}"
   local skill_id="skill-${session_id}"
   [[ "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]]
-  [[ "${user_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${fixture_user_id}" =~ ^[A-Za-z0-9._-]+$ ]]
   d1_execute_fixture \
-    "INSERT INTO agents (id, user_id, label, api_key_hash, created_at) VALUES ('${agent_id}', '${user_id}', 'Provider lifecycle agent', 'hash-${agent_id}', strftime('%Y-%m-%dT%H:%M:%fZ','now')); INSERT INTO skills (skill_id, template, facts_schema_json, actions_json, ttl_json, created_at) VALUES ('${skill_id}', 'Provider lifecycle skill', '{}', '[]', '{}', strftime('%Y-%m-%dT%H:%M:%fZ','now')); INSERT INTO sessions (id, agent_id, user_id, skill_id, state, facts_json, created_at, updated_at) VALUES ('${session_id}', '${agent_id}', '${user_id}', '${skill_id}', 'active', '{}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+    "INSERT INTO agents (id, user_id, label, api_key_hash, created_at) VALUES ('${agent_id}', '${fixture_user_id}', 'Provider lifecycle agent', 'hash-${agent_id}', strftime('%Y-%m-%dT%H:%M:%fZ','now')); INSERT INTO skills (skill_id, template, facts_schema_json, actions_json, ttl_json, created_at) VALUES ('${skill_id}', 'Provider lifecycle skill', '{}', '[]', '{}', strftime('%Y-%m-%dT%H:%M:%fZ','now')); INSERT INTO sessions (id, agent_id, user_id, skill_id, state, facts_json, created_at, updated_at) VALUES ('${session_id}', '${agent_id}', '${fixture_user_id}', '${skill_id}', 'active', '{}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+}
+
+insert_history_message_fixture() {
+  local session_id="$1"
+  local fixture_user_id="$2"
+  local message_id="$3"
+  local content="$4"
+  [[ "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${fixture_user_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${message_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${content}" =~ ^[A-Za-z0-9._\ -]+$ ]]
+  d1_execute_fixture \
+    "INSERT INTO session_messages (id, user_id, session_id, role, content, metadata_json, sequence, created_at) VALUES ('${message_id}', '${fixture_user_id}', '${session_id}', 'user', '${content}', '{}', 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+}
+
+assert_single_draft_undo_fixture() {
+  local command_id="$1"
+  local effect_id="$2"
+  local undo_version="$3"
+  local assertion
+  [[ "${command_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${effect_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${undo_version}" =~ ^[0-9]+$ ]]
+  assertion="$(d1_query_fixture \
+    "SELECT CASE WHEN (SELECT COUNT(*) FROM drafts WHERE user_id = '${user_id}' AND command_id = '${command_id}') = 1 AND (SELECT COUNT(*) FROM drafts WHERE user_id = '${user_id}' AND command_id = '${command_id}' AND id = '${effect_id}' AND status = 'cancelled') = 1 AND (SELECT COUNT(*) FROM audit_logs WHERE user_id = '${user_id}' AND action = 'command.undo' AND json_extract(metadata_json, '$.command_id') = '${command_id}') = 1 AND (SELECT COUNT(*) FROM phone_changes WHERE user_id = '${user_id}' AND entity_type = 'command' AND entity_id = '${command_id}' AND version = ${undo_version}) = 1 THEN 1 ELSE 0 END AS ok")"
+  jq -e '
+    (type == "array") and
+    (length == 1) and
+    (.[0].success == true) and
+    (.[0].results == [{"ok": 1}])
+  ' <<<"${assertion}" >/dev/null
 }
 
 delete_session_fixture() {
@@ -288,6 +332,144 @@ create_message() {
     -d "$(jq -nc --arg id "${command_id}" --arg idem "${idempotency_key}" \
       '{schema_version:1,command_id:$id,intent:"send_message",args:{recipient:"+85255550123",body:"Provider lifecycle message smoke"},risk_level:"high",needs_confirmation:true,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC"}')"
 }
+
+search_history() {
+  local command_id="$1"
+  local idempotency_key="$2"
+  local query="$3"
+  json "${user_auth[@]}" -X POST "${BASE_URL}/v1/phone/commands" \
+    -d "$(jq -nc --arg id "${command_id}" --arg idem "${idempotency_key}" --arg query "${query}" \
+      '{schema_version:1,command_id:$id,intent:"search_history",args:{q:$query},risk_level:"low",needs_confirmation:false,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC"}')"
+}
+
+create_draft() {
+  local command_id="$1"
+  local idempotency_key="$2"
+  local title="$3"
+  local recipient="$4"
+  local body="$5"
+  json "${user_auth[@]}" -X POST "${BASE_URL}/v1/phone/commands" \
+    -d "$(jq -nc --arg id "${command_id}" --arg idem "${idempotency_key}" \
+      --arg title "${title}" --arg recipient "${recipient}" --arg body "${body}" \
+      '{schema_version:1,command_id:$id,intent:"create_draft",args:{title:$title,recipient:$recipient,body:$body},risk_level:"low",needs_confirmation:false,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC"}')"
+}
+
+if [[ -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
+  scoped_history_marker="provider-history-scope-$(date +%s%N)"
+  owner_history_session="ses-${scoped_history_marker}-owner"
+  other_history_session="ses-${scoped_history_marker}-other"
+  owner_history_message="msg-${scoped_history_marker}-owner"
+  other_history_message="msg-${scoped_history_marker}-other"
+  owner_history_content="${scoped_history_marker} owner fixture"
+  other_history_content="${scoped_history_marker} cross user fixture"
+  other_auth="$(json -X POST "${BASE_URL}/v1/auth/register" \
+    -d "$(jq -nc \
+      --arg email "provider-history-other-$(date +%s%N)-$$@local.test" \
+      --arg password "${PASSWORD}" '{email:$email,password:$password}')")"
+  other_user_id="$(jq -r '.user_id' <<<"${other_auth}")"
+  [[ "${other_user_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  create_session_fixture "${owner_history_session}" "${user_id}"
+  create_session_fixture "${other_history_session}" "${other_user_id}"
+  insert_history_message_fixture \
+    "${owner_history_session}" "${user_id}" \
+    "${owner_history_message}" "${owner_history_content}"
+  insert_history_message_fixture \
+    "${other_history_session}" "${other_user_id}" \
+    "${other_history_message}" "${other_history_content}"
+
+  history_command_id="cmd-${scoped_history_marker}"
+  history_command_key="idem-${scoped_history_marker}"
+  history_queued="$(search_history \
+    "${history_command_id}" "${history_command_key}" "${scoped_history_marker}")"
+  test "$(jq -r '.state' <<<"${history_queued}")" = "queued"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  history_result="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${history_command_id}")"
+  jq -e \
+    --arg command_id "${history_command_id}" \
+    --arg query "${scoped_history_marker}" \
+    --arg owner_session "${owner_history_session}" \
+    --arg owner_message "${owner_history_message}" \
+    --arg owner_content "${owner_history_content}" \
+    --arg other_session "${other_history_session}" \
+    --arg other_message "${other_history_message}" \
+    --arg other_content "${other_history_content}" '
+      (.command_id == $command_id) and
+      (.state == "succeeded") and
+      (.result.kind == "history_search") and
+      (.result.data.query == $query) and
+      (.result.data.messages == .result.data.items) and
+      (.result.data.messages | length == 1) and
+      (.result.data.messages[0].session_id == $owner_session) and
+      (.result.data.messages[0].message_id == $owner_message) and
+      (.result.data.messages[0].content == $owner_content) and
+      ([.result.data.messages[] | select(
+        .session_id == $other_session or
+        .message_id == $other_message or
+        .content == $other_content
+      )] | length == 0)
+    ' <<<"${history_result}" >/dev/null
+
+  draft_marker="provider-draft-route-$(date +%s%N)"
+  draft_command_id="cmd-${draft_marker}"
+  draft_command_key="idem-${draft_marker}"
+  draft_title="${draft_marker} title"
+  draft_recipient="fixture recipient"
+  draft_body="${draft_marker} body"
+  draft_queued="$(create_draft \
+    "${draft_command_id}" "${draft_command_key}" \
+    "${draft_title}" "${draft_recipient}" "${draft_body}")"
+  test "$(jq -r '.state' <<<"${draft_queued}")" = "queued"
+  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  draft_result="$(get_json "${user_auth[@]}" \
+    "${BASE_URL}/v1/phone/commands/${draft_command_id}")"
+  jq -e \
+    --arg command_id "${draft_command_id}" \
+    --arg title "${draft_title}" \
+    --arg recipient "${draft_recipient}" '
+      (.command_id == $command_id) and
+      (.state == "succeeded") and
+      (.result.kind == "draft") and
+      (.result.status == "draft") and
+      (.result.title == $title) and
+      (.result.recipient == $recipient) and
+      (.result.draft_id | type == "string" and length > 0) and
+      (.undo_command_id == $command_id)
+    ' <<<"${draft_result}" >/dev/null
+  draft_effect_id="$(jq -r '.result.draft_id' <<<"${draft_result}")"
+
+  draft_undo="$(json "${user_auth[@]}" -X POST \
+    "${BASE_URL}/v1/phone/commands/${draft_command_id}/undo")"
+  jq -e --arg effect_id "${draft_effect_id}" '
+    (.state == "succeeded") and
+    (.result.kind == "draft") and
+    (.result.status == "draft") and
+    (.result.undo.status == "cancelled") and
+    (.result.undo.effect_id == $effect_id) and
+    (.result.undo.already_cancelled == false) and
+    (.undo_result == .result.undo) and
+    (.undo_command_id == null)
+  ' <<<"${draft_undo}" >/dev/null
+  draft_undo_version="$(jq -r '.version' <<<"${draft_undo}")"
+
+  duplicate_draft_undo="$(json "${user_auth[@]}" -X POST \
+    "${BASE_URL}/v1/phone/commands/${draft_command_id}/undo")"
+  jq -e \
+    --arg effect_id "${draft_effect_id}" \
+    --argjson expected_version "${draft_undo_version}" \
+    --argjson first_result "$(jq -c '.result' <<<"${draft_undo}")" '
+      (.state == "succeeded") and
+      (.version == $expected_version) and
+      (.result == $first_result) and
+      (.undo_result.kind == "undo") and
+      (.undo_result.status == "cancelled") and
+      (.undo_result.effect_id == $effect_id) and
+      (.undo_result.already_cancelled == true) and
+      (.undo_command_id == null)
+    ' <<<"${duplicate_draft_undo}" >/dev/null
+  assert_single_draft_undo_fixture \
+    "${draft_command_id}" "${draft_effect_id}" "${draft_undo_version}"
+fi
 
 success_id="cmd-provider-success-$(date +%s%N)"
 success_key="idem-provider-success-$(date +%s%N)"
@@ -680,7 +862,7 @@ else
 fi
 
 if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
-  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, atomic message identity, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, structured failures, and strict resource-identity fail-closed behavior'
+  printf '%s\n' 'provider lifecycle smoke passed: owner-scoped history search, idempotent draft undo, provider IDs, atomic message identity, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, structured failures, and strict resource-identity fail-closed behavior'
 else
-  printf '%s\n' 'provider lifecycle smoke passed: provider IDs, atomic message identity, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, and structured failures (strict resource-identity checks opt-in)'
+  printf '%s\n' 'provider lifecycle smoke passed: owner-scoped history search, idempotent draft undo, provider IDs, atomic message identity, duplicate idempotency, cancellation safety, deleted-session reconciliation, zero-attempt cancellation, elapsed-deadline and expired-TTL recovery, asynchronous delivery, and structured failures (strict resource-identity checks opt-in)'
 fi
