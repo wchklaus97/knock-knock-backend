@@ -82,15 +82,17 @@ impl ActionProviderConfig {
         if self.mode != ActionProviderMode::External {
             return self.mode == ActionProviderMode::Internal;
         }
-        ["create_reminder", "send_message"]
-            .into_iter()
-            .filter(|intent| self.enabled(intent))
-            .all(|intent| {
-                self.endpoint(intent).is_some()
-                    && self.status_endpoint(intent).is_some()
-                    && self.token(intent).is_some()
-                    && (intent != "create_reminder" || self.cancel_endpoint(intent).is_some())
-            })
+        let intents = ["create_reminder", "send_message"];
+        intents.iter().copied().any(|intent| self.enabled(intent))
+            && intents
+                .into_iter()
+                .filter(|intent| self.enabled(intent))
+                .all(|intent| {
+                    self.endpoint(intent).is_some()
+                        && self.status_endpoint(intent).is_some()
+                        && self.token(intent).is_some()
+                        && (intent != "create_reminder" || self.cancel_endpoint(intent).is_some())
+                })
     }
 }
 
@@ -725,9 +727,35 @@ mod tests {
             reminder_token: None,
             message_token: None,
         };
+        let external_without_enabled_actions = ActionProviderConfig {
+            mode: ActionProviderMode::External,
+            reminder_enabled: false,
+            message_enabled: false,
+            reminder_url: Some("https://provider.example/reminders".to_string()),
+            message_url: Some("https://provider.example/messages".to_string()),
+            reminder_cancel_url: Some("https://provider.example/reminders/cancel".to_string()),
+            reminder_status_url: Some("https://provider.example/reminders/status".to_string()),
+            message_status_url: Some("https://provider.example/messages/status".to_string()),
+            reminder_token: Some("reminder-token".to_string()),
+            message_token: Some("message-token".to_string()),
+        };
+        let external_message_only = ActionProviderConfig {
+            mode: ActionProviderMode::External,
+            reminder_enabled: false,
+            message_enabled: true,
+            reminder_url: None,
+            message_url: Some("https://provider.example/messages".to_string()),
+            reminder_cancel_url: None,
+            reminder_status_url: None,
+            message_status_url: Some("https://provider.example/messages/status".to_string()),
+            reminder_token: None,
+            message_token: Some("message-token".to_string()),
+        };
         assert!(ready(&internal));
         assert!(!ready(&external));
         assert!(!ready(&disabled));
+        assert!(!ready(&external_without_enabled_actions));
+        assert!(ready(&external_message_only));
     }
 
     #[test]

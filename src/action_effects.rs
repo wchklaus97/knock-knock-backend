@@ -143,6 +143,22 @@ fn bind_message_delivery_sql() -> &'static str {
     "UPDATE outbound_messages SET delivery_state = ?, provider_message_id = COALESCE(provider_message_id, ?), updated_at = ? WHERE user_id = ? AND command_id = ? AND (? IS NULL OR provider_message_id IS NULL OR provider_message_id = ?)"
 }
 
+fn message_delivery_state(
+    external: bool,
+    provider_state: providers::ProviderDeliveryState,
+) -> &'static str {
+    if !external {
+        return "queued";
+    }
+    match provider_state {
+        providers::ProviderDeliveryState::Succeeded => "sent",
+        providers::ProviderDeliveryState::Failed => "failed",
+        providers::ProviderDeliveryState::Pending | providers::ProviderDeliveryState::Unknown => {
+            "queued"
+        }
+    }
+}
+
 fn materialized_message_response(
     effect: &MessageEffectRow,
     provider: &str,
@@ -923,13 +939,7 @@ async fn queue_message(
         .as_ref()
         .map(|response| response.state)
         .unwrap_or(providers::ProviderDeliveryState::Succeeded);
-    let delivery_state = match provider_state {
-        providers::ProviderDeliveryState::Succeeded => "sent",
-        providers::ProviderDeliveryState::Failed => "failed",
-        providers::ProviderDeliveryState::Pending | providers::ProviderDeliveryState::Unknown => {
-            "queued"
-        }
-    };
+    let delivery_state = message_delivery_state(external, provider_state);
     db::run(
         db,
         "INSERT OR IGNORE INTO outbound_messages (id, user_id, command_id, session_id, recipient, body, provider, delivery_state, provider_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1569,6 +1579,24 @@ mod tests {
         assert_eq!(response["delivery_state"], json!("sent"));
         assert_eq!(response["external_delivery"], json!("sent"));
         assert_eq!(response["provider_id"], json!("provider-message-a"));
+    }
+
+    #[test]
+    fn internal_message_simulation_stays_queued_and_non_delivered() {
+        assert_eq!(
+            message_delivery_state(false, providers::ProviderDeliveryState::Succeeded),
+            "queued"
+        );
+
+        let local = MessageEffectRow {
+            id: "msg-local-1".to_string(),
+            delivery_state: "queued".to_string(),
+            provider_message_id: None,
+        };
+        let response = materialized_message_response(&local, "internal.outbox", false);
+        assert_eq!(response["delivery_state"], json!("queued"));
+        assert_eq!(response["external_delivery"], json!("not_configured"));
+        assert_eq!(response["provider_id"], Value::Null);
     }
 
     #[test]

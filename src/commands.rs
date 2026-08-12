@@ -703,6 +703,195 @@ fn error_value(row: &CommandRow) -> Value {
         .unwrap_or(Value::Null)
 }
 
+#[derive(Clone, Copy)]
+enum PresentationLocale {
+    En,
+    ZhHans,
+    YueHant,
+}
+
+impl PresentationLocale {
+    fn from_persisted(locale: &str) -> Self {
+        let normalized = locale.trim().replace('_', "-").to_ascii_lowercase();
+        if normalized == "yue"
+            || normalized.starts_with("yue-")
+            || normalized == "zh-yue"
+            || normalized.starts_with("zh-yue-")
+        {
+            Self::YueHant
+        } else if normalized == "zh"
+            || normalized == "zh-cn"
+            || normalized.starts_with("zh-cn-")
+            || normalized == "zh-sg"
+            || normalized.starts_with("zh-sg-")
+            || normalized == "zh-hans"
+            || normalized.starts_with("zh-hans-")
+        {
+            Self::ZhHans
+        } else {
+            Self::En
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::ZhHans => "zh-Hans",
+            Self::YueHant => "yue-Hant",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PresentationKind {
+    Queued,
+    AwaitingConfirmation,
+    Running,
+    Retryable,
+    Unknown,
+    Undone,
+    HistorySearchCompleted,
+    ReminderCreated,
+    DraftSaved,
+    MessageSent,
+    MessageQueuedLocally,
+    Succeeded,
+    Failed,
+    Expired,
+    Cancelled,
+    Reconciling,
+}
+
+struct PresentationCopy {
+    display_text: &'static str,
+    voice_script: Option<&'static str>,
+}
+
+impl PresentationKind {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Queued => "command.queued",
+            Self::AwaitingConfirmation => "command.awaiting_confirmation",
+            Self::Running => "command.running",
+            Self::Retryable => "command.retryable",
+            Self::Unknown => "command.unknown",
+            Self::Undone => "command.undone",
+            Self::HistorySearchCompleted => "history_search.completed",
+            Self::ReminderCreated => "reminder.created",
+            Self::DraftSaved => "draft.saved",
+            Self::MessageSent => "send_message.sent",
+            Self::MessageQueuedLocally => "send_message.queued_locally",
+            Self::Succeeded => "command.succeeded",
+            Self::Failed => "command.failed",
+            Self::Expired => "command.expired",
+            Self::Cancelled => "command.cancelled",
+            Self::Reconciling => "command.reconciling",
+        }
+    }
+
+    fn localized_copy(self, locale: PresentationLocale) -> PresentationCopy {
+        let (display_text, voice_script) = match locale {
+            PresentationLocale::En => match self {
+                Self::Queued => ("The command is queued.", None),
+                Self::AwaitingConfirmation => (
+                    "Confirmation is required before this action can run.",
+                    Some("Please confirm this action in Knock Knock."),
+                ),
+                Self::Running => ("The command is running.", None),
+                Self::Retryable => ("The backend will retry this command.", None),
+                Self::Unknown => (
+                    "Completion could not be verified. Check status before trying again.",
+                    None,
+                ),
+                Self::Undone => ("The action was undone.", Some("The action was undone.")),
+                Self::HistorySearchCompleted => (
+                    "History search completed. Review the results on screen.",
+                    Some("History search completed."),
+                ),
+                Self::ReminderCreated => ("Reminder created.", Some("Reminder created.")),
+                Self::DraftSaved => ("Draft saved.", Some("Draft saved.")),
+                Self::MessageSent => ("Message sent.", Some("Message sent.")),
+                Self::MessageQueuedLocally => (
+                    "Message saved to the local outbox; external delivery is not confirmed.",
+                    Some("Message queued locally."),
+                ),
+                Self::Succeeded => ("The command completed.", Some("The command completed.")),
+                Self::Failed => (
+                    "The backend could not complete this command.",
+                    Some("The command failed."),
+                ),
+                Self::Expired => (
+                    "The command expired before it could complete.",
+                    Some("The command expired."),
+                ),
+                Self::Cancelled => (
+                    "The command was cancelled.",
+                    Some("The command was cancelled."),
+                ),
+                Self::Reconciling => ("The command is being reconciled with the backend.", None),
+            },
+            PresentationLocale::ZhHans => match self {
+                Self::Queued => ("命令已排队。", None),
+                Self::AwaitingConfirmation => (
+                    "此操作需要确认后才能执行。",
+                    Some("请在 Knock Knock 中确认此操作。"),
+                ),
+                Self::Running => ("命令正在运行。", None),
+                Self::Retryable => ("后端将重试此命令。", None),
+                Self::Unknown => ("无法确认是否完成。请先检查状态，再重试。", None),
+                Self::Undone => ("操作已撤销。", Some("操作已撤销。")),
+                Self::HistorySearchCompleted => (
+                    "历史记录搜索已完成。请在屏幕上查看结果。",
+                    Some("历史记录搜索已完成。"),
+                ),
+                Self::ReminderCreated => ("提醒已创建。", Some("提醒已创建。")),
+                Self::DraftSaved => ("草稿已保存。", Some("草稿已保存。")),
+                Self::MessageSent => ("消息已发送。", Some("消息已发送。")),
+                Self::MessageQueuedLocally => (
+                    "消息已保存到本地发件箱；尚未确认外部送达。",
+                    Some("消息已在本地排队。"),
+                ),
+                Self::Succeeded => ("命令已完成。", Some("命令已完成。")),
+                Self::Failed => ("后端无法完成此命令。", Some("命令执行失败。")),
+                Self::Expired => ("命令在完成前已过期。", Some("命令已过期。")),
+                Self::Cancelled => ("命令已取消。", Some("命令已取消。")),
+                Self::Reconciling => ("正在与后端核对命令状态。", None),
+            },
+            PresentationLocale::YueHant => match self {
+                Self::Queued => ("指令已排入隊列。", None),
+                Self::AwaitingConfirmation => (
+                    "執行呢個操作之前需要確認。",
+                    Some("請喺 Knock Knock 確認呢個操作。"),
+                ),
+                Self::Running => ("指令正在執行。", None),
+                Self::Retryable => ("後端會重試呢個指令。", None),
+                Self::Unknown => ("未能確認是否完成。請先檢查狀態，再重試。", None),
+                Self::Undone => ("操作已還原。", Some("操作已還原。")),
+                Self::HistorySearchCompleted => (
+                    "歷史記錄搜尋已完成。請喺畫面查看結果。",
+                    Some("歷史記錄搜尋已完成。"),
+                ),
+                Self::ReminderCreated => ("提醒已建立。", Some("提醒已建立。")),
+                Self::DraftSaved => ("草稿已儲存。", Some("草稿已儲存。")),
+                Self::MessageSent => ("訊息已傳送。", Some("訊息已傳送。")),
+                Self::MessageQueuedLocally => (
+                    "訊息已儲存到本機寄件匣；尚未確認外部傳送。",
+                    Some("訊息已喺本機排隊。"),
+                ),
+                Self::Succeeded => ("指令已完成。", Some("指令已完成。")),
+                Self::Failed => ("後端未能完成呢個指令。", Some("指令執行失敗。")),
+                Self::Expired => ("指令喺完成之前已過期。", Some("指令已過期。")),
+                Self::Cancelled => ("指令已取消。", Some("指令已取消。")),
+                Self::Reconciling => ("正在同後端核對指令狀態。", None),
+            },
+        };
+        PresentationCopy {
+            display_text,
+            voice_script,
+        }
+    }
+}
+
 /// Build the only command text intended for direct UI/TTS presentation.
 /// It deliberately never interpolates command arguments, search results,
 /// recipients, message bodies, provider IDs, URLs, or raw provider errors.
@@ -720,106 +909,41 @@ fn presentation_value(row: &CommandRow) -> Value {
         .and_then(|value| value.get("delivery_state"))
         .and_then(Value::as_str);
 
-    let (code, display_text, voice_script, terminal) = match row.state.as_str() {
-        "pending" | "validated" | "queued" => {
-            ("command.queued", "The command is queued.", None, false)
-        }
-        "awaiting_confirmation" => (
-            "command.awaiting_confirmation",
-            "Confirmation is required before this action can run.",
-            Some("Please confirm this action in Knock Knock."),
-            false,
-        ),
-        "running" => ("command.running", "The command is running.", None, false),
-        "retryable" => (
-            "command.retryable",
-            "The backend will retry this command.",
-            None,
-            false,
-        ),
-        "unknown" => (
-            "command.unknown",
-            "Completion could not be verified. Check status before trying again.",
-            None,
-            false,
-        ),
-        "succeeded" if was_undone => (
-            "command.undone",
-            "The action was undone.",
-            Some("The action was undone."),
-            true,
-        ),
+    let (kind, terminal) = match row.state.as_str() {
+        "pending" | "validated" | "queued" => (PresentationKind::Queued, false),
+        "awaiting_confirmation" => (PresentationKind::AwaitingConfirmation, false),
+        "running" => (PresentationKind::Running, false),
+        "retryable" => (PresentationKind::Retryable, false),
+        "unknown" => (PresentationKind::Unknown, false),
+        "succeeded" if was_undone => (PresentationKind::Undone, true),
         "succeeded" => match (row.intent.as_str(), result_kind) {
-            ("search_history", Some("history_search")) => (
-                "history_search.completed",
-                "History search completed. Review the results on screen.",
-                Some("History search completed."),
-                true,
-            ),
-            ("create_reminder", Some("reminder")) => (
-                "reminder.created",
-                "Reminder created.",
-                Some("Reminder created."),
-                true,
-            ),
-            ("create_draft", Some("draft")) => {
-                ("draft.saved", "Draft saved.", Some("Draft saved."), true)
+            ("search_history", Some("history_search")) => {
+                (PresentationKind::HistorySearchCompleted, true)
             }
+            ("create_reminder", Some("reminder")) => (PresentationKind::ReminderCreated, true),
+            ("create_draft", Some("draft")) => (PresentationKind::DraftSaved, true),
             ("send_message", Some("message"))
                 if external_delivery == Some("sent") && delivery_state == Some("sent") =>
             {
-                (
-                    "send_message.sent",
-                    "Message sent.",
-                    Some("Message sent."),
-                    true,
-                )
+                (PresentationKind::MessageSent, true)
             }
-            ("send_message", Some("message")) => (
-                "send_message.queued_locally",
-                "Message saved to the local outbox; external delivery is not confirmed.",
-                Some("Message queued locally."),
-                true,
-            ),
-            _ => (
-                "command.succeeded",
-                "The command completed.",
-                Some("The command completed."),
-                true,
-            ),
+            ("send_message", Some("message")) => (PresentationKind::MessageQueuedLocally, true),
+            _ => (PresentationKind::Succeeded, true),
         },
-        "failed" => (
-            "command.failed",
-            "The backend could not complete this command.",
-            Some("The command failed."),
-            true,
-        ),
-        "expired" => (
-            "command.expired",
-            "The command expired before it could complete.",
-            Some("The command expired."),
-            true,
-        ),
-        "cancelled" => (
-            "command.cancelled",
-            "The command was cancelled.",
-            Some("The command was cancelled."),
-            true,
-        ),
-        _ => (
-            "command.reconciling",
-            "The command is being reconciled with the backend.",
-            None,
-            false,
-        ),
+        "failed" => (PresentationKind::Failed, true),
+        "expired" => (PresentationKind::Expired, true),
+        "cancelled" => (PresentationKind::Cancelled, true),
+        _ => (PresentationKind::Reconciling, false),
     };
+    let locale = PresentationLocale::from_persisted(&row.locale);
+    let copy = kind.localized_copy(locale);
 
     json!({
         "schema_version": 1,
-        "code": code,
-        "locale": "en",
-        "display_text": display_text,
-        "voice_script": voice_script,
+        "code": kind.code(),
+        "locale": locale.as_str(),
+        "display_text": copy.display_text,
+        "voice_script": copy.voice_script,
         "terminal": terminal,
     })
 }
@@ -1936,26 +2060,49 @@ mod tests {
     }
 
     #[test]
-    fn presentation_never_interpolates_sensitive_command_or_result_text() {
-        let mut row = command_row(
-            "search_history",
-            "succeeded",
-            Some(json!({
-                "kind": "history_search",
-                "data": {
-                    "query": "private query",
-                    "items": [{"content": "private result"}],
-                }
-            })),
-        );
-        row.locale = "zh-Hans-HK".to_string();
-        let presentation = presentation_value(&row);
-        let rendered = presentation.to_string();
-        assert_eq!(presentation["locale"], json!("en"));
-        assert!(rendered.contains("history_search.completed"));
-        assert!(!rendered.contains("private query"));
-        assert!(!rendered.contains("private result"));
-        assert!(!rendered.contains("private recipient"));
+    fn presentation_localizes_persisted_locale_without_interpolating_sensitive_text() {
+        for (persisted_locale, locale, display_text, voice_script) in [
+            (
+                "en-HK",
+                "en",
+                "History search completed. Review the results on screen.",
+                "History search completed.",
+            ),
+            (
+                "zh-Hans-HK",
+                "zh-Hans",
+                "历史记录搜索已完成。请在屏幕上查看结果。",
+                "历史记录搜索已完成。",
+            ),
+            (
+                "yue-Hant-HK",
+                "yue-Hant",
+                "歷史記錄搜尋已完成。請喺畫面查看結果。",
+                "歷史記錄搜尋已完成。",
+            ),
+        ] {
+            let mut row = command_row(
+                "search_history",
+                "succeeded",
+                Some(json!({
+                    "kind": "history_search",
+                    "data": {
+                        "query": "private query",
+                        "items": [{"content": "private result"}],
+                    }
+                })),
+            );
+            row.locale = persisted_locale.to_string();
+            let presentation = presentation_value(&row);
+            let rendered = presentation.to_string();
+            assert_eq!(presentation["locale"], json!(locale));
+            assert_eq!(presentation["display_text"], json!(display_text));
+            assert_eq!(presentation["voice_script"], json!(voice_script));
+            assert!(rendered.contains("history_search.completed"));
+            assert!(!rendered.contains("private query"));
+            assert!(!rendered.contains("private result"));
+            assert!(!rendered.contains("private recipient"));
+        }
     }
 
     #[test]
@@ -1998,7 +2145,7 @@ mod tests {
             "succeeded",
             Some(json!({
                 "kind": "message",
-                "delivery_state": "sent",
+                "delivery_state": "queued",
                 "external_delivery": "not_configured",
             })),
         );
