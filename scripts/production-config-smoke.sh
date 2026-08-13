@@ -52,6 +52,9 @@ grep -q '^bucket_name = "REPLACE_WITH_STAGING_R2_BUCKET_NAME"$' "$STAGING_EXAMPL
 grep -q 'BACKUP_BUCKET' "$ROOT/.github/workflows/production-backup.yml"
 grep -q 'BACKUP_PASSPHRASE' "$ROOT/.github/workflows/production-backup.yml"
 grep -q 'gpg' "$ROOT/.github/workflows/production-backup.yml"
+grep -Fq 'name: production-backup' "$ROOT/.github/workflows/production-backup.yml"
+grep -Fq 'group: knock-knock-production-backup' "$ROOT/.github/workflows/production-backup.yml"
+grep -Fq '`production-backup` environment' "$ROOT/docs/PRODUCTION_RELEASE_RUNBOOK.md"
 if grep -q 'actions/upload-artifact' "$ROOT/.github/workflows/production-backup.yml"; then
   echo "production backups must not be retained as plaintext CI artifacts" >&2
   exit 1

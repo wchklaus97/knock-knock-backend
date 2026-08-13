@@ -8,10 +8,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: knock-knock-production-backup
+  cancel-in-progress: false
+
 jobs:
   backup:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Backups need production data access but must remain schedulable without
+    # approving a production deployment. Keep these credentials in a separate,
+    # least-privilege environment restricted to the main branch.
+    environment:
+      name: production-backup
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
