@@ -115,6 +115,12 @@ device_again="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/devices" \
     --arg push_token "$device_push_token" \
     '{platform:"ios",push_token:$push_token,locale:"zh-HK",timezone:"Asia/Hong_Kong",device_id:$device_id}')")"
 test "$(jq -r '.device_id' <<<"$device_again")" = "$(jq -r '.device_id' <<<"$device")"
+device_reinstall_correlation_id="${device_correlation_id}-reinstall"
+device_after_reinstall="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/devices" \
+  -d "$(jq -nc --arg device_id "$device_reinstall_correlation_id" \
+    --arg push_token "$device_push_token" \
+    '{platform:"ios",push_token:$push_token,locale:"zh-HK",timezone:"Asia/Hong_Kong",device_id:$device_id}')")"
+test "$(jq -r '.device_id' <<<"$device_after_reinstall")" != "$(jq -r '.device_id' <<<"$device")"
 
 command_key="command-smoke-$(date +%s%N)"
 command="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/commands" \
