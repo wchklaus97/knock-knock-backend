@@ -5,10 +5,28 @@ use p256::ecdsa::signature::Signer;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::DecodePrivateKey;
 use serde_json::json;
+use std::cell::RefCell;
 use worker::{Fetch, Headers, Method, Request, RequestInit};
 
 use crate::auth::{config_value, secret_value};
 use crate::error::{ApiError, ApiResult};
+
+const PROVIDER_TOKEN_REFRESH_SECONDS: i64 = 50 * 60;
+
+#[derive(Debug, Clone)]
+struct CachedProviderToken {
+    token: String,
+    issued_at: i64,
+    key_id: String,
+    team_id: String,
+}
+
+thread_local! {
+    // Cloudflare may reuse an isolate and its APNs HTTP/2 connection across
+    // requests. Reuse the matching provider token in that isolate too: APNs
+    // rejects a connection that sees newly signed tokens too frequently.
+    static PROVIDER_TOKEN_CACHE: RefCell<Option<CachedProviderToken>> = const { RefCell::new(None) };
+}
 
 #[derive(Debug)]
 pub(crate) enum CommandWakeFailure {
@@ -70,16 +88,14 @@ fn signing_key(env: &worker::Env) -> ApiResult<SigningKey> {
         .map_err(|error| ApiError::new(500, "apns_configuration_error", error.to_string()))
 }
 
-fn signed_token(env: &worker::Env) -> ApiResult<String> {
-    let now = worker::Date::now().as_millis() as i64 / 1000;
-    let key_id = secret_value(env, "APNS_KEY_ID").unwrap_or_default();
+fn signed_token(env: &worker::Env, now: i64, key_id: &str, team_id: &str) -> ApiResult<String> {
     let header = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({ "alg": "ES256", "kid": key_id }))
             .map_err(|error| ApiError::new(500, "apns_configuration_error", error.to_string()))?,
     );
     let payload = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({
-            "iss": secret_value(env, "APNS_TEAM_ID").unwrap_or_default(),
+            "iss": team_id,
             "iat": now,
         }))
         .map_err(|error| ApiError::new(500, "apns_configuration_error", error.to_string()))?,
@@ -92,8 +108,47 @@ fn signed_token(env: &worker::Env) -> ApiResult<String> {
     ))
 }
 
+fn reusable_provider_token(
+    cached: &CachedProviderToken,
+    now: i64,
+    key_id: &str,
+    team_id: &str,
+) -> Option<String> {
+    let age = now - cached.issued_at;
+    ((0..PROVIDER_TOKEN_REFRESH_SECONDS).contains(&age)
+        && cached.key_id == key_id
+        && cached.team_id == team_id)
+        .then(|| cached.token.clone())
+}
+
+pub(crate) fn provider_authorization(env: &worker::Env) -> ApiResult<String> {
+    let now = worker::Date::now().as_millis() as i64 / 1000;
+    let key_id = secret_value(env, "APNS_KEY_ID").unwrap_or_default();
+    let team_id = secret_value(env, "APNS_TEAM_ID").unwrap_or_default();
+    if let Some(token) = PROVIDER_TOKEN_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .and_then(|cached| reusable_provider_token(cached, now, &key_id, &team_id))
+    }) {
+        return Ok(token);
+    }
+
+    let token = signed_token(env, now, &key_id, &team_id)?;
+    PROVIDER_TOKEN_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(CachedProviderToken {
+            token: token.clone(),
+            issued_at: now,
+            key_id,
+            team_id,
+        });
+    });
+    Ok(token)
+}
+
 pub async fn send_alert(
     env: &worker::Env,
+    provider_authorization: &str,
     token: &str,
     title: &str,
     body: &str,
@@ -108,7 +163,7 @@ pub async fn send_alert(
         "session_id": session_id,
     })
     .to_string();
-    send_payload(env, token, &payload, "alert", None).await
+    send_payload(env, provider_authorization, token, &payload, "alert", None).await
 }
 
 fn command_wakeup_payload() -> String {
@@ -121,8 +176,16 @@ fn command_wakeup_payload() -> String {
 
 pub async fn send_command_wakeup(env: &worker::Env, token: &str) -> Result<(), CommandWakeFailure> {
     let payload = command_wakeup_payload();
-    let request = payload_request(env, token, &payload, "background", Some("5"))
-        .map_err(CommandWakeFailure::Known)?;
+    let provider_authorization = provider_authorization(env).map_err(CommandWakeFailure::Known)?;
+    let request = payload_request(
+        env,
+        &provider_authorization,
+        token,
+        &payload,
+        "background",
+        Some("5"),
+    )
+    .map_err(CommandWakeFailure::Known)?;
     let response = Fetch::Request(request).send().await.map_err(|error| {
         CommandWakeFailure::Unknown(ApiError::new(
             502,
@@ -137,18 +200,27 @@ pub async fn send_command_wakeup(env: &worker::Env, token: &str) -> Result<(), C
 
 async fn send_payload(
     env: &worker::Env,
+    provider_authorization: &str,
     token: &str,
     payload: &str,
     push_type: &str,
     priority: Option<&str>,
 ) -> ApiResult<()> {
-    let request = payload_request(env, token, payload, push_type, priority)?;
+    let request = payload_request(
+        env,
+        provider_authorization,
+        token,
+        payload,
+        push_type,
+        priority,
+    )?;
     let response = Fetch::Request(request).send().await?;
     require_success(response, false).await
 }
 
 fn payload_request(
     env: &worker::Env,
+    provider_authorization: &str,
     token: &str,
     payload: &str,
     push_type: &str,
@@ -169,7 +241,7 @@ fn payload_request(
     let url = worker::Url::parse(&format!("https://{host}/3/device/{token}"))
         .map_err(|error| ApiError::new(500, "apns_error", error.to_string()))?;
     let headers = Headers::new();
-    headers.set("authorization", &format!("bearer {}", signed_token(env)?))?;
+    headers.set("authorization", &format!("bearer {provider_authorization}"))?;
     headers.set(
         "apns-topic",
         &config_value(env, "APNS_BUNDLE_ID", "hk.knockknock.app"),
@@ -241,5 +313,47 @@ mod tests {
         assert!(known.into_error().retryable);
         assert!(unknown.is_unknown());
         assert_eq!(unknown.into_error().code, "unknown");
+    }
+
+    #[test]
+    fn provider_token_is_reused_until_the_safe_refresh_window() {
+        let cached = CachedProviderToken {
+            token: "signed-token".into(),
+            issued_at: 1_000,
+            key_id: "KEY123".into(),
+            team_id: "TEAM123".into(),
+        };
+
+        assert_eq!(
+            reusable_provider_token(
+                &cached,
+                1_000 + PROVIDER_TOKEN_REFRESH_SECONDS - 1,
+                "KEY123",
+                "TEAM123",
+            )
+            .as_deref(),
+            Some("signed-token")
+        );
+        assert!(reusable_provider_token(
+            &cached,
+            1_000 + PROVIDER_TOKEN_REFRESH_SECONDS,
+            "KEY123",
+            "TEAM123",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn provider_token_is_not_reused_after_identity_or_clock_change() {
+        let cached = CachedProviderToken {
+            token: "signed-token".into(),
+            issued_at: 1_000,
+            key_id: "KEY123".into(),
+            team_id: "TEAM123".into(),
+        };
+
+        assert!(reusable_provider_token(&cached, 999, "KEY123", "TEAM123").is_none());
+        assert!(reusable_provider_token(&cached, 1_001, "KEY999", "TEAM123").is_none());
+        assert!(reusable_provider_token(&cached, 1_001, "KEY123", "TEAM999").is_none());
     }
 }

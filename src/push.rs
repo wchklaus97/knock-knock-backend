@@ -229,19 +229,30 @@ pub async fn notify_user(
     let mut apns_sent = 0;
     let mut apns_errors = Vec::new();
     if (mode == "apns" || mode == "both") && apns_ready {
-        for token in user_apns_tokens(db, request.user_id).await? {
-            match apns::send_alert(
-                env,
-                &token,
-                request.title,
-                request.body,
-                request.session_id,
-                request.voice_script,
-            )
-            .await
-            {
-                Ok(()) => apns_sent += 1,
-                Err(error) => apns_errors.push(error.message),
+        let tokens = user_apns_tokens(db, request.user_id).await?;
+        if !tokens.is_empty() {
+            match apns::provider_authorization(env) {
+                Ok(provider_authorization) => {
+                    for token in tokens {
+                        match apns::send_alert(
+                            env,
+                            &provider_authorization,
+                            &token,
+                            request.title,
+                            request.body,
+                            request.session_id,
+                            request.voice_script,
+                        )
+                        .await
+                        {
+                            Ok(()) => apns_sent += 1,
+                            Err(error) => apns_errors.push(error.message),
+                        }
+                    }
+                }
+                Err(error) => {
+                    apns_errors.resize(tokens.len(), error.message);
+                }
             }
         }
     }
