@@ -145,20 +145,35 @@ jobs:
         run: |
           set -euo pipefail
           staging_url="${STAGING_URL%/}"
-          health="$(curl --fail-with-body --silent --show-error --max-time 20 "${staging_url}/health")"
-          jq -e --arg expected_version "$STAGING_RELEASE_VERSION" '
-            (.ok == true) and
-            (.api == "rust") and
-            (.runtime == "cloudflare-worker") and
-            (.version == $expected_version) and
-            (.push_mode == "both") and
-            (.apns_ready == true) and
-            (.apns_production == false) and
-            (.action_provider_mode == "disabled") and
-            (.action_provider_ready == false) and
-            (.action_reminder_enabled == false) and
-            (.action_message_enabled == false)
-          ' <<<"$health" >/dev/null
+          health_ok=false
+          for attempt in $(seq 1 12); do
+            health=""
+            if health="$(curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 20 "${staging_url}/health")" \
+              && jq -e --arg expected_version "$STAGING_RELEASE_VERSION" '
+                (.ok == true) and
+                (.api == "rust") and
+                (.runtime == "cloudflare-worker") and
+                (.version == $expected_version) and
+                (.push_mode == "both") and
+                (.apns_ready == true) and
+                (.apns_production == false) and
+                (.action_provider_mode == "disabled") and
+                (.action_provider_ready == false) and
+                (.action_reminder_enabled == false) and
+                (.action_message_enabled == false)
+              ' <<<"$health" >/dev/null; then
+              health_ok=true
+              break
+            fi
+            if (( attempt < 12 )); then
+              echo "staging health is not ready yet (attempt ${attempt}/12); retrying" >&2
+              sleep 5
+            fi
+          done
+          if [[ "$health_ok" != true ]]; then
+            echo 'staging health did not converge to the deployed revision' >&2
+            exit 1
+          fi
           echo 'staging health contract passed: Rust Worker, APNs sandbox profile, and disabled action provider'
 
       - name: Remove materialized staging config
