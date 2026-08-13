@@ -1922,8 +1922,8 @@ async fn phone_history(
     )
 }
 
-fn retire_device_token_from_other_users_sql() -> &'static str {
-    "UPDATE devices SET push_token = NULL, updated_at = ? WHERE push_token = ? AND user_id != ?"
+fn retire_device_token_from_previous_bindings_sql() -> &'static str {
+    "UPDATE devices SET push_token = NULL, updated_at = ? WHERE push_token = ?"
 }
 
 async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
@@ -1956,16 +1956,15 @@ async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiRe
     let mut statements = Vec::new();
     if let Some(push_token) = push_token {
         // An APNs token identifies one current app installation. Transfer it
-        // away from any previous account before binding it to this owner so a
-        // shared device cannot keep receiving wakeups for an old account.
+        // away from every previous row before binding it to this device. This
+        // includes stale rows owned by the same account after an app reinstall
+        // as well as rows owned by a previous account. Both statements run in
+        // one D1 batch, so the token is never left unbound after a successful
+        // registration.
         statements.push(db::prepare(
             db,
-            retire_device_token_from_other_users_sql(),
-            vec![
-                db::text(&now),
-                db::text(push_token),
-                db::text(&user.user_id),
-            ],
+            retire_device_token_from_previous_bindings_sql(),
+            vec![db::text(&now), db::text(push_token)],
         )?);
     }
     let device_id = if let Some(existing) = existing {
@@ -2284,8 +2283,8 @@ fn add_common_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        phone_change_event_type, retire_device_token_from_other_users_sql, valid_model_r2_key,
-        valid_request_id, valid_semantic_version, validate_model_manifest,
+        phone_change_event_type, retire_device_token_from_previous_bindings_sql,
+        valid_model_r2_key, valid_request_id, valid_semantic_version, validate_model_manifest,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
@@ -2373,10 +2372,12 @@ mod tests {
     }
 
     #[test]
-    fn device_registration_transfers_one_apns_token_between_accounts() {
-        let sql = retire_device_token_from_other_users_sql();
-        assert!(sql.contains("SET push_token = NULL"));
-        assert!(sql.contains("WHERE push_token = ?"));
-        assert!(sql.contains("user_id != ?"));
+    fn device_registration_rebinds_one_apns_token_after_reinstall_or_account_change() {
+        let sql = retire_device_token_from_previous_bindings_sql();
+        assert_eq!(
+            sql,
+            "UPDATE devices SET push_token = NULL, updated_at = ? WHERE push_token = ?"
+        );
+        assert!(!sql.contains("user_id"));
     }
 }
