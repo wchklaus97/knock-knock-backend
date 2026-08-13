@@ -26,20 +26,35 @@ if [[ "${BASE_URL}" == *production* ]]; then
   exit 64
 fi
 
-health="$(curl --fail-with-body --silent --show-error "${BASE_URL}/health")"
-jq -e --arg expected_version "${STAGING_RELEASE_VERSION}" '
-  (.ok == true) and
-  (.api == "rust") and
-  (.runtime == "cloudflare-worker") and
-  (.version == $expected_version) and
-  (.push_mode == "both") and
-  (.apns_ready == true) and
-  (.apns_production == false) and
-  (.action_provider_mode == "disabled") and
-  (.action_provider_ready == false) and
-  (.action_reminder_enabled == false) and
-  (.action_message_enabled == false)
-' <<<"${health}" >/dev/null
+health_ok=false
+for attempt in $(seq 1 6); do
+  health=""
+  if health="$(curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 20 "${BASE_URL}/health")" \
+    && jq -e --arg expected_version "${STAGING_RELEASE_VERSION}" '
+      (.ok == true) and
+      (.api == "rust") and
+      (.runtime == "cloudflare-worker") and
+      (.version == $expected_version) and
+      (.push_mode == "both") and
+      (.apns_ready == true) and
+      (.apns_production == false) and
+      (.action_provider_mode == "disabled") and
+      (.action_provider_ready == false) and
+      (.action_reminder_enabled == false) and
+      (.action_message_enabled == false)
+    ' <<<"${health}" >/dev/null; then
+    health_ok=true
+    break
+  fi
+  if (( attempt < 6 )); then
+    echo "staging health is temporarily unavailable or stale (attempt ${attempt}/6); retrying" >&2
+    sleep 5
+  fi
+done
+if [[ "${health_ok}" != true ]]; then
+  echo 'staging health did not match the expected release contract' >&2
+  exit 1
+fi
 
 BASE_URL="${BASE_URL}" \
 EXPECTED_PROVIDER_READY=false \

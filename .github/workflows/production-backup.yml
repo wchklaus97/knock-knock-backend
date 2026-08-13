@@ -39,11 +39,25 @@ jobs:
         run: |
           test -n "$D1_DATABASE_ID"
           test -n "$CORS_ORIGIN"
+          if [[ -z "$BACKUP_BUCKET" ]]; then
+            echo "missing required production setting: BACKUP_BUCKET" >&2
+            exit 64
+          fi
+          if [[ ! "$BACKUP_BUCKET" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]; then
+            echo "BACKUP_BUCKET must be 3-63 lowercase letters, numbers, or hyphens and start/end with an alphanumeric character" >&2
+            exit 64
+          fi
+          config="$RUNNER_TEMP/wrangler.production.toml"
           sed \
             -e "s|REPLACE_WITH_D1_DATABASE_ID|$D1_DATABASE_ID|g" \
             -e "s|REPLACE_WITH_ALLOWED_ORIGIN|$CORS_ORIGIN|g" \
             -e "s|REPLACE_WITH_RELEASE_VERSION|backup-${GITHUB_RUN_ID}|g" \
-            wrangler.production.toml.example > "$RUNNER_TEMP/wrangler.production.toml"
+            -e "s|REPLACE_WITH_R2_BUCKET_NAME|$BACKUP_BUCKET|g" \
+            wrangler.production.toml.example > "$config"
+          if grep -Eq 'REPLACE_WITH_(D1_DATABASE_ID|ALLOWED_ORIGIN|RELEASE_VERSION|R2_BUCKET_NAME)' "$config"; then
+            echo "backup configuration still contains a required placeholder" >&2
+            exit 64
+          fi
       - name: Export production D1
         env:
           KNOCK_KNOCK_PRODUCTION_CONFIG: ${{ runner.temp }}/wrangler.production.toml
