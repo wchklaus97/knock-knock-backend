@@ -7,6 +7,9 @@ use crate::error::ApiResult;
 use crate::models::AuditRow;
 use crate::pagination;
 
+/// Records compatibility-path audit data with the project's established
+/// best-effort semantics: an audit write failure never rewinds an already
+/// durable business mutation. Callers must keep metadata explicitly redacted.
 pub async fn record_audit(
     db: &D1Database,
     action: &str,

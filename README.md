@@ -9,7 +9,7 @@ MCP clients:
 - `/v1/agents/*` and `/v1/pairing/*` — agent keys and one-time pairing
 - `/v1/skills` — skill definitions
 - `/v1/sessions/*` and `/v1/actions/*` — agent session/action loop
-- `/v1/phone/*` — phone inbox, replies, confirmations and devices
+- `/v1/phone/*` — phone inbox, structured Memory, commands, sync and devices
 - `/v1/dev/pushes` — development push inbox
 
 ## Local development
@@ -34,6 +34,14 @@ the full auth/pairing/phone loop and two consecutive decisions on the same
 
 The local endpoint is `http://127.0.0.1:8787`. For the iPhone, use the Mac's
 LAN address instead of `127.0.0.1`.
+
+Structured Memory is backend-authoritative factual data. The authenticated
+phone API can create only `explicit_user` facts with `user_confirmed=true`;
+`trusted_system` is reserved for a future internal server path. Memory
+retention expires through soft deletion and durable sync tombstones. Only
+`display_text` may be read by the non-persistent, read-only E5 shadow
+evaluator; `value`, storage `value_json`, and source URLs are never direct
+prompt input, and shadow output does not affect API, Command, UI, or execution.
 
 Set a development secret in `.dev.vars`:
 

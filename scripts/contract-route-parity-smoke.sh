@@ -42,6 +42,16 @@ unless missing.empty? && extra.empty?
   exit 1
 end
 
+required_memory_routes = Set[
+  ["get", "/v1/phone/memories"],
+  ["post", "/v1/phone/memories"],
+  ["get", "/v1/phone/memories/{memory_id}"],
+  ["delete", "/v1/phone/memories/{memory_id}"]
+]
+unless required_memory_routes.subset?(routes) && required_memory_routes.subset?(contract_routes)
+  abort "structured Memory routes must remain executable and canonical"
+end
+
 operation_ids = contract.fetch("paths").flat_map do |_path, operations|
   operations.values.map { |operation| operation["operationId"] }.compact
 end

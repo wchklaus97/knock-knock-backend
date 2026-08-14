@@ -170,6 +170,44 @@ and the current gap. IDs are stable and must not be reused.
 | D39 | iOS persistence uses system SQLite. | The app has an iOS 15 floor; SwiftData cannot be the required store. | Migration, crash recovery, logout deletion, and offline reads pass on iOS 15. | iOS 15 SQLite cache/queue plus scoped, version-checked active-command checkpoints, cold-launch reconciliation, and queued manual retry during active auto-retry exist; real termination/offline UI UAT remains. |
 | D40 | Backend contracts are the single API schema source. | OpenAPI 3.1 plus embedded JSON Schema prevents iOS/backend field drift. | Schema lint, fixture validation, breaking-change CI, and generated examples pass. | OpenAPI covers lightweight command presentation, private model delivery, and all 48 routes; paired voice PR review and deployed compatibility smoke remain. |
 
+## Additive Memory ADR — 2026-08-14
+
+This ADR is additive. It leaves the accepted D01–D40 register above byte-for-byte
+unchanged and introduces two independently reviewable decisions.
+
+### D41 — Structured Memory is backend-authoritative
+
+**Status:** Accepted.
+
+Structured Memory is typed, user-scoped factual data owned by the backend.
+The public phone API may write it only when the authenticated user explicitly
+confirms the fact. `trusted_system` remains reserved for a future internal
+server path with its own authorization and review; a client cannot claim that
+source type. Models may propose or evaluate a fact, but they cannot write a
+Memory row directly or bypass confirmation, ownership, validation,
+idempotency, retention, audit, or sync tombstone policy.
+
+Validation is migration 0015, the canonical OpenAPI Memory schemas, Rust
+request/projection tests, authenticated local contract tests, and cursor/
+tombstone migration smoke. Production activation of any new internal writer
+requires a separate RFC and authorization path.
+
+### D42 — Multilingual E5 is a read-only shadow evaluator
+
+**Status:** Accepted.
+
+The multilingual-E5 experiment may read only the reviewed `display_text`
+projection. Storage `value_json`, public `value`, source URLs, provenance
+payloads, and instructions embedded inside structured values must never be
+fed directly into a prompt or embedding input. The shadow evaluator does not
+persist embeddings and its output cannot alter API responses, Command policy,
+UI state, ranking, or execution.
+
+The OpenAPI prompt boundary and contract smoke enforce the allowed input and
+non-persistence declaration. Enabling production ranking, persistence, or any
+product-visible effect requires a new RFC and decision; it is not authorized
+by D42.
+
 ## Canonical data model target
 
 The target model is intentionally additive:
@@ -184,6 +222,7 @@ action_attempts   external execution attempts and unknown outcomes
 outbox_events     post-commit delivery work
 phone_changes     durable per-user sync cursor
 retrieval_items   source snapshots and R2 references
+memory_items      backend-authoritative typed user facts and retention state
 devices           per-device locale, push token, and sync metadata
 pushes            wake-up history plus read/dismiss state
 R2                audio and large retrieval payloads with expiry

@@ -110,6 +110,7 @@ mod tests {
         assert_eq!(category("/v1/phone/commands"), ("command", 60));
         assert_eq!(category("/v1/phone/events"), ("sse", 30));
         assert_eq!(category("/v1/phone/devices"), ("device", 60));
+        assert_eq!(category("/v1/phone/memories"), ("api", 240));
         assert_eq!(category("/v1/phone/models/gemma"), ("model", 30));
         assert_eq!(
             category("/v1/phone/retrievals/ret_1/download"),
