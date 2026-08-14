@@ -128,6 +128,10 @@ jobs:
           import sys
 
           source = pathlib.Path("wrangler.production.toml.example").read_text()
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          migrations_dir = workspace / "migrations"
+          if not migrations_dir.is_dir():
+              raise SystemExit(f"production migrations directory is missing: {migrations_dir}")
 
           def toml_string(value: str) -> str:
               return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
@@ -150,7 +154,11 @@ jobs:
           }
           source = source.replace(
               'main = "build/worker/shim.mjs"',
-              f'main = "{toml_string(os.environ["GITHUB_WORKSPACE"] + "/build/worker/shim.mjs")}"',
+              f'main = "{toml_string(str(workspace / "build/worker/shim.mjs"))}"',
+          )
+          source = source.replace(
+              'migrations_dir = "migrations"',
+              f'migrations_dir = "{toml_string(str(migrations_dir))}"',
           )
           for marker, value in replacements.items():
               source = source.replace(marker, toml_string(value))
@@ -162,6 +170,8 @@ jobs:
           fi
           grep -Fqx 'NODE_ENV = "production"' "$config"
           grep -Fqx 'APNS_PRODUCTION = "true"' "$config"
+          test -d "$GITHUB_WORKSPACE/migrations"
+          grep -Fqx "migrations_dir = \"$GITHUB_WORKSPACE/migrations\"" "$config"
           echo "PRODUCTION_WRANGLER_CONFIG=$config" >> "$GITHUB_ENV"
 
       - name: Apply approved production migrations
