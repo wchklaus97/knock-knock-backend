@@ -7,6 +7,7 @@ LOCAL_EXAMPLE="$ROOT/wrangler.toml.example"
 PRODUCTION_EXAMPLE="$ROOT/wrangler.production.toml.example"
 STAGING_EXAMPLE="$ROOT/wrangler.staging.toml.example"
 BACKUP_WORKFLOW="$ROOT/.github/workflows/production-backup.yml"
+PRODUCTION_RELEASE_WORKFLOW="$ROOT/.github/workflows/production-release.yml"
 STAGING_DEPLOY_WORKFLOW="$ROOT/.github/workflows/staging-deploy.yml"
 
 for file in "$LOCAL_CONFIG" "$LOCAL_EXAMPLE" "$PRODUCTION_EXAMPLE" "$STAGING_EXAMPLE"; do
@@ -61,6 +62,15 @@ grep -Fq '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$' "$BACKUP_WORKFLOW"
 grep -Fq -- "-e \"s|REPLACE_WITH_R2_BUCKET_NAME|\$BACKUP_BUCKET|g\"" "$BACKUP_WORKFLOW"
 grep -Fq "REPLACE_WITH_(D1_DATABASE_ID|ALLOWED_ORIGIN|RELEASE_VERSION|R2_BUCKET_NAME)" "$BACKUP_WORKFLOW"
 grep -Fq "\`production-backup\` environment" "$ROOT/docs/PRODUCTION_RELEASE_RUNBOOK.md"
+grep -Fq 'workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()' "$PRODUCTION_RELEASE_WORKFLOW"
+grep -Fq 'migrations_dir = workspace / "migrations"' "$PRODUCTION_RELEASE_WORKFLOW"
+grep -Fq 'production migrations directory is missing' "$PRODUCTION_RELEASE_WORKFLOW"
+grep -Fq 'migrations_dir = "{toml_string(str(migrations_dir))}"' "$PRODUCTION_RELEASE_WORKFLOW"
+# These assertions intentionally match the literal GitHub Actions shell source.
+# shellcheck disable=SC2016
+grep -Fq 'test -d "$GITHUB_WORKSPACE/migrations"' "$PRODUCTION_RELEASE_WORKFLOW"
+# shellcheck disable=SC2016
+grep -Fq 'grep -Fqx "migrations_dir = \"$GITHUB_WORKSPACE/migrations\"" "$config"' "$PRODUCTION_RELEASE_WORKFLOW"
 if grep -q 'actions/upload-artifact' "$BACKUP_WORKFLOW"; then
   echo "production backups must not be retained as plaintext CI artifacts" >&2
   exit 1
