@@ -32,7 +32,7 @@ stop_process() {
 
 print_sanitized_logs() {
   local log_file
-  for log_file in "${TMP_DIR}/migrations.log" "${TMP_DIR}/worker.log"; do
+  for log_file in "${TMP_DIR}/migrations.log" "${TMP_DIR}/memory-audit.log" "${TMP_DIR}/worker.log"; do
     if [[ -f "${log_file}" ]]; then
       "${ROOT_DIR}/scripts/ci-log-sanitize.sh" "${log_file}" >&2 || true
     fi
@@ -163,5 +163,38 @@ MODEL_ID="${MODEL_ID}" \
 EXPECTED_MODEL_ARTIFACT="${MODEL_ARTIFACT}" \
 SMOKE_EMAIL="${MODEL_SMOKE_EMAIL:-local-model-$(date +%s)-$$@local.test}" \
   "${ROOT_DIR}/scripts/voice-model-r2-smoke.sh"
+
+BASE_URL="http://127.0.0.1:${WORKER_PORT}" \
+SMOKE_EMAIL="${MEMORY_SMOKE_EMAIL:-local-memory-$(date +%s)-$$@local.test}" \
+  "${ROOT_DIR}/scripts/memory-contract-smoke.sh"
+
+if ! wrangler d1 execute DB --local \
+  --persist-to "${PERSIST_TO}" \
+  --config "${ROOT_DIR}/wrangler.toml" \
+  --command "SELECT action, metadata_json FROM audit_logs WHERE action IN ('memory.create', 'memory.delete') ORDER BY created_at, id" \
+  --json >"${TMP_DIR}/memory-audit.json" 2>"${TMP_DIR}/memory-audit.log"; then
+  fail "local Memory audit query failed"
+fi
+jq -e '
+  .[0].results as $rows |
+  ([$rows[] | select(.action == "memory.create")] | length >= 4) and
+  ([$rows[] | select(.action == "memory.delete")] | length >= 1) and
+  any($rows[];
+    .action == "memory.create" and
+    ((.metadata_json | fromjson).result == "created")
+  ) and
+  any($rows[];
+    .action == "memory.create" and
+    ((.metadata_json | fromjson).result == "replay")
+  ) and
+  all($rows[];
+    (.metadata_json | fromjson) as $metadata |
+    if .action == "memory.create" then
+      (($metadata | keys | sort) == ["kind", "memory_id", "result", "source_type"])
+    else
+      (($metadata | keys | sort) == ["kind", "memory_id", "source_type"])
+    end
+  )
+' "${TMP_DIR}/memory-audit.json" >/dev/null || fail "Memory audit metadata was missing or unsafe"
 
 echo "local-contract-gate passed: isolated Worker/D1/R2 contract, readiness, correlation, retention, model streaming, and isolation smokes"

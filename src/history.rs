@@ -5,6 +5,7 @@ use worker::{D1Database, Env};
 
 use crate::db;
 use crate::error::{ApiError, ApiResult};
+use crate::memories;
 use crate::models::{RetrievalItemRow, SessionMessageRow, SessionRow};
 use crate::pagination;
 use crate::sessions;
@@ -52,6 +53,7 @@ pub async fn purge_expired(db: &D1Database, env: &Env, user_id: &str) -> ApiResu
     let retrievals = expired_retrievals(db, Some(user_id), &now, RETENTION_SWEEP_BATCH).await?;
     delete_r2_objects(db, env, &retrievals).await?;
     expire_retrieval_rows(db, &retrievals, &now).await?;
+    memories::soft_delete_expired_for_user(db, user_id, &now).await?;
     db::run(
         db,
         "DELETE FROM session_messages WHERE user_id = ? AND retention_expires_at IS NOT NULL AND retention_expires_at <= ?",
@@ -69,13 +71,14 @@ pub async fn purge_expired_all(db: &D1Database, env: &Env) -> ApiResult<usize> {
     let expired = expired_retrievals(db, None, &now, RETENTION_SWEEP_BATCH).await?;
     delete_r2_objects(db, env, &expired).await?;
     let retrievals = expire_retrieval_rows(db, &expired, &now).await?;
+    let memories = memories::soft_delete_expired_all(db, &now, RETENTION_SWEEP_BATCH).await?;
     let messages = db::run(
         db,
         "DELETE FROM session_messages WHERE id IN (SELECT id FROM session_messages WHERE retention_expires_at IS NOT NULL AND retention_expires_at <= ? ORDER BY created_at ASC, id ASC LIMIT ?)",
         vec![db::text(&now), db::number(RETENTION_SWEEP_BATCH)],
     )
     .await?;
-    Ok(retrievals + db::changes(&messages))
+    Ok(retrievals + memories + db::changes(&messages))
 }
 
 async fn expired_retrievals(

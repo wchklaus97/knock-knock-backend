@@ -285,7 +285,7 @@ fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
 
 // RFC3339 constrained to ordinary seconds and millisecond precision, matching
 // the execution clock used for the strict-future comparison.
-fn parse_reminder_due_at_millis(timestamp: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339_millis(timestamp: &str) -> Option<i64> {
     let bytes = timestamp.as_bytes();
     if bytes.len() < 20
         || bytes[4] != b'-'
@@ -389,7 +389,7 @@ fn validate_action_args_at(
     validate_action_args_shape(intent, args)?;
     let valid = intent != "create_reminder"
         || reminder_due_at(args)
-            .and_then(parse_reminder_due_at_millis)
+            .and_then(parse_rfc3339_millis)
             .is_some_and(|due_at_millis| due_at_millis > now_millis);
     valid
         .then_some(())
@@ -412,7 +412,7 @@ pub fn validate_action_args_shape(
         && fields.iter().all(|field| field.validates(args))
         && (intent != "create_reminder"
             || reminder_due_at(args)
-                .and_then(parse_reminder_due_at_millis)
+                .and_then(parse_rfc3339_millis)
                 .is_some());
     valid
         .then_some(())
@@ -2037,7 +2037,7 @@ mod tests {
     }
 
     fn test_timestamp_millis(timestamp: &str) -> i64 {
-        parse_reminder_due_at_millis(timestamp).unwrap()
+        parse_rfc3339_millis(timestamp).unwrap()
     }
 
     fn validate_reminder_due_at_at(due_at: &str, now: &str) -> Result<(), CommandValidationError> {

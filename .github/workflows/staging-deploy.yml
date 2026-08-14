@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       apply_migrations:
-        description: Apply only migrations 0013 and 0014 through the separately gated staging path
+        description: Apply only migrations 0013, 0014, and 0015 through the separately gated staging path
         required: true
         default: false
         type: boolean
@@ -181,7 +181,7 @@ jobs:
         run: rm -f -- "${STAGING_WRANGLER_CONFIG:-}"
 
   apply-migrations:
-    name: Apply staging expand migrations 0013/0014 (explicit opt-in)
+    name: Apply staging expand migrations 0013/0014/0015 (explicit opt-in)
     needs: deploy
     if: ${{ inputs.apply_migrations == true }}
     runs-on: ubuntu-latest
@@ -264,9 +264,11 @@ jobs:
           mkdir -m 700 "$migration_dir"
           cp -- migrations/0013_retrieval_retention_status.sql "$migration_dir/"
           cp -- migrations/0014_command_safety.sql "$migration_dir/"
+          cp -- migrations/0015_structured_memory.sql "$migration_dir/"
           test -f "$migration_dir/0013_retrieval_retention_status.sql"
           test -f "$migration_dir/0014_command_safety.sql"
-          test "$(find "$migration_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 2
+          test -f "$migration_dir/0015_structured_memory.sql"
+          test "$(find "$migration_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 3
 
           migration_config="$RUNNER_TEMP/wrangler.staging-migrations.toml"
           sed \
@@ -275,12 +277,12 @@ jobs:
           grep -Fqx "migrations_dir = \"${migration_dir}\"" "$migration_config"
           echo "STAGING_MIGRATION_CONFIG=$migration_config" >> "$GITHUB_ENV"
 
-      - name: Apply only migrations 0013 and 0014 to staging D1
+      - name: Apply only migrations 0013, 0014, and 0015 to staging D1
         run: |
           set -euo pipefail
           test -n "${STAGING_MIGRATION_CONFIG:-}"
           # The temporary migration directory contains exactly the documented
-          # expand pair; no earlier, later, or production config is available.
+          # expand set; no earlier, later, or production config is available.
           test "$(grep -Fc "migrations_dir = \"${RUNNER_TEMP}/staging-expand-migrations\"" "$STAGING_MIGRATION_CONFIG")" -eq 1
           wrangler d1 migrations apply DB --remote --cwd "$GITHUB_WORKSPACE" --config "$STAGING_MIGRATION_CONFIG"
 
@@ -288,5 +290,5 @@ jobs:
         if: ${{ always() }}
         run: |
           rm -f -- "${STAGING_MIGRATION_CONFIG:-}" "${RUNNER_TEMP}/wrangler.staging.toml"
-          rm -f -- "${RUNNER_TEMP}/staging-expand-migrations/0013_retrieval_retention_status.sql" "${RUNNER_TEMP}/staging-expand-migrations/0014_command_safety.sql"
+          rm -f -- "${RUNNER_TEMP}/staging-expand-migrations/0013_retrieval_retention_status.sql" "${RUNNER_TEMP}/staging-expand-migrations/0014_command_safety.sql" "${RUNNER_TEMP}/staging-expand-migrations/0015_structured_memory.sql"
           rmdir -- "${RUNNER_TEMP}/staging-expand-migrations" 2>/dev/null || true

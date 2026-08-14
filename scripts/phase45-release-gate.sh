@@ -25,6 +25,7 @@ echo "[phase45] contract, migration, configuration, and adversarial checks"
 ./scripts/voice-model-candidate-smoke.sh
 ./scripts/voice-model-release-smoke.sh
 test -x ./scripts/local-contract-gate.sh
+test -x ./scripts/memory-contract-smoke.sh
 test -x ./scripts/execution-time-authority-smoke.sh
 test -x ./scripts/r2-download-smoke.sh
 test -x ./scripts/provider-lifecycle-smoke.sh
@@ -43,6 +44,7 @@ bash -n \
   ./scripts/ci-log-sanitization-smoke.sh \
   ./scripts/execution-time-authority-smoke.sh \
   ./scripts/local-contract-gate.sh \
+  ./scripts/memory-contract-smoke.sh \
   ./scripts/r2-download-smoke.sh \
   ./scripts/provider-lifecycle-smoke.sh \
   ./scripts/provider-local-gate.sh \

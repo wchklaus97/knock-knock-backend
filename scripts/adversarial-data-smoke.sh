@@ -19,7 +19,8 @@ sqlite3 "${DB_FILE}" \
   ".read ${ROOT_DIR}/migrations/0011_command_pairing_action_descriptors.sql" \
   ".read ${ROOT_DIR}/migrations/0012_reminder_delivery_state.sql" \
   ".read ${ROOT_DIR}/migrations/0013_retrieval_retention_status.sql" \
-  ".read ${ROOT_DIR}/migrations/0014_command_safety.sql"
+  ".read ${ROOT_DIR}/migrations/0014_command_safety.sql" \
+  ".read ${ROOT_DIR}/migrations/0015_structured_memory.sql"
 
 sqlite3 "${DB_FILE}" <<'SQL'
 INSERT INTO users (id, email, password_hash, created_at) VALUES

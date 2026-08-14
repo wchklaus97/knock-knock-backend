@@ -1,6 +1,13 @@
 use serde_json::{json, Value};
 
-const ENTITY_TYPES: [&str; 5] = ["session", "message", "command", "push", "retrieval"];
+const ENTITY_TYPES: [&str; 6] = [
+    "session",
+    "message",
+    "command",
+    "push",
+    "retrieval",
+    "memory",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CursorError {
@@ -89,6 +96,8 @@ mod tests {
         assert_eq!(payload["entity_id"], "ses_1");
         assert_eq!(payload["version"], 3);
         assert!(change_payload(9, "unknown", "id", None, 1).is_err());
+        assert_eq!(ENTITY_TYPES.len(), 6);
+        assert!(change_payload(9, "memory", "memory_1", None, 1).is_ok());
     }
 
     #[test]

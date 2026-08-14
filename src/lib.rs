@@ -6,6 +6,7 @@ mod commands;
 mod db;
 mod error;
 mod history;
+mod memories;
 mod models;
 mod outbox;
 mod pagination;
@@ -262,6 +263,16 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         }
 
         (Method::Get, ["v1", "phone", "sessions"]) => phone_sessions(&req, &env, &db).await,
+        (Method::Get, ["v1", "phone", "memories"]) => phone_memories(&req, &env, &db).await,
+        (Method::Post, ["v1", "phone", "memories"]) => {
+            phone_create_memory(&mut req, &env, &db).await
+        }
+        (Method::Get, ["v1", "phone", "memories", memory_id]) => {
+            phone_memory(&req, &env, &db, memory_id).await
+        }
+        (Method::Delete, ["v1", "phone", "memories", memory_id]) => {
+            phone_delete_memory(&req, &env, &db, memory_id).await
+        }
         (Method::Get, ["v1", "phone", "sync"]) => phone_sync(&req, &env, &db).await,
         (Method::Get, ["v1", "phone", "events"]) => phone_events(&req, &env, db).await,
         (Method::Get, ["v1", "phone", "sessions", session_id]) => {
@@ -1135,6 +1146,75 @@ async fn phone_sessions(req: &Request, env: &Env, db: &D1Database) -> ApiResult<
     )
 }
 
+async fn phone_memories(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    history::purge_expired(db, env, &user.user_id).await?;
+    let before = query_value(req, "before")?;
+    json_response(
+        memories::list_for_user(db, &user.user_id, before.as_deref(), query_limit(req, 50)?)
+            .await?,
+        200,
+    )
+}
+
+async fn phone_create_memory(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let body: memories::CreateMemoryRequest = read_json(req).await?;
+    let result = memories::create(db, &user.user_id, body).await?;
+    audit::record_audit(
+        db,
+        "memory.create",
+        Some(&user.user_id),
+        None,
+        None,
+        memories::create_audit_metadata(&result),
+    )
+    .await;
+    json_response(result.memory, if result.created { 201 } else { 200 })
+}
+
+async fn phone_memory(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    memory_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    history::purge_expired(db, env, &user.user_id).await?;
+    let memory = memories::get_for_user(db, &user.user_id, memory_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Memory not found"))?;
+    json_response(memory, 200)
+}
+
+async fn phone_delete_memory(
+    req: &Request,
+    env: &Env,
+    db: &D1Database,
+    memory_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    history::purge_expired(db, env, &user.user_id).await?;
+    let result = memories::soft_delete(db, &user.user_id, memory_id).await?;
+    audit::record_audit(
+        db,
+        "memory.delete",
+        Some(&user.user_id),
+        None,
+        None,
+        memories::delete_audit_metadata(memory_id, &result),
+    )
+    .await;
+    json_response(
+        json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "deleted_at": result.deleted_at,
+        }),
+        200,
+    )
+}
+
 async fn phone_session_for_user(
     req: &Request,
     env: &Env,
@@ -1721,6 +1801,9 @@ fn phone_change_event_type(entity_type: &str) -> &'static str {
         // stable while forcing clients to reconcile retrieval tombstones and
         // metadata changes through the authoritative snapshot.
         "retrieval" => "sync.required",
+        // Memory events remain invalidation hints. Typed facts are fetched
+        // through the authenticated Memory REST endpoint.
+        "memory" => "sync.required",
         _ => "sync.required",
     }
 }
@@ -2368,6 +2451,7 @@ mod tests {
     #[test]
     fn retrieval_changes_require_snapshot_reconciliation() {
         assert_eq!(phone_change_event_type("retrieval"), "sync.required");
+        assert_eq!(phone_change_event_type("memory"), "sync.required");
         assert_eq!(phone_change_event_type("message"), "message.created");
     }
 

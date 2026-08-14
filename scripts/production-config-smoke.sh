@@ -7,6 +7,7 @@ LOCAL_EXAMPLE="$ROOT/wrangler.toml.example"
 PRODUCTION_EXAMPLE="$ROOT/wrangler.production.toml.example"
 STAGING_EXAMPLE="$ROOT/wrangler.staging.toml.example"
 BACKUP_WORKFLOW="$ROOT/.github/workflows/production-backup.yml"
+STAGING_DEPLOY_WORKFLOW="$ROOT/.github/workflows/staging-deploy.yml"
 
 for file in "$LOCAL_CONFIG" "$LOCAL_EXAMPLE" "$PRODUCTION_EXAMPLE" "$STAGING_EXAMPLE"; do
   test -f "$file"
@@ -122,5 +123,18 @@ if grep -Fq 'vars.KNOCK_KNOCK_STAGING_RELEASE_VERSION' "$ROOT/.github/workflows/
   echo "staging release identity must come from github.sha, not a mutable repository variable" >&2
   exit 1
 fi
+
+# The staging migration job is intentionally allowlisted. Keep its newest
+# entry mechanically tied to the repository's newest migration so an additive
+# schema cannot be deployed without first becoming staging-applicable.
+latest_migration="$(find "$ROOT/migrations" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]_*.sql' -print | sort | tail -n 1)"
+latest_migration_name="$(basename "$latest_migration")"
+test -n "$latest_migration_name"
+grep -Fq "cp -- migrations/${latest_migration_name} \"\$migration_dir/\"" "$STAGING_DEPLOY_WORKFLOW"
+grep -Fq "test -f \"\$migration_dir/${latest_migration_name}\"" "$STAGING_DEPLOY_WORKFLOW"
+grep -Fq "staging-expand-migrations/${latest_migration_name}" "$STAGING_DEPLOY_WORKFLOW"
+
+workflow_latest_migration="$(grep -Eo 'migrations/[0-9]{4}_[A-Za-z0-9_]+[.]sql' "$STAGING_DEPLOY_WORKFLOW" | sed 's|^migrations/||' | sort | tail -n 1)"
+test "$workflow_latest_migration" = "$latest_migration_name"
 
 echo "production config smoke passed: local defaults are explicit and production is fail-closed"
