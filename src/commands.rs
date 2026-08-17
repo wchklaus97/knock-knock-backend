@@ -587,7 +587,10 @@ pub fn valid_transition(from: Option<&str>, to: &str) -> bool {
             to,
             "running" | "cancelled" | "expired" | "retryable" | "unknown"
         ),
-        "running" => matches!(to, "succeeded" | "failed" | "retryable" | "unknown"),
+        "running" => matches!(
+            to,
+            "succeeded" | "failed" | "retryable" | "unknown" | "cancelled" | "expired"
+        ),
         "retryable" => matches!(
             to,
             "running" | "retryable" | "failed" | "expired" | "cancelled" | "unknown"
@@ -1846,7 +1849,7 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
     }
     if !matches!(
         command.state.as_str(),
-        "pending" | "validated" | "awaiting_confirmation" | "queued" | "retryable"
+        "pending" | "validated" | "awaiting_confirmation" | "queued" | "retryable" | "running"
     ) {
         return Err(ApiError::conflict(
             "Command cannot be cancelled in its current state",
@@ -1921,7 +1924,7 @@ pub async fn cancel(db: &D1Database, user_id: &str, command_id: &str) -> ApiResu
 
 fn cancel_command_sql() -> String {
     format!(
-        "UPDATE commands SET state = 'cancelled', error_code = NULL, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable') AND version = ? AND NOT {}",
+        "UPDATE commands SET state = 'cancelled', error_code = NULL, version = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable', 'running') AND version = ? AND NOT {}",
         RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
     )
 }
@@ -2214,9 +2217,10 @@ mod tests {
             RECOVERABLE_ACTION_ATTEMPT_EXISTS_SQL
         )));
         assert!(cancel.contains(
-            "state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable')"
+            "state IN ('pending', 'validated', 'awaiting_confirmation', 'queued', 'retryable', 'running')"
         ));
         assert!(cancel_outbox_sql().contains("AND changes() = 1"));
+        assert!(cancel_outbox_sql().contains("state IN ('queued', 'retrying', 'unknown')"));
     }
 
     #[test]
@@ -2777,6 +2781,7 @@ mod tests {
         assert!(valid_transition(Some("running"), "retryable"));
         assert!(valid_transition(Some("retryable"), "running"));
         assert!(valid_transition(Some("retryable"), "cancelled"));
+        assert!(valid_transition(Some("running"), "cancelled"));
         assert!(valid_transition(Some("retryable"), "unknown"));
         assert!(valid_transition(Some("running"), "unknown"));
         assert!(valid_transition(Some("unknown"), "succeeded"));

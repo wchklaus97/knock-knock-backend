@@ -2237,6 +2237,45 @@ async fn phone_confirm(
     }
 }
 
+/// Confirm/create can leave work in the outbox. Drain it before answering so
+/// the phone receives the post-execution state instead of a stuck `queued`.
+fn command_body_after_outbox_drain(fallback: Value, snapshot: Option<Value>) -> Value {
+    let Some(mut body) = snapshot else {
+        return fallback;
+    };
+    let snapshot_token = body.get("confirmation_token").and_then(Value::as_str);
+    if snapshot_token.is_none() {
+        if let Some(token) = fallback.get("confirmation_token").cloned() {
+            if token.as_str().is_some_and(|value| !value.is_empty()) {
+                body["confirmation_token"] = token;
+            }
+        }
+    }
+    body
+}
+
+async fn json_response_after_outbox_drain(
+    db: &D1Database,
+    env: &Env,
+    user_id: &str,
+    fallback: Value,
+    status: u16,
+) -> ApiResult<Response> {
+    let _ = outbox::drain(db, env).await;
+    let command_id = fallback
+        .get("command_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let snapshot = match command_id.as_deref() {
+        Some(command_id) => match crate::commands::get_for_user(db, user_id, command_id).await {
+            Ok(Some(command)) => Some(crate::commands::response(&command, None)),
+            _ => None,
+        },
+        None => None,
+    };
+    json_response(command_body_after_outbox_drain(fallback, snapshot), status)
+}
+
 async fn phone_create_command(
     req: &mut Request,
     env: &Env,
@@ -2244,7 +2283,8 @@ async fn phone_create_command(
 ) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
     let body: CommandEnvelope = read_json(req).await?;
-    json_response(crate::commands::create(db, &user.user_id, body).await?, 202)
+    let response = crate::commands::create(db, &user.user_id, body).await?;
+    json_response_after_outbox_drain(db, env, &user.user_id, response, 202).await
 }
 
 async fn phone_get_command(
@@ -2287,10 +2327,9 @@ async fn phone_confirm_command(
 ) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
     let body: ConfirmationRequest = read_json(req).await?;
-    json_response(
-        crate::commands::confirm(db, &user.user_id, command_id, &body.confirmation_token).await?,
-        200,
-    )
+    let response =
+        crate::commands::confirm(db, &user.user_id, command_id, &body.confirmation_token).await?;
+    json_response_after_outbox_drain(db, env, &user.user_id, response, 200).await
 }
 
 async fn phone_cancel_command(
@@ -2463,5 +2502,56 @@ mod tests {
             "UPDATE devices SET push_token = NULL, updated_at = ? WHERE push_token = ?"
         );
         assert!(!sql.contains("user_id"));
+    }
+
+    #[test]
+    fn create_and_confirm_return_the_post_drain_command_snapshot() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("json_response_after_outbox_drain"));
+        assert!(source.contains(
+            "json_response_after_outbox_drain(db, env, &user.user_id, response, 202).await"
+        ));
+        assert!(source.contains(
+            "json_response_after_outbox_drain(db, env, &user.user_id, response, 200).await"
+        ));
+    }
+
+    #[test]
+    fn post_drain_snapshot_replaces_queued_confirm_with_disabled_failure() {
+        let fallback = json!({
+            "command_id": "cmd_send",
+            "state": "queued",
+            "confirmation_token": null,
+            "error": null
+        });
+        let snapshot = json!({
+            "command_id": "cmd_send",
+            "state": "failed",
+            "confirmation_token": null,
+            "error": {"code": "action_disabled", "retryable": false},
+            "presentation": {"terminal": true}
+        });
+        let body = super::command_body_after_outbox_drain(fallback, Some(snapshot));
+        assert_eq!(body["state"], json!("failed"));
+        assert_ne!(body["state"], json!("queued"));
+        assert_eq!(body["error"]["code"], json!("action_disabled"));
+        assert_eq!(body["presentation"]["terminal"], json!(true));
+    }
+
+    #[test]
+    fn post_drain_snapshot_keeps_create_confirmation_token() {
+        let fallback = json!({
+            "command_id": "cmd_send",
+            "state": "awaiting_confirmation",
+            "confirmation_token": "ctok_live"
+        });
+        let snapshot = json!({
+            "command_id": "cmd_send",
+            "state": "awaiting_confirmation",
+            "confirmation_token": null
+        });
+        let body = super::command_body_after_outbox_drain(fallback, Some(snapshot));
+        assert_eq!(body["state"], json!("awaiting_confirmation"));
+        assert_eq!(body["confirmation_token"], json!("ctok_live"));
     }
 }

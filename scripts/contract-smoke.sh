@@ -128,16 +128,21 @@ command="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/commands" \
     '{schema_version:1,command_id:("cmd-smoke-" + ($key | split("-") | last)),intent:"search_history",args:{q:"history"},risk_level:"low",needs_confirmation:false,idempotency_key:$key,confidence:0.95,locale:"zh-Hans-HK",timezone:"Asia/Hong_Kong"}')")"
 command_id="$(jq -r '.command_id' <<<"$command")"
 test -n "$command_id" && test "$command_id" != "null"
-test "$(jq -r '.state' <<<"$command")" = "queued"
+jq -e '
+  (.state == "succeeded") and
+  (.state != "queued") and
+  (.presentation.terminal == true)
+' <<<"$command" >/dev/null
 command_detail="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands/$command_id")"
 jq -e --arg command_id "$command_id" \
-  '(.command_id == $command_id) and (.state == "queued") and (.version | type == "number") and
+  '(.command_id == $command_id) and (.state == "succeeded") and (.state != "queued") and
+   (.presentation.terminal == true) and (.version | type == "number") and
    (.presentation.schema_version == 1) and (.presentation.display_text | type == "string")' \
   <<<"$command_detail" >/dev/null
 command_headers="$(curl --fail-with-body --silent --show-error \
   "${user_auth[@]}" -D - -o /dev/null "$BASE_URL/v1/phone/commands/$command_id")"
 grep -qi '^cache-control: private, no-store' <<<"$command_headers"
-commands="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands?state=queued&limit=50")"
+commands="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands?state=succeeded&limit=50")"
 test "$(jq -r --arg id "$command_id" '[.commands[] | select(.command_id == $id)] | length' <<<"$commands")" = "1"
 jq -e '
   all(.commands[];
@@ -193,26 +198,53 @@ test "$stale_confirmation_status" = "409"
 confirmation_result="$(json "${user_auth[@]}" \
   -X POST "$BASE_URL/v1/phone/commands/$confirmation_id/confirm" \
   -d "$(jq -nc --arg token "$confirmation_token_two" '{confirmation_token:$token}')")"
-test "$(jq -r '.state' <<<"$confirmation_result")" = "queued"
+message_enabled="$(jq -r '.action_message_enabled' <<<"$health")"
+provider_ready="$(jq -r '.action_provider_ready' <<<"$health")"
+if [[ "$message_enabled" == "true" ]]; then
+  jq -e '
+    (.state == "succeeded") and
+    (.state != "queued") and
+    (.presentation.terminal == true)
+  ' <<<"$confirmation_result" >/dev/null
+else
+  jq -e '
+    (.state == "failed") and
+    (.state != "queued") and
+    (.error.code == "action_disabled") and
+    (.error.retryable == false) and
+    (.presentation.terminal == true)
+  ' <<<"$confirmation_result" >/dev/null
+fi
+confirmation_detail="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands/$confirmation_id")"
+test "$(jq -r '.state' <<<"$confirmation_detail")" = "$(jq -r '.state' <<<"$confirmation_result")"
+test "$(jq -r '.state' <<<"$confirmation_detail")" != "queued"
+if [[ "$message_enabled" != "true" ]]; then
+  test "$(jq -r '.error.code' <<<"$confirmation_detail")" = "action_disabled"
+  health_after_disabled_send="$(get "$BASE_URL/health")"
+  test "$(jq -r '.action_message_enabled' <<<"$health_after_disabled_send")" = "false"
+  if [[ "$provider_ready" == "false" ]]; then
+    test "$(jq -r '.action_provider_ready' <<<"$health_after_disabled_send")" = "false"
+  fi
+fi
 
 command_two="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/commands" \
   -d "$(jq -nc --arg key "command-smoke-two-$(date +%s%N)" \
     '{schema_version:1,command_id:("cmd-smoke-two-" + ($key | split("-") | last)),intent:"search_history",args:{q:"second"},risk_level:"low",needs_confirmation:false,idempotency_key:$key,confidence:0.95,locale:"zh-Hans-HK",timezone:"Asia/Hong_Kong"}')")"
 command_two_id="$(jq -r '.command_id' <<<"$command_two")"
-test "$(jq -r '.state' <<<"$command_two")" = "queued"
+test "$(jq -r '.state' <<<"$command_two")" = "succeeded"
 sleep 1
 command_three="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/commands" \
   -d "$(jq -nc --arg key "command-smoke-three-$(date +%s%N)" \
     '{schema_version:1,command_id:("cmd-smoke-three-" + ($key | split("-") | last)),intent:"search_history",args:{q:"third"},risk_level:"low",needs_confirmation:false,idempotency_key:$key,confidence:0.95,locale:"zh-Hans-HK",timezone:"Asia/Hong_Kong"}')")"
 command_three_id="$(jq -r '.command_id' <<<"$command_three")"
-test "$(jq -r '.state' <<<"$command_three")" = "queued"
-command_page_one="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands?state=queued&limit=1")"
+test "$(jq -r '.state' <<<"$command_three")" = "succeeded"
+command_page_one="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands?state=succeeded&limit=1")"
 command_page_one_cursor="$(jq -r '.next_cursor' <<<"$command_page_one")"
 command_page_one_id="$(jq -r '.commands[0].command_id' <<<"$command_page_one")"
 test -n "$command_page_one_cursor" && test "$command_page_one_cursor" != "null"
 test "$(jq -r '.commands | length' <<<"$command_page_one")" = "1"
 test "$(jq -r --arg id "$command_three_id" '[.commands[] | select(.command_id == $id)] | length' <<<"$command_page_one")" = "1"
-command_page_two="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands?state=queued&limit=1&before=$(jq -rn --arg value "$command_page_one_cursor" '$value | @uri')")"
+command_page_two="$(get "${user_auth[@]}" "$BASE_URL/v1/phone/commands?state=succeeded&limit=1&before=$(jq -rn --arg value "$command_page_one_cursor" '$value | @uri')")"
 test "$(jq -r '.commands | length' <<<"$command_page_two")" = "1"
 test "$(jq -r --arg id "$command_three_id" '[.commands[] | select(.command_id == $id)] | length' <<<"$command_page_two")" = "0"
 test "$(jq -r '.commands[0].command_id' <<<"$command_page_two")" != "$command_page_one_id"
