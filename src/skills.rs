@@ -5,6 +5,26 @@ use crate::db::{self, now_iso};
 use crate::error::ApiResult;
 use crate::models::{ActionInput, SkillAction, SkillDef, SkillRow, SkillTtl};
 
+pub fn phone_ask_skill() -> SkillDef {
+    SkillDef {
+        skill_id: "phone.ask".to_string(),
+        template: "手机问：{{transcript}}".to_string(),
+        facts_schema: vec!["transcript".into(), "ask_id".into(), "locale".into()],
+        actions: vec![SkillAction {
+            id: "ack".into(),
+            risk: "low".into(),
+            confirm: false,
+            title: "已知晓".into(),
+            payload: None,
+        }],
+        ttl: SkillTtl {
+            default_sec: 86_400,
+            destructive_sec: 1_800,
+        },
+        version: Some(1),
+    }
+}
+
 pub fn deploy_skill() -> SkillDef {
     SkillDef {
         skill_id: "deploy.result".to_string(),
@@ -35,14 +55,20 @@ pub fn deploy_skill() -> SkillDef {
 }
 
 pub async fn seed_skill(db: &D1Database) -> ApiResult<()> {
+    seed_if_missing(db, &deploy_skill()).await?;
+    seed_if_missing(db, &phone_ask_skill()).await?;
+    Ok(())
+}
+
+async fn seed_if_missing(db: &D1Database, skill: &SkillDef) -> ApiResult<()> {
     let existing: Option<SkillRow> = db::first(
         db,
         "SELECT skill_id, template, facts_schema_json, actions_json, ttl_json FROM skills WHERE skill_id = ?",
-        vec![db::text("deploy.result")],
+        vec![db::text(&skill.skill_id)],
     )
     .await?;
     if existing.is_none() {
-        upsert_skill(db, &deploy_skill()).await?;
+        upsert_skill(db, skill).await?;
     }
     Ok(())
 }

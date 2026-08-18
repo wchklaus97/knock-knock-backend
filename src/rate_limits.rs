@@ -22,7 +22,9 @@ fn category(path: &str) -> (&'static str, i64) {
         // Pairing claims are intentionally unauthenticated. Keep a tighter
         // edge bucket in addition to the high-entropy token requirement.
         ("pairing", 10)
-    } else if path.starts_with("/v1/phone/commands") {
+    } else if path.starts_with("/v1/phone/commands")
+        || path.contains("/asks")
+    {
         ("command", 60)
     } else if path == "/v1/phone/events" {
         ("sse", 30)
@@ -108,6 +110,10 @@ mod tests {
         assert_eq!(category("/v1/auth/login"), ("auth", 20));
         assert_eq!(category("/v1/pairing/claim"), ("pairing", 10));
         assert_eq!(category("/v1/phone/commands"), ("command", 60));
+        assert_eq!(
+            category("/v1/phone/agents/agt_1/asks"),
+            ("command", 60)
+        );
         assert_eq!(category("/v1/phone/events"), ("sse", 30));
         assert_eq!(category("/v1/phone/devices"), ("device", 60));
         assert_eq!(category("/v1/phone/memories"), ("api", 240));

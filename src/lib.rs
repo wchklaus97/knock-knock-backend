@@ -1,5 +1,6 @@
 mod action_effects;
 mod apns;
+mod asks;
 mod audit;
 mod auth;
 mod commands;
@@ -235,6 +236,7 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         (Method::Get, ["v1", "agents", "me", "actions", "pending"]) => {
             list_agent_pending(&req, &db).await
         }
+        (Method::Get, ["v1", "agents", "me", "asks"]) => list_agent_asks(&req, &db).await,
 
         (Method::Post, ["v1", "pairing", "code"]) => create_pairing_code(&mut req, &env, &db).await,
         (Method::Get, ["v1", "pairing", "code", code]) => {
@@ -299,6 +301,9 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         }
         (Method::Post, ["v1", "phone", "sessions", session_id, "confirm"]) => {
             phone_confirm(&mut req, &env, &db, session_id).await
+        }
+        (Method::Post, ["v1", "phone", "agents", agent_id, "asks"]) => {
+            phone_create_ask(&mut req, &env, &db, agent_id).await
         }
         (Method::Post, ["v1", "phone", "commands"]) => {
             phone_create_command(&mut req, &env, &db).await
@@ -748,7 +753,7 @@ async fn list_agents(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Res
     let user = require_user(req, env, db).await?;
     let rows: Vec<models::AgentRow> = db::all(
         db,
-        "SELECT id, user_id, label, host_label, created_at FROM agents WHERE user_id = ? ORDER BY created_at DESC",
+        "SELECT id, user_id, label, host_label, created_at, last_seen_at FROM agents WHERE user_id = ? ORDER BY created_at DESC",
         vec![db::text(&user.user_id)],
     )
     .await?;
@@ -761,7 +766,7 @@ async fn list_agents(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Res
                 "label": row.label,
                 "host_label": row.host_label,
                 "created_at": row.created_at,
-                "last_seen_at": Value::Null,
+                "last_seen_at": row.last_seen_at,
             })
         })
         .collect::<Vec<_>>();
@@ -808,7 +813,7 @@ async fn rotate_agent_key(
     let user = require_user(req, env, db).await?;
     let row = db::first::<models::AgentRow>(
         db,
-        "SELECT id, user_id, label, host_label, created_at FROM agents WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, label, host_label, created_at, last_seen_at FROM agents WHERE id = ? AND user_id = ?",
         vec![db::text(agent_id), db::text(&user.user_id)],
     )
     .await?
@@ -1091,8 +1096,33 @@ async fn list_agent_pending(req: &Request, db: &D1Database) -> ApiResult<Respons
     json_response(
         json!({
             "actions": sessions::pending_actions(db, &agent.agent_id, None, query_claim(req)?).await?,
+            "asks": asks::list_agent_asks(db, &agent.agent_id, false).await?,
         }),
         200,
+    )
+}
+
+async fn list_agent_asks(req: &Request, db: &D1Database) -> ApiResult<Response> {
+    let agent = require_agent(req, db).await?;
+    json_response(
+        json!({
+            "asks": asks::list_agent_asks(db, &agent.agent_id, query_claim(req)?).await?,
+        }),
+        200,
+    )
+}
+
+async fn phone_create_ask(
+    req: &mut Request,
+    env: &Env,
+    db: &D1Database,
+    agent_id: &str,
+) -> ApiResult<Response> {
+    let user = require_user(req, env, db).await?;
+    let body: asks::CreateAskRequest = read_json(req).await?;
+    json_response(
+        asks::create_ask(db, &user.user_id, agent_id, &body).await?,
+        201,
     )
 }
 
@@ -2254,6 +2284,37 @@ fn command_body_after_outbox_drain(fallback: Value, snapshot: Option<Value>) -> 
     body
 }
 
+fn command_snapshot_is_queued(snapshot: Option<&Value>) -> bool {
+    snapshot
+        .and_then(|body| body.get("state"))
+        .and_then(Value::as_str)
+        == Some("queued")
+}
+
+async fn drain_outbox_for_command_response(db: &D1Database, env: &Env) {
+    if let Err(error) = outbox::drain(db, env).await {
+        worker::console_error!(
+            "request outbox drain left unsettled work ({}; status {})",
+            error.code,
+            error.status
+        );
+    }
+}
+
+async fn command_snapshot_for_user(
+    db: &D1Database,
+    user_id: &str,
+    command_id: &str,
+) -> Option<Value> {
+    match crate::commands::get_for_user(db, user_id, command_id).await {
+        Ok(Some(command)) => Some(crate::commands::response(&command, None)),
+        _ => match crate::commands::get_for_user(db, user_id, command_id).await {
+            Ok(Some(command)) => Some(crate::commands::response(&command, None)),
+            _ => None,
+        },
+    }
+}
+
 async fn json_response_after_outbox_drain(
     db: &D1Database,
     env: &Env,
@@ -2261,16 +2322,20 @@ async fn json_response_after_outbox_drain(
     fallback: Value,
     status: u16,
 ) -> ApiResult<Response> {
-    let _ = outbox::drain(db, env).await;
+    drain_outbox_for_command_response(db, env).await;
     let command_id = fallback
         .get("command_id")
         .and_then(Value::as_str)
         .map(str::to_string);
     let snapshot = match command_id.as_deref() {
-        Some(command_id) => match crate::commands::get_for_user(db, user_id, command_id).await {
-            Ok(Some(command)) => Some(crate::commands::response(&command, None)),
-            _ => None,
-        },
+        Some(command_id) => {
+            let mut snapshot = command_snapshot_for_user(db, user_id, command_id).await;
+            if command_snapshot_is_queued(snapshot.as_ref()) {
+                drain_outbox_for_command_response(db, env).await;
+                snapshot = command_snapshot_for_user(db, user_id, command_id).await;
+            }
+            snapshot
+        }
         None => None,
     };
     json_response(command_body_after_outbox_drain(fallback, snapshot), status)
@@ -2508,12 +2573,25 @@ mod tests {
     fn create_and_confirm_return_the_post_drain_command_snapshot() {
         let source = include_str!("lib.rs");
         assert!(source.contains("json_response_after_outbox_drain"));
+        assert!(source.contains("drain_outbox_for_command_response"));
+        assert!(source.contains("request outbox drain left unsettled work"));
         assert!(source.contains(
             "json_response_after_outbox_drain(db, env, &user.user_id, response, 202).await"
         ));
         assert!(source.contains(
             "json_response_after_outbox_drain(db, env, &user.user_id, response, 200).await"
         ));
+        assert!(source.contains("if command_snapshot_is_queued(snapshot.as_ref())"));
+    }
+
+    #[test]
+    fn queued_post_drain_snapshot_is_detected_for_a_second_drain() {
+        assert!(super::command_snapshot_is_queued(Some(&json!({"state": "queued"}))));
+        assert!(!super::command_snapshot_is_queued(Some(&json!({
+            "state": "failed",
+            "error": {"code": "action_disabled"}
+        }))));
+        assert!(!super::command_snapshot_is_queued(None));
     }
 
     #[test]

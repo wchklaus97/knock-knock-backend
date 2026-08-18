@@ -19,6 +19,13 @@ pub fn is_expired(value: &str) -> bool {
     !millis.is_finite() || millis <= Date::now().as_millis() as f64
 }
 
+/// True when `value` is missing, unparseable, or older than `seconds` ago.
+pub fn is_older_than(value: &str, seconds: i64) -> bool {
+    let millis = worker::js_sys::Date::new(&JsValue::from_str(value)).get_time();
+    !millis.is_finite()
+        || millis + (seconds as f64 * 1_000.0) <= Date::now().as_millis() as f64
+}
+
 pub fn text(value: &str) -> JsValue {
     JsValue::from_str(value)
 }
