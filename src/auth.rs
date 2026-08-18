@@ -782,7 +782,7 @@ pub async fn require_agent(request: &Request, db: &D1Database) -> ApiResult<Agen
         agent_key_header(request)?.ok_or_else(|| ApiError::unauthorized("Missing X-Agent-Key"))?;
     let row: Option<AgentRow> = db::first(
         db,
-        "SELECT id, user_id, label, host_label, created_at FROM agents WHERE api_key_hash = ?",
+        "SELECT id, user_id, label, host_label, created_at, last_seen_at FROM agents WHERE api_key_hash = ?",
         vec![db::text(&hash_api_key(&key))],
     )
     .await?;
@@ -798,6 +798,7 @@ pub async fn require_agent(request: &Request, db: &D1Database) -> ApiResult<Agen
         None,
     )
     .await?;
+    crate::asks::touch_agent_seen(db, &principal.agent_id).await?;
     Ok(principal)
 }
 

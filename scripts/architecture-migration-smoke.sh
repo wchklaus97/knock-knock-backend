@@ -5,20 +5,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # The historical checks below intentionally keep their explicit migration
 # list. Inject the later migrations immediately before each final SQL assertion
-# so a fresh-D1 smoke verifies through 0015 rather than silently stopping at
+# so a fresh-D1 smoke verifies through 0016 rather than silently stopping at
 # the earlier schema.
 sqlite3() {
   local database="$1"
   shift
   local last="${!#}"
   local count=$#
-  local args=("${@:1:$((count - 1))}" ".read ${ROOT_DIR}/migrations/0012_reminder_delivery_state.sql" ".read ${ROOT_DIR}/migrations/0013_retrieval_retention_status.sql" ".read ${ROOT_DIR}/migrations/0014_command_safety.sql" ".read ${ROOT_DIR}/migrations/0015_structured_memory.sql" "$last")
+  local args=("${@:1:$((count - 1))}" ".read ${ROOT_DIR}/migrations/0012_reminder_delivery_state.sql" ".read ${ROOT_DIR}/migrations/0013_retrieval_retention_status.sql" ".read ${ROOT_DIR}/migrations/0014_command_safety.sql" ".read ${ROOT_DIR}/migrations/0015_structured_memory.sql" ".read ${ROOT_DIR}/migrations/0016_phone_asks.sql" "$last")
   command sqlite3 "$database" "${args[@]}"
 }
 
 tables="$(sqlite3 :memory: ".read ${ROOT_DIR}/migrations/0001_initial.sql" ".read ${ROOT_DIR}/migrations/0002_supabase_auth.sql" ".read ${ROOT_DIR}/migrations/0003_architecture_foundation.sql" ".read ${ROOT_DIR}/migrations/0004_command_versions.sql" ".read ${ROOT_DIR}/migrations/0005_phone_change_triggers.sql" ".read ${ROOT_DIR}/migrations/0006_history_and_phone_idempotency.sql" ".read ${ROOT_DIR}/migrations/0007_rate_limits.sql" ".read ${ROOT_DIR}/migrations/0008_history_consistency.sql" ".read ${ROOT_DIR}/migrations/0009_phone_operation_claim_tokens.sql" ".read ${ROOT_DIR}/migrations/0010_vertical_action_effects.sql" ".read ${ROOT_DIR}/migrations/0011_command_pairing_action_descriptors.sql" "SELECT name FROM sqlite_master WHERE type='table';")"
 
-for table in commands confirmation_tokens session_messages retrieval_items memory_items phone_changes outbox_events action_attempts sync_tombstones phone_operations rate_limit_buckets reminders drafts outbound_messages; do
+for table in commands confirmation_tokens session_messages retrieval_items memory_items phone_changes outbox_events action_attempts sync_tombstones phone_operations rate_limit_buckets reminders drafts outbound_messages phone_asks; do
   grep -qx "${table}" <<<"${tables}"
 done
 
@@ -174,4 +174,4 @@ command sqlite3 "${fixture_db}" \
   "DELETE FROM users WHERE id = 'erase_user';"
 test "$(command sqlite3 "${fixture_db}" "SELECT COUNT(*) FROM memory_items WHERE user_id = 'erase_user';")" = "0"
 
-echo "architecture migration smoke passed: migrations through 0015, structured-memory triggers/tombstones, exact phone cursor preservation, legacy trigger continuity, user-delete cascade, leases, and foreign keys apply to SQLite"
+echo "architecture migration smoke passed: migrations through 0016, structured-memory triggers/tombstones, exact phone cursor preservation, legacy trigger continuity, user-delete cascade, leases, and foreign keys apply to SQLite"

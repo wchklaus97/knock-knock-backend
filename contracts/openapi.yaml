@@ -218,6 +218,29 @@ paths:
                       $ref: '#/components/schemas/Action'
         default:
           $ref: '#/components/responses/Error'
+  /v1/agents/me/asks:
+    get:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: listAgentPhoneAsks
+      parameters:
+        - $ref: '#/components/parameters/Claim'
+      responses:
+        '200':
+          description: User voice asks queued for this agent.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [asks]
+                properties:
+                  asks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PhoneAsk'
+        default:
+          $ref: '#/components/responses/Error'
   /v1/pairing/code:
     post:
       tags: [Agent]
@@ -798,6 +821,30 @@ paths:
                 $ref: '#/components/schemas/CommandResponse'
         default:
           $ref: '#/components/responses/Error'
+  /v1/phone/agents/{agent_id}/asks:
+    post:
+      tags: [Phone]
+      operationId: createPhoneAsk
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePhoneAskRequest'
+      responses:
+        '201':
+          description: Ask accepted for the selected Home agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneAsk'
+        default:
+          $ref: '#/components/responses/Error'
   /v1/phone/commands:
     get:
       tags: [Phone]
@@ -1125,6 +1172,30 @@ components:
         agent_id: { type: string }
         label: { type: string }
         host_label: { type: [string, 'null'] }
+        last_seen_at: { type: [string, 'null'], format: date-time }
+    PhoneAsk:
+      type: object
+      required: [ask_id, agent_id, transcript, status, created_at]
+      properties:
+        ask_id: { type: string }
+        agent_id: { type: string }
+        user_id: { type: string }
+        agent_label: { type: string }
+        transcript: { type: string, minLength: 1, maxLength: 2000 }
+        locale: { type: [string, 'null'] }
+        session_id: { type: [string, 'null'] }
+        status: { type: string, enum: [queued, claimed, expired] }
+        claimed_at: { type: [string, 'null'], format: date-time }
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+    CreatePhoneAskRequest:
+      type: object
+      additionalProperties: false
+      required: [transcript, idempotency_key]
+      properties:
+        transcript: { type: string, minLength: 1, maxLength: 2000 }
+        locale: { type: string, minLength: 2, maxLength: 35 }
+        idempotency_key: { type: string, minLength: 8, maxLength: 128 }
     RotateAgentKeyResponse:
       type: object
       required: [agent, api_key]

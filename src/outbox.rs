@@ -2314,6 +2314,17 @@ mod tests {
     }
 
     #[test]
+    fn disabled_send_message_fails_closed_as_failed_action_disabled() {
+        let error = crate::providers::disabled("send_message");
+        assert_eq!(error.status, 409);
+        assert_eq!(error.code, "action_disabled");
+        assert!(!error.retryable);
+        let failure = classify_error(error);
+        assert!(!failure.retryable());
+        assert_eq!(command_failure_state(false, false), "failed");
+    }
+
+    #[test]
     fn command_failures_keep_retryable_distinct_from_unknown() {
         assert_eq!(command_failure_state(true, true), "retryable");
         assert_eq!(command_failure_state(true, false), "unknown");

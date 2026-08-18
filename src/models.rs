@@ -56,6 +56,8 @@ pub struct AgentRow {
     pub label: String,
     pub host_label: Option<String>,
     pub created_at: String,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

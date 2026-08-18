@@ -9,6 +9,7 @@ TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/knock-knock-local-contract.XXXXXX")"
 PERSIST_TO="${TMP_DIR}/state"
 WORKER_PORT="${WORKER_PORT:-}"
 WORKER_PID=""
+DISABLED_WORKER_PID=""
 FAILURE_REASON=""
 
 stop_process() {
@@ -32,7 +33,8 @@ stop_process() {
 
 print_sanitized_logs() {
   local log_file
-  for log_file in "${TMP_DIR}/migrations.log" "${TMP_DIR}/memory-audit.log" "${TMP_DIR}/worker.log"; do
+  for log_file in "${TMP_DIR}/migrations.log" "${TMP_DIR}/memory-audit.log" "${TMP_DIR}/worker.log" \
+    "${TMP_DIR}/disabled-migrations.log" "${TMP_DIR}/disabled-worker.log"; do
     if [[ -f "${log_file}" ]]; then
       "${ROOT_DIR}/scripts/ci-log-sanitize.sh" "${log_file}" >&2 || true
     fi
@@ -43,6 +45,7 @@ cleanup() {
   local status=$?
   trap - EXIT INT TERM
   stop_process "${WORKER_PID}"
+  stop_process "${DISABLED_WORKER_PID}"
   if ((status != 0)); then
     echo "local-contract-gate failed${FAILURE_REASON:+: ${FAILURE_REASON}}" >&2
     print_sanitized_logs
@@ -69,12 +72,14 @@ PY
 }
 
 wait_for_health() {
+  local port="${1:-${WORKER_PORT}}"
+  local pid="${2:-${WORKER_PID}}"
   for _ in $(seq 1 180); do
     if curl --fail --silent --show-error --max-time 2 \
-      "http://127.0.0.1:${WORKER_PORT}/health" >/dev/null 2>&1; then
+      "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
       return 0
     fi
-    if [[ -n "${WORKER_PID}" ]] && ! kill -0 "${WORKER_PID}" 2>/dev/null; then
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       return 1
     fi
     sleep 1
@@ -197,4 +202,40 @@ jq -e '
   )
 ' "${TMP_DIR}/memory-audit.json" >/dev/null || fail "Memory audit metadata was missing or unsafe"
 
-echo "local-contract-gate passed: isolated Worker/D1/R2 contract, readiness, correlation, retention, model streaming, and isolation smokes"
+DISABLED_PERSIST_TO="${TMP_DIR}/disabled-state"
+DISABLED_WORKER_PORT="$(pick_port)"
+cat >"${TMP_DIR}/disabled.env" <<EOF
+NODE_ENV=development
+JWT_SECRET=knock-knock-disabled-contract-jwt-secret
+CORS_ORIGIN=*
+PUSH_MODE=dev
+SERVICE_VERSION=local-disabled-contract
+ACTION_PROVIDER_MODE=disabled
+ACTION_REMINDER_ENABLED=false
+ACTION_MESSAGE_ENABLED=false
+EOF
+
+if ! wrangler d1 migrations apply DB --local \
+  --persist-to "${DISABLED_PERSIST_TO}" \
+  --config "${ROOT_DIR}/wrangler.toml" \
+  --env-file "${TMP_DIR}/disabled.env" \
+  >"${TMP_DIR}/disabled-migrations.log" 2>&1; then
+  fail "disabled-provider D1 migrations failed"
+fi
+
+wrangler dev --local --port "${DISABLED_WORKER_PORT}" --test-scheduled \
+  --persist-to "${DISABLED_PERSIST_TO}" \
+  --env-file "${TMP_DIR}/disabled.env" \
+  --log-level error \
+  >"${TMP_DIR}/disabled-worker.log" 2>&1 &
+DISABLED_WORKER_PID=$!
+
+if ! wait_for_health "${DISABLED_WORKER_PORT}" "${DISABLED_WORKER_PID}"; then
+  fail "disabled-provider Worker did not become ready"
+fi
+
+BASE_URL="http://127.0.0.1:${DISABLED_WORKER_PORT}" \
+SMOKE_EMAIL="${DISABLED_SMOKE_EMAIL:-local-disabled-$(date +%s)-$$@local.test}" \
+  "${ROOT_DIR}/scripts/disabled-send-message-smoke.sh"
+
+echo "local-contract-gate passed: isolated Worker/D1/R2 contract, readiness, correlation, retention, model streaming, isolation smokes, and disabled send_message fail-closed"
