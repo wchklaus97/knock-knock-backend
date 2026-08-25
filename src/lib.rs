@@ -1101,7 +1101,9 @@ async fn report_session_event(
     if row.skill_id == "phone.ask" {
         let binding = listener_bindings::require_request_binding(db, req, &agent.agent_id).await?;
         if row.chat_id.as_deref() != Some(binding.chat_id.as_str()) {
-            return Err(ApiError::forbidden("This voice session belongs to another Codex chat"));
+            return Err(ApiError::forbidden(
+                "This voice session belongs to another Codex chat",
+            ));
         }
     }
     let body: EventRequest = read_json(req).await?;
@@ -1140,12 +1142,18 @@ async fn list_agent_asks(req: &Request, db: &D1Database) -> ApiResult<Response> 
 async fn register_agent_listener(req: &mut Request, db: &D1Database) -> ApiResult<Response> {
     let agent = require_agent(req, db).await?;
     let body: listener_bindings::RegisterListenerRequest = read_json(req).await?;
-    json_response(listener_bindings::register_listener(db, &agent, &body).await?, 200)
+    json_response(
+        listener_bindings::register_listener(db, &agent, &body).await?,
+        200,
+    )
 }
 
 async fn disconnect_agent_listener(req: &Request, db: &D1Database) -> ApiResult<Response> {
     let agent = require_agent(req, db).await?;
-    json_response(listener_bindings::disconnect_listener(db, req, &agent.agent_id).await?, 200)
+    json_response(
+        listener_bindings::disconnect_listener(db, req, &agent.agent_id).await?,
+        200,
+    )
 }
 
 async fn phone_create_ask(

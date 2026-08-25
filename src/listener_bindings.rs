@@ -20,6 +20,7 @@ pub struct RegisterListenerRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ListenerBindingRow {
     pub id: String,
     pub user_id: String,
@@ -167,13 +168,25 @@ pub async fn require_request_binding(
         .get("x-knock-chat-id")?
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::new(409, "listener_binding_required", "This Codex chat is not registered as the voice listener"))?;
+        .ok_or_else(|| {
+            ApiError::new(
+                409,
+                "listener_binding_required",
+                "This Codex chat is not registered as the voice listener",
+            )
+        })?;
     let instance_id = req
         .headers()
         .get("x-knock-listener-instance")?
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::new(409, "listener_binding_required", "This Codex chat is not registered as the voice listener"))?;
+        .ok_or_else(|| {
+            ApiError::new(
+                409,
+                "listener_binding_required",
+                "This Codex chat is not registered as the voice listener",
+            )
+        })?;
     expire_stale(db, agent_id).await?;
     db::first(
         db,

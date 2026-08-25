@@ -5,8 +5,8 @@ use worker::D1Database;
 use crate::auth::new_id;
 use crate::db;
 use crate::error::{ApiError, ApiResult};
-use crate::models::{SessionMessageRow, SessionRequest};
 use crate::listener_bindings::{self, ListenerBindingRow};
+use crate::models::{SessionMessageRow, SessionRequest};
 use crate::sessions;
 
 /// Exclusive Ask listening window. Exact last_seen age 90.000s is not listening
@@ -192,7 +192,10 @@ pub async fn create_ask(
             || existing.chat_id.as_deref() != Some(binding.chat_id.as_str())
             || existing.deleted_at.is_some()
         {
-            return Err(ApiError::session("Session belongs to an expired Codex chat binding", 410));
+            return Err(ApiError::session(
+                "Session belongs to an expired Codex chat binding",
+                410,
+            ));
         }
     }
 
@@ -454,11 +457,7 @@ async fn ask_context_messages(
         .collect())
 }
 
-async fn ask_to_api(
-    db: &D1Database,
-    row: &AskRow,
-    agent_label: Option<&str>,
-) -> ApiResult<Value> {
+async fn ask_to_api(db: &D1Database, row: &AskRow, agent_label: Option<&str>) -> ApiResult<Value> {
     let (turn_sequence, context_messages) = if let Some(session_id) = row.session_id.as_deref() {
         let turn_sequence = db::first::<AskMessageSequenceRow>(
             db,
@@ -515,7 +514,11 @@ async fn expire_asks(db: &D1Database, agent_id: &str) -> ApiResult<()> {
     Ok(())
 }
 
-async fn claim_asks(db: &D1Database, rows: &[AskRow], binding: &ListenerBindingRow) -> ApiResult<Vec<AskRow>> {
+async fn claim_asks(
+    db: &D1Database,
+    rows: &[AskRow],
+    binding: &ListenerBindingRow,
+) -> ApiResult<Vec<AskRow>> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }

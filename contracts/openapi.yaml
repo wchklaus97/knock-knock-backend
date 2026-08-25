@@ -241,6 +241,76 @@ paths:
                       $ref: '#/components/schemas/PhoneAsk'
         default:
           $ref: '#/components/responses/Error'
+  /v1/agents/me/listener:
+    post:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: registerAgentListener
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [chat_id, chat_title, listener_instance_id]
+              properties:
+                chat_id:
+                  type: string
+                chat_title:
+                  type: string
+                listener_instance_id:
+                  type: string
+                takeover:
+                  type: boolean
+      responses:
+        '200':
+          description: Active listener binding for this agent.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agent_id, binding_id, chat_id, chat_title, last_seen_at, expires_at, listener_instance_id, status]
+                properties:
+                  agent_id:
+                    type: string
+                  binding_id:
+                    type: string
+                  chat_id:
+                    type: string
+                  chat_title:
+                    type: string
+                  last_seen_at:
+                    type: string
+                  expires_at:
+                    type: string
+                  listener_instance_id:
+                    type: string
+                  status:
+                    type: string
+        default:
+          $ref: '#/components/responses/Error'
+    delete:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: disconnectAgentListener
+      responses:
+        '200':
+          description: Listener binding disconnected.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, binding_id]
+                properties:
+                  ok:
+                    type: boolean
+                  binding_id:
+                    type: string
+        default:
+          $ref: '#/components/responses/Error'
   /v1/pairing/code:
     post:
       tags: [Agent]

@@ -427,6 +427,7 @@ pub struct EventRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct PhoneAskReplyRow {
     pub id: String,
 }

@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       apply_migrations:
-        description: Apply only migrations 0013, 0014, 0015, and 0016 through the separately gated staging path
+        description: Apply only migrations 0013, 0014, 0015, 0016, and 0017 through the separately gated staging path
         required: true
         default: false
         type: boolean
@@ -181,7 +181,7 @@ jobs:
         run: rm -f -- "${STAGING_WRANGLER_CONFIG:-}"
 
   apply-migrations:
-    name: Apply staging expand migrations 0013/0014/0015/0016 (explicit opt-in)
+    name: Apply staging expand migrations 0013/0014/0015/0016/0017 (explicit opt-in)
     needs: deploy
     if: ${{ inputs.apply_migrations == true }}
     runs-on: ubuntu-latest
@@ -294,5 +294,5 @@ jobs:
         if: ${{ always() }}
         run: |
           rm -f -- "${STAGING_MIGRATION_CONFIG:-}" "${RUNNER_TEMP}/wrangler.staging.toml"
-          rm -f -- "${RUNNER_TEMP}/staging-expand-migrations/0013_retrieval_retention_status.sql" "${RUNNER_TEMP}/staging-expand-migrations/0014_command_safety.sql" "${RUNNER_TEMP}/staging-expand-migrations/0015_structured_memory.sql" "${RUNNER_TEMP}/staging-expand-migrations/0016_phone_asks.sql"
+          rm -f -- "${RUNNER_TEMP}/staging-expand-migrations/0013_retrieval_retention_status.sql" "${RUNNER_TEMP}/staging-expand-migrations/0014_command_safety.sql" "${RUNNER_TEMP}/staging-expand-migrations/0015_structured_memory.sql" "${RUNNER_TEMP}/staging-expand-migrations/0016_phone_asks.sql" "${RUNNER_TEMP}/staging-expand-migrations/0017_agent_chat_bindings.sql"
           rmdir -- "${RUNNER_TEMP}/staging-expand-migrations" 2>/dev/null || true
