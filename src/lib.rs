@@ -2586,7 +2586,9 @@ mod tests {
 
     #[test]
     fn queued_post_drain_snapshot_is_detected_for_a_second_drain() {
-        assert!(super::command_snapshot_is_queued(Some(&json!({"state": "queued"}))));
+        assert!(super::command_snapshot_is_queued(Some(
+            &json!({"state": "queued"})
+        )));
         assert!(!super::command_snapshot_is_queued(Some(&json!({
             "state": "failed",
             "error": {"code": "action_disabled"}
