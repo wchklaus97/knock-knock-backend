@@ -4,31 +4,35 @@
 > The canonical decisions live in `ARCHITECTURE_DECISIONS.md`; this document
 > defines agent boundaries, handoffs, verification, and release gates.
 
-## Execution status — 2026-08-12
+## Execution status — 2026-08-26
 
-The architecture, data, sync, history, command-safety, staging, and UI
-checkpoints are merged. The only bases for the current paired voice work are:
+All planned checkpoints are merged; there is no in-flight branch on either
+repository. The current bases are:
 
-| Repository | Merged base | Current completion branch | Status |
+| Repository | Current `main` | Recently merged | Status |
 |---|---|---|---|
-| Backend | `bbb4a82` ([PR #29](https://github.com/wchklaus97/knock-knock-backend/pull/29)) | `agent/reject-unqualified-270m-20260812` | Voice backend merged; fail-closed 270M follow-up pending review; not deployed |
-| iOS | `1757009` ([PR #15](https://github.com/wchklaus97/knock-knock-frontend/pull/15)) | `agent/voice-goal-completion-ios-20260812` ([PR #17](https://github.com/wchklaus97/knock-knock-frontend/pull/17)) | Model safety and verified voice workflow pending review; not distributed |
+| Backend | `bb45fc2` | Voice backend (#29), fail-closed 270M rejection (#30), APNs diagnostics (#31), production release gates/backup scoping (#32–#35), APNs token rebind (#36), Structured Memory v2 (#37, migration `0015`), production migration/readiness retries (#38/#39), phone asks + fail-closed confirm drain (#40, migration `0016`) | Merged; not deployed to production |
+| iOS | through [PR #36](https://github.com/wchklaus97/knock-knock-frontend/pull/36) | Voice workflow (#15, #17), memory shadow (#32–#34), voice race gates (#35), Ask front-door (#36) | Merged; not distributed |
 
-The protected staging deploy and contract workflows passed for the previously
-deployed backend checkpoint, and 20 consecutive health probes passed. Backend
-PR #29 is now merged but has not been deployed by this work. The current iOS
-PR and backend model-policy follow-up
-add strict app-owned command canonicalization, backend-owned presentation,
-crash-safe pre-POST SQLite checkpoint/replay, one-time confirmation-token
-rotation, lightweight command summaries, authenticated private-R2 model
-delivery, signed release tooling, and a 32-example multilingual golden fixture.
+Since 2026-08-12 the backend also changed the command response contract
+(PR #40): create/confirm responses drain the outbox before replying, so POST
+bodies carry post-drain terminal states (e.g. read-only `search_history`
+returns `succeeded` synchronously) instead of `queued`. Clients must treat
+the POST snapshot as authoritative and keep GET reconciliation as the
+canonical read.
+
+Main CI went red on 2026-08-18 when #40 merged with a failing rustfmt check,
+which also masked a stale provider-lifecycle smoke that still expected
+queued-at-POST semantics. Both were fixed on 2026-08-25 (`1334792`,
+`bb45fc2`); the full local gate suite (static, contract, provider lifecycle
+with strict resource identity) passes on `bb45fc2`.
 
 Gemma 3 1B now has ≥95%/zero-high-risk-false-execution evidence on iPhone 17
 Pro Max. The evaluated 270M tier is rejected at 0.500 accuracy and its
 acquisition path fails closed; iPhone 13 keeps deterministic parsing plus
 clarification. Remaining external gates are production trust-key approval,
 private staging-R2 publication, microphone/memory/thermal/crash UAT, real APNs delivery, simultaneous
-two-physical-device convergence, provider sandbox approval, paired PR review,
+two-physical-device convergence, provider sandbox approval,
 and human approval of deployment, secrets, migrations, and model rollout.
 
 The detailed evidence and rollback record is in
@@ -38,9 +42,10 @@ The numbered release handoff is in `docs/RELEASE_GATE_MATRIX.md`.
 ### Contract parity checkpoint
 
 Merged PR #12 aligned OpenAPI with the 47 executable operations at that point.
-The current private model-artifact route is the 48th operation; the same parity
-smoke covers it. The paired voice PRs must be reviewed before any generated
-client treats `CommandPresentation` as required.
+The parity smoke now covers 54 operations, including the private
+model-artifact route and the phone-asks routes from PR #40. The paired voice
+PRs are merged, and generated clients may treat `CommandPresentation` as
+required.
 
 ### Backend follow-up checkpoint — 2026-08-10
 

@@ -1,15 +1,28 @@
 # Backend Release Gate Matrix
 
-This matrix is the handoff checklist for the voice-workflow completion branches
-with tested implementation heads backend `6d98166f` and iOS `94669e9e`. A
-local smoke is evidence for code behavior only; it does not substitute for a
-deployed staging resource, a real provider, a physical iPhone, or human
-approval.
+This matrix is the handoff checklist for the voice-workflow completion work,
+now merged to `main` (backend `bb45fc2`; iOS frontend through PR #36,
+`voice-agent-front-door-20260818`). A local smoke is evidence for code
+behavior only; it does not substitute for a deployed staging resource, a real
+provider, a physical iPhone, or human approval.
+
+> **Status refresh — 2026-08-26.** All paired voice PRs are merged (backend
+> #29/#30, frontend #15/#17, plus the Ask front-door in frontend #36). Since
+> the original matrix was written, the backend also landed Structured Memory
+> v2 (#37, migration `0015`), APNs token-rebind and delivery diagnostics
+> (#36/#31), production release gates and backup scoping (#32–#35), production
+> migration-path and readiness retries (#38/#39), and phone asks with
+> fail-closed confirm drain (#40, migration `0016`). PR #40 also changed the
+> command contract: create/confirm responses now drain the outbox before
+> replying, so POST bodies carry post-drain terminal states instead of
+> `queued`. That PR merged with red CI (rustfmt), which masked a stale
+> provider-lifecycle smoke; both were repaired on 2026-08-25 (`1334792`,
+> `bb45fc2`) and the full local gate suite passes again.
 
 | ID | Gate | Current status | Evidence or next action | Owner / dependency |
 |---|---|---|---|---|
 | RG-01 | Staging Worker + D1 + R2 route E2E | **Passed for `c83b04d`** | Protected staging deploy and contract workflows passed, followed by 20/20 read-only health probes. This does not deploy or validate the current voice branches. See `STAGING_VERIFICATION.md`. | Control Tower + Cloudflare/Supabase access |
-| RG-02 | Paired PR review and CI | **Current voice PRs pending** | Backend and iOS voice changes must be committed as paired draft PRs, pass their repository CI, and receive human review. No automatic merge or deployment is allowed. | Human reviewer + paired agents |
+| RG-02 | Paired PR review and CI | **Passed — all merged** | Backend #29/#30 and frontend #15/#17 merged after review; the Ask front-door follow-up merged as frontend #36. Backend CI on `main` is green again as of `bb45fc2` after the PR #40 fmt/lifecycle-smoke regression. Process note: branch protection must not allow merging with red checks, as happened for #40. | Human reviewer + paired agents |
 | RG-03 | Production provider contract | **Local adapter passed; vendor pending** | Local mock verifies reminder delivery/cancel, scheduled cancellation recovery, timeout reconciliation, and message `accepted → delivered → sent`. Cancellation now requires an explicit terminal provider state and uses a durable per-operation fence; exhausted retryable outcomes remain `unknown` for scheduled reconciliation. Select a vendor, run sandbox tests, verify its idempotency/cancellation/status semantics, configure Wrangler secrets, then approve rollout. | Backend/Operations + provider credentials |
 | RG-04 | Voice golden set and model gate | **Partial — 1B accepted, rollout pending** | Gemma 3 1B passed the 32-example semantic gate at 1.000 with zero high-risk false executions and command p95 1.546 seconds on iPhone 17 Pro Max. The 270M candidate is rejected: its best controlled result was 0.500, below the 0.950 threshold, so its acquisition path fails closed. Production trust-key approval, private-R2 publication, microphone/thermal UAT, and human rollout approval remain. Follow `VOICE_MODEL_RELEASE_RUNBOOK.md`. | Voice/Verification agent + operator-approved 1B release |
 | RG-05 | Physical iPhone and APNs gate | **Partial** | The final simulator safety run completed 186 unit tests (183 passed, 3 optional skips) and 4 UI tests (3 passed, 1 opt-in physical skip), with zero failures. Gemma 3 1B passed the physical iPhone 17 Pro Max semantic and latency gate; iPhone 13 retains deterministic parsing because 1B is too slow and 270M is inaccurate. The signed Staging app installs and launches on both phones, and a read-only staging D1 aggregate confirms two valid physical APNs registrations under one user. Identifier-free wakes and cold-launch REST reconciliation are implemented. Real microphone/VAD/interruption/memory/thermal/crash execution, APNs delivery, true airplane-mode recovery, and simultaneous two-phone UI convergence remain separate gates. | iOS/Verification agent + approved model and two phones |
@@ -19,11 +32,11 @@ approval.
 ## What is already verified locally
 
 - `cargo fmt --all -- --check`
-- `cargo test --all-targets` — 76 passed, 0 failed
+- `cargo test --all-targets` — 144 passed, 0 failed
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo check --target wasm32-unknown-unknown`
 - OpenAPI schema and breaking-compatibility smokes
-- executable Rust dispatch ↔ OpenAPI route parity smoke — 48 operations
+- executable Rust dispatch ↔ OpenAPI route parity smoke — 54 operations
 - migration, adversarial-data, provider-safety, and production-config smokes
 - local contract smoke, including `/v1/health`, key rotation, skills, session detail/progress, R2 download/retention, and provider lifecycle smokes
 - signed model-manifest/artifact release, authenticated private-R2 download,
@@ -101,12 +114,11 @@ Failure diagnostics pass through the repository redaction filter; raw bearer,
 API-key-shaped, password, APNs, Supabase, and CI secret-shaped values are not
 printed.
 
-`PROVIDER_STRICT_RESOURCE_IDENTITY=true` is intentionally not enabled by the
-default local gate on this `origin/main` base: the corresponding Rust action
-effect owner still needs to add the cancellation provider-ID match and
-message provider-ID presence guards. After that source-side patch lands, the
-owner can enable the strict lifecycle mode in CI and retain the fail-closed
-`provider_cancel_mismatch` / `provider_missing_id` assertions.
+`PROVIDER_STRICT_RESOURCE_IDENTITY=true` is now exercised by the default local
+provider gate: the cancellation provider-ID match and message provider-ID
+presence guards are in the Rust action effects, and the strict lifecycle
+assertions (`provider_cancel_mismatch`, `provider_missing_id`,
+`provider_id_mismatch`) pass on `main` as of `bb45fc2`.
 
 No migration is added by the CI/release gate work. Rollback is a code-only
 revert or closing the draft PR; if a future release exposes a provider/APNs
