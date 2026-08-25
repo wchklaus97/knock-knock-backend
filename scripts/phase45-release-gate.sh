@@ -7,6 +7,7 @@ cd "${ROOT_DIR}"
 
 echo "[phase45] Rust format, tests, Clippy, and Worker target"
 cargo fmt --all -- --check
+./scripts/asks-listening-window-tests.sh
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo check --target wasm32-unknown-unknown
@@ -41,8 +42,10 @@ test -x ./scripts/voice-model-candidate.sh
 test -x ./scripts/voice-model-candidate-smoke.sh
 test -x ./scripts/voice-model-release.sh
 test -x ./scripts/voice-model-release-smoke.sh
+test -x ./scripts/asks-listening-window-tests.sh
 test -x ./scripts/voice-model-r2-smoke.sh
 bash -n \
+  ./scripts/asks-listening-window-tests.sh \
   ./scripts/ci-log-sanitize.sh \
   ./scripts/ci-log-sanitization-smoke.sh \
   ./scripts/execution-time-authority-smoke.sh \

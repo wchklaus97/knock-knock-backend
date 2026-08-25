@@ -7,6 +7,7 @@ mod commands;
 mod db;
 mod error;
 mod history;
+mod listener_bindings;
 mod memories;
 mod models;
 mod outbox;
@@ -237,6 +238,12 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
             list_agent_pending(&req, &db).await
         }
         (Method::Get, ["v1", "agents", "me", "asks"]) => list_agent_asks(&req, &db).await,
+        (Method::Post, ["v1", "agents", "me", "listener"]) => {
+            register_agent_listener(&mut req, &db).await
+        }
+        (Method::Delete, ["v1", "agents", "me", "listener"]) => {
+            disconnect_agent_listener(&req, &db).await
+        }
 
         (Method::Post, ["v1", "pairing", "code"]) => create_pairing_code(&mut req, &env, &db).await,
         (Method::Get, ["v1", "pairing", "code", code]) => {
@@ -753,8 +760,8 @@ async fn list_agents(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Res
     let user = require_user(req, env, db).await?;
     let rows: Vec<models::AgentRow> = db::all(
         db,
-        "SELECT id, user_id, label, host_label, created_at, last_seen_at FROM agents WHERE user_id = ? ORDER BY created_at DESC",
-        vec![db::text(&user.user_id)],
+        "SELECT a.id, a.user_id, a.label, a.host_label, a.created_at, a.last_seen_at, b.id AS listener_binding_id, b.chat_id AS listener_chat_id, b.chat_title AS listener_chat_title, b.expires_at AS listener_expires_at FROM agents a LEFT JOIN agent_chat_bindings b ON b.id = (SELECT b2.id FROM agent_chat_bindings b2 WHERE b2.agent_id = a.id AND b2.status = 'active' AND b2.expires_at > ? ORDER BY b2.updated_at DESC LIMIT 1) WHERE a.user_id = ? ORDER BY a.created_at DESC",
+        vec![db::text(&db::now_iso()), db::text(&user.user_id)],
     )
     .await?;
     let agents = rows
@@ -767,6 +774,10 @@ async fn list_agents(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Res
                 "host_label": row.host_label,
                 "created_at": row.created_at,
                 "last_seen_at": row.last_seen_at,
+                "listener_binding_id": row.listener_binding_id,
+                "listener_chat_id": row.listener_chat_id,
+                "listener_chat_title": row.listener_chat_title,
+                "listener_expires_at": row.listener_expires_at,
             })
         })
         .collect::<Vec<_>>();
@@ -1087,16 +1098,23 @@ async fn report_session_event(
         .filter(|row| row.agent_id == agent.agent_id)
         .filter(|row| row.deleted_at.is_none())
         .ok_or_else(|| ApiError::not_found("Session not found"))?;
+    if row.skill_id == "phone.ask" {
+        let binding = listener_bindings::require_request_binding(db, req, &agent.agent_id).await?;
+        if row.chat_id.as_deref() != Some(binding.chat_id.as_str()) {
+            return Err(ApiError::forbidden("This voice session belongs to another Codex chat"));
+        }
+    }
     let body: EventRequest = read_json(req).await?;
     json_response(sessions::report_event(db, env, &row, &body).await?, 200)
 }
 
 async fn list_agent_pending(req: &Request, db: &D1Database) -> ApiResult<Response> {
     let agent = require_agent(req, db).await?;
+    let binding = listener_bindings::require_request_binding(db, req, &agent.agent_id).await?;
     json_response(
         json!({
             "actions": sessions::pending_actions(db, &agent.agent_id, None, query_claim(req)?).await?,
-            "asks": asks::list_agent_asks(db, &agent.agent_id, false).await?,
+            "asks": asks::list_agent_asks(db, &agent.agent_id, &binding, false).await?,
         }),
         200,
     )
@@ -1104,12 +1122,30 @@ async fn list_agent_pending(req: &Request, db: &D1Database) -> ApiResult<Respons
 
 async fn list_agent_asks(req: &Request, db: &D1Database) -> ApiResult<Response> {
     let agent = require_agent(req, db).await?;
+    let binding = listener_bindings::require_request_binding(db, req, &agent.agent_id).await?;
     json_response(
         json!({
-            "asks": asks::list_agent_asks(db, &agent.agent_id, query_claim(req)?).await?,
+            "asks": asks::list_agent_asks(db, &agent.agent_id, &binding, query_claim(req)?).await?,
+            "binding": {
+                "binding_id": binding.id,
+                "chat_id": binding.chat_id,
+                "chat_title": binding.chat_title,
+                "expires_at": binding.expires_at,
+            }
         }),
         200,
     )
+}
+
+async fn register_agent_listener(req: &mut Request, db: &D1Database) -> ApiResult<Response> {
+    let agent = require_agent(req, db).await?;
+    let body: listener_bindings::RegisterListenerRequest = read_json(req).await?;
+    json_response(listener_bindings::register_listener(db, &agent, &body).await?, 200)
+}
+
+async fn disconnect_agent_listener(req: &Request, db: &D1Database) -> ApiResult<Response> {
+    let agent = require_agent(req, db).await?;
+    json_response(listener_bindings::disconnect_listener(db, req, &agent.agent_id).await?, 200)
 }
 
 async fn phone_create_ask(
@@ -2449,7 +2485,7 @@ fn add_common_headers(
     }
     response.headers_mut().set(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Agent-Key, X-Device-ID, X-Request-ID",
+        "Authorization, Content-Type, X-Agent-Key, X-Device-ID, X-Request-ID, X-Knock-Chat-ID, X-Knock-Listener-Instance",
     )?;
     response.headers_mut().set(
         "Access-Control-Allow-Methods",

@@ -766,14 +766,20 @@ pub async fn require_user(
         }
         user
     };
-    let device_id = request.headers().get("x-device-id")?;
-    crate::rate_limits::enforce_authenticated(
-        db,
-        request.path().as_str(),
-        &format!("user:{}", user.user_id),
-        device_id.as_deref(),
-    )
-    .await?;
+    // Phone refresh fans out several authenticated GETs concurrently. Writing
+    // principal and device buckets for every read creates avoidable D1 write
+    // contention and can strand Worker futures on the Free-plan runtime.
+    // Mutations remain account-rate-limited; pairing/auth entry points retain
+    // their dedicated unauthenticated limits.
+    if request.method() != Method::Get {
+        crate::rate_limits::enforce_authenticated(
+            db,
+            request.path().as_str(),
+            &format!("user:{}", user.user_id),
+            None,
+        )
+        .await?;
+    }
     Ok(user)
 }
 

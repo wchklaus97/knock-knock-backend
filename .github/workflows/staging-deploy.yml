@@ -266,11 +266,13 @@ jobs:
           cp -- migrations/0014_command_safety.sql "$migration_dir/"
           cp -- migrations/0015_structured_memory.sql "$migration_dir/"
           cp -- migrations/0016_phone_asks.sql "$migration_dir/"
+          cp -- migrations/0017_agent_chat_bindings.sql "$migration_dir/"
           test -f "$migration_dir/0013_retrieval_retention_status.sql"
           test -f "$migration_dir/0014_command_safety.sql"
           test -f "$migration_dir/0015_structured_memory.sql"
           test -f "$migration_dir/0016_phone_asks.sql"
-          test "$(find "$migration_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 4
+          test -f "$migration_dir/0017_agent_chat_bindings.sql"
+          test "$(find "$migration_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 5
 
           migration_config="$RUNNER_TEMP/wrangler.staging-migrations.toml"
           sed \
@@ -279,7 +281,7 @@ jobs:
           grep -Fqx "migrations_dir = \"${migration_dir}\"" "$migration_config"
           echo "STAGING_MIGRATION_CONFIG=$migration_config" >> "$GITHUB_ENV"
 
-      - name: Apply only migrations 0013, 0014, 0015, and 0016 to staging D1
+      - name: Apply only migrations 0013 through 0017 to staging D1
         run: |
           set -euo pipefail
           test -n "${STAGING_MIGRATION_CONFIG:-}"

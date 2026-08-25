@@ -7,6 +7,25 @@ pub fn now_iso() -> String {
     worker::js_sys::Date::new_0().to_iso_string().into()
 }
 
+/// Epoch milliseconds for age checks. Native tests use SystemTime so they do
+/// not need `js_sys::Date::now`.
+pub fn now_ms() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        Date::now().as_millis() as i64
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+            Err(error) => -i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX),
+        }
+    }
+}
+
 pub fn add_seconds_iso(seconds: i64) -> String {
     let millis = Date::now().as_millis() as f64 + (seconds as f64 * 1000.0);
     worker::js_sys::Date::new(&JsValue::from_f64(millis))
