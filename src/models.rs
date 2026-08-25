@@ -58,6 +58,14 @@ pub struct AgentRow {
     pub created_at: String,
     #[serde(default)]
     pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub listener_binding_id: Option<String>,
+    #[serde(default)]
+    pub listener_chat_id: Option<String>,
+    #[serde(default)]
+    pub listener_chat_title: Option<String>,
+    #[serde(default)]
+    pub listener_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -407,6 +415,8 @@ pub struct EventRequest {
     pub status: String,
     pub summary: Option<String>,
     #[serde(default)]
+    pub in_reply_to_ask_id: Option<String>,
+    #[serde(default)]
     pub facts: Option<Map<String, Value>>,
     #[serde(default)]
     pub actions: Option<Vec<ActionInput>>,
@@ -414,6 +424,12 @@ pub struct EventRequest {
     pub force_push: Option<bool>,
     #[serde(default)]
     pub retrievals: Option<Vec<RetrievalInput>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct PhoneAskReplyRow {
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

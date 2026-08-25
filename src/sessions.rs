@@ -388,6 +388,32 @@ pub async fn report_event(
     if current.state == "expired" {
         return Err(ApiError::session("Session expired", 410));
     }
+    let in_reply_to_ask_id = input
+        .in_reply_to_ask_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(ask_id) = in_reply_to_ask_id.as_deref() {
+        let matching_ask = db::first::<crate::models::PhoneAskReplyRow>(
+            db,
+            "SELECT id FROM phone_asks WHERE id = ? AND session_id = ? AND agent_id = ? AND user_id = ? AND status = 'claimed' AND target_chat_id = ? AND claimed_by_chat_id = ?",
+            vec![
+                db::text(ask_id),
+                db::text(&current.id),
+                db::text(&current.agent_id),
+                db::text(&current.user_id),
+                db::optional_text(current.chat_id.as_deref()),
+                db::optional_text(current.chat_id.as_deref()),
+            ],
+        )
+        .await?;
+        if matching_ask.is_none() {
+            return Err(ApiError::validation(
+                "in_reply_to_ask_id does not belong to this session",
+            ));
+        }
+    }
     if let Some(previous) = db::first::<EventRow>(
         db,
         "SELECT id, pushed, summary_text, voice_script FROM events WHERE session_id = ? AND idempotency_key = ?",
@@ -441,7 +467,7 @@ pub async fn report_event(
             db::text(&current.id),
             db::text(&input.status),
             db::text(&input.idempotency_key),
-            db::text(&serde_json::json!({"facts": facts, "actions": resolved, "force_push": input.force_push.unwrap_or(false)}).to_string()),
+            db::text(&serde_json::json!({"facts": facts, "actions": resolved, "force_push": input.force_push.unwrap_or(false), "in_reply_to_ask_id": in_reply_to_ask_id.clone()}).to_string()),
             db::number(if pushed { 1 } else { 0 }),
             db::text(&summary),
             db::text(&voice),
@@ -541,6 +567,7 @@ pub async fn report_event(
                     "event_id": event_id.clone(),
                     "status": input.status.clone(),
                     "actions": action_keys.clone(),
+                    "ask_id": in_reply_to_ask_id.clone(),
                 })
                 .to_string(),
             ),
