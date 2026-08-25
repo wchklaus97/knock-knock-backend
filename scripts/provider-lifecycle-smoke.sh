@@ -177,6 +177,10 @@ jq -e '
   (.action_provider_ready == true)
 ' <<<"${health}" >/dev/null
 
+# Create/confirm responses are post-drain snapshots: terminal success carries
+# the result, while a failed first provider attempt carries a structured error
+# object. Callers assert the exact expected shape, so these helpers use
+# http_json (which tolerates error bodies) rather than json.
 create_reminder() {
   local command_id="$1"
   local idempotency_key="$2"
@@ -187,7 +191,7 @@ create_reminder_at() {
   local command_id="$1"
   local idempotency_key="$2"
   local due_at="$3"
-  json "${user_auth[@]}" -X POST "${BASE_URL}/v1/phone/commands" \
+  http_json "${user_auth[@]}" -X POST "${BASE_URL}/v1/phone/commands" \
     -d "$(jq -nc --arg id "${command_id}" --arg idem "${idempotency_key}" --arg due_at "${due_at}" \
       '{schema_version:1,command_id:$id,intent:"create_reminder",args:{title:"Provider lifecycle smoke",due_at:$due_at},risk_level:"low",needs_confirmation:false,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC"}')"
 }
@@ -197,7 +201,7 @@ create_reminder_at_in_session() {
   local idempotency_key="$2"
   local due_at="$3"
   local session_id="$4"
-  json "${user_auth[@]}" -X POST "${BASE_URL}/v1/phone/commands" \
+  http_json "${user_auth[@]}" -X POST "${BASE_URL}/v1/phone/commands" \
     -d "$(jq -nc --arg id "${command_id}" --arg idem "${idempotency_key}" \
       --arg due_at "${due_at}" --arg session_id "${session_id}" \
       '{schema_version:1,command_id:$id,intent:"create_reminder",args:{title:"Provider lifecycle smoke",due_at:$due_at},risk_level:"low",needs_confirmation:false,idempotency_key:$idem,confidence:0.99,locale:"en-US",timezone:"UTC",session_id:$session_id}')"
@@ -316,6 +320,35 @@ insert_zero_attempt_permit_fixture() {
     "INSERT INTO action_attempts (id, user_id, command_id, action_id, provider, provider_idempotency_key, state, request_hash, response_json, attempts, next_attempt_at, last_error, created_at, updated_at) SELECT 'attempt-${command_id}', user_id, id, NULL, 'action.reminder', 'permit-${command_id}', 'running', command_hash, NULL, 0, NULL, 'execution_permit', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM commands WHERE id = '${command_id}' AND user_id = '${user_id}'"
 }
 
+# Command POST/confirm responses now drain the outbox before replying, so an
+# HTTP-created reminder executes before the caller can attach pre-execution
+# fixtures. Scenarios that must reach the drain still queued are inserted
+# directly, mirroring the post-create row shape (state queued, version 2).
+insert_queued_reminder_fixture() {
+  local command_id="$1"
+  local expires_at="$2"
+  local session_id="${3:-}"
+  local session_sql="NULL"
+  [[ "${command_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ "${expires_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$ ]]
+  if [[ -n "${session_id}" ]]; then
+    [[ "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+    session_sql="'${session_id}'"
+  fi
+  # The drain's claim fence requires the outbox row to carry the exact
+  # backend-derived execution key: kk_<sha256("v1:command.execute:<user>:<key>")>.
+  local command_key="idem-${command_id}"
+  local outbox_key
+  outbox_key="$(python3 - "${user_id}" "${command_key}" <<'PY'
+import hashlib, sys
+print("kk_" + hashlib.sha256(f"v1:command.execute:{sys.argv[1]}:{sys.argv[2]}".encode()).hexdigest())
+PY
+)"
+  [[ "${outbox_key}" =~ ^kk_[0-9a-f]{64}$ ]]
+  d1_execute_fixture \
+    "INSERT INTO commands (id, user_id, device_id, session_id, schema_version, intent, args_json, risk_level, needs_confirmation, idempotency_key, confidence, locale, timezone, state, command_hash, result_json, error_code, expires_at, model_version, version, created_at, updated_at) VALUES ('${command_id}', '${user_id}', NULL, ${session_sql}, 1, 'create_reminder', '{\"title\":\"Provider lifecycle smoke\",\"due_at\":\"2099-01-01T09:00:00.000Z\"}', 'low', 0, '${command_key}', 0.99, 'en-US', 'UTC', 'queued', 'fixture-hash-${command_id}', NULL, NULL, '${expires_at}', NULL, 2, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')); INSERT INTO outbox_events (id, user_id, topic, aggregate_id, payload_json, idempotency_key, state, attempts, created_at, updated_at) VALUES ('out-${command_id}', '${user_id}', 'command.execute', '${command_id}', '{\"command_id\":\"${command_id}\"}', '${outbox_key}', 'queued', 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+}
+
 insert_succeeded_cancel_fixture() {
   local command_id="$1"
   local response_provider_id="$2"
@@ -379,36 +412,39 @@ if [[ -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
 
   history_command_id="cmd-${scoped_history_marker}"
   history_command_key="idem-${scoped_history_marker}"
-  history_queued="$(search_history \
+  # Read-only commands execute synchronously at POST; the canonical GET must
+  # reconcile to the identical owner-scoped terminal result.
+  history_result="$(search_history \
     "${history_command_id}" "${history_command_key}" "${scoped_history_marker}")"
-  test "$(jq -r '.state' <<<"${history_queued}")" = "queued"
-  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
-  history_result="$(get_json "${user_auth[@]}" \
+  test "$(jq -r '.state' <<<"${history_result}")" = "succeeded"
+  history_reconciled="$(get_json "${user_auth[@]}" \
     "${BASE_URL}/v1/phone/commands/${history_command_id}")"
-  jq -e \
-    --arg command_id "${history_command_id}" \
-    --arg query "${scoped_history_marker}" \
-    --arg owner_session "${owner_history_session}" \
-    --arg owner_message "${owner_history_message}" \
-    --arg owner_content "${owner_history_content}" \
-    --arg other_session "${other_history_session}" \
-    --arg other_message "${other_history_message}" \
-    --arg other_content "${other_history_content}" '
-      (.command_id == $command_id) and
-      (.state == "succeeded") and
-      (.result.kind == "history_search") and
-      (.result.data.query == $query) and
-      (.result.data.messages == .result.data.items) and
-      (.result.data.messages | length == 1) and
-      (.result.data.messages[0].session_id == $owner_session) and
-      (.result.data.messages[0].message_id == $owner_message) and
-      (.result.data.messages[0].content == $owner_content) and
-      ([.result.data.messages[] | select(
-        .session_id == $other_session or
-        .message_id == $other_message or
-        .content == $other_content
-      )] | length == 0)
-    ' <<<"${history_result}" >/dev/null
+  for history_body in "${history_result}" "${history_reconciled}"; do
+    jq -e \
+      --arg command_id "${history_command_id}" \
+      --arg query "${scoped_history_marker}" \
+      --arg owner_session "${owner_history_session}" \
+      --arg owner_message "${owner_history_message}" \
+      --arg owner_content "${owner_history_content}" \
+      --arg other_session "${other_history_session}" \
+      --arg other_message "${other_history_message}" \
+      --arg other_content "${other_history_content}" '
+        (.command_id == $command_id) and
+        (.state == "succeeded") and
+        (.result.kind == "history_search") and
+        (.result.data.query == $query) and
+        (.result.data.messages == .result.data.items) and
+        (.result.data.messages | length == 1) and
+        (.result.data.messages[0].session_id == $owner_session) and
+        (.result.data.messages[0].message_id == $owner_message) and
+        (.result.data.messages[0].content == $owner_content) and
+        ([.result.data.messages[] | select(
+          .session_id == $other_session or
+          .message_id == $other_message or
+          .content == $other_content
+        )] | length == 0)
+      ' <<<"${history_body}" >/dev/null
+  done
 
   draft_marker="provider-draft-route-$(date +%s%N)"
   draft_command_id="cmd-${draft_marker}"
@@ -416,26 +452,29 @@ if [[ -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
   draft_title="${draft_marker} title"
   draft_recipient="fixture recipient"
   draft_body="${draft_marker} body"
-  draft_queued="$(create_draft \
+  # Local draft effects also complete synchronously at POST; GET reconciles.
+  draft_result="$(create_draft \
     "${draft_command_id}" "${draft_command_key}" \
     "${draft_title}" "${draft_recipient}" "${draft_body}")"
-  test "$(jq -r '.state' <<<"${draft_queued}")" = "queued"
+  test "$(jq -r '.state' <<<"${draft_result}")" = "succeeded"
   curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
-  draft_result="$(get_json "${user_auth[@]}" \
+  draft_reconciled="$(get_json "${user_auth[@]}" \
     "${BASE_URL}/v1/phone/commands/${draft_command_id}")"
-  jq -e \
-    --arg command_id "${draft_command_id}" \
-    --arg title "${draft_title}" \
-    --arg recipient "${draft_recipient}" '
-      (.command_id == $command_id) and
-      (.state == "succeeded") and
-      (.result.kind == "draft") and
-      (.result.status == "draft") and
-      (.result.title == $title) and
-      (.result.recipient == $recipient) and
-      (.result.draft_id | type == "string" and length > 0) and
-      (.undo_command_id == $command_id)
-    ' <<<"${draft_result}" >/dev/null
+  for draft_response in "${draft_result}" "${draft_reconciled}"; do
+    jq -e \
+      --arg command_id "${draft_command_id}" \
+      --arg title "${draft_title}" \
+      --arg recipient "${draft_recipient}" '
+        (.command_id == $command_id) and
+        (.state == "succeeded") and
+        (.result.kind == "draft") and
+        (.result.status == "draft") and
+        (.result.title == $title) and
+        (.result.recipient == $recipient) and
+        (.result.draft_id | type == "string" and length > 0) and
+        (.undo_command_id == $command_id)
+      ' <<<"${draft_response}" >/dev/null
+  done
   draft_effect_id="$(jq -r '.result.draft_id' <<<"${draft_result}")"
 
   draft_undo="$(json "${user_auth[@]}" -X POST \
@@ -474,12 +513,12 @@ fi
 success_id="cmd-provider-success-$(date +%s%N)"
 success_key="idem-provider-success-$(date +%s%N)"
 success="$(create_reminder "${success_id}" "${success_key}")"
-test "$(jq -r '.state' <<<"${success}")" = "queued"
-curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+test "$(jq -r '.state' <<<"${success}")" = "succeeded"
 success_result="$(get_json "${user_auth[@]}" "${BASE_URL}/v1/phone/commands/${success_id}")"
 test "$(jq -r '.state' <<<"${success_result}")" = "succeeded"
 test "$(jq -r '.result.provider' <<<"${success_result}")" = "external.reminder"
 test "$(jq -r '.result.provider_id' <<<"${success_result}")" != "null"
+test "$(jq -r '.result.provider_id' <<<"${success}")" = "$(jq -r '.result.provider_id' <<<"${success_result}")"
 if [[ -n "${PROVIDER_LOG}" ]]; then
   success_delivery_count="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
   test "${success_delivery_count}" = "1"
@@ -501,8 +540,7 @@ if [[ -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
   ttl_success_id="cmd-ttl-success-reuse-$(date +%s%N)"
   ttl_success_key="idem-ttl-success-reuse-$(date +%s%N)"
   ttl_success="$(create_reminder "${ttl_success_id}" "${ttl_success_key}")"
-  test "$(jq -r '.state' <<<"${ttl_success}")" = "queued"
-  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  test "$(jq -r '.state' <<<"${ttl_success}")" = "succeeded"
   ttl_success_first="$(get_json "${user_auth[@]}" \
     "${BASE_URL}/v1/phone/commands/${ttl_success_id}")"
   test "$(jq -r '.state' <<<"${ttl_success_first}")" = "succeeded"
@@ -525,13 +563,12 @@ if [[ -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
   fi
 
   ttl_fresh_id="cmd-ttl-fresh-expire-$(date +%s%N)"
-  ttl_fresh_key="idem-ttl-fresh-expire-$(date +%s%N)"
   if [[ -n "${PROVIDER_LOG}" ]]; then
     ttl_fresh_delivery_before="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
   fi
-  ttl_fresh="$(create_reminder "${ttl_fresh_id}" "${ttl_fresh_key}")"
-  test "$(jq -r '.state' <<<"${ttl_fresh}")" = "queued"
-  expire_command_ttl_fixture "${ttl_fresh_id}"
+  # Inserted already TTL-expired and still queued; the drain sweep must expire
+  # it before any provider delivery attempt.
+  insert_queued_reminder_fixture "${ttl_fresh_id}" "2000-01-01T00:00:00.000Z"
   curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
   ttl_fresh_final="$(get_json "${user_auth[@]}" \
     "${BASE_URL}/v1/phone/commands/${ttl_fresh_id}")"
@@ -555,8 +592,9 @@ if [[ -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
   deleted_reconcile="$(create_reminder_at_in_session \
     "${deleted_reconcile_id}" "${deleted_reconcile_key}" \
     "2099-01-01T09:00:00Z" "${deleted_reconcile_session}")"
-  test "$(jq -r '.state' <<<"${deleted_reconcile}")" = "queued"
-  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  # The mock 503s this command's first delivery, so the post-drain POST
+  # response already carries the structured in-flight error.
+  assert_structured_command_error "${deleted_reconcile}"
   deleted_reconcile_first="$(get_json "${user_auth[@]}" \
     "${BASE_URL}/v1/phone/commands/${deleted_reconcile_id}")"
   assert_structured_command_error "${deleted_reconcile_first}"
@@ -580,10 +618,10 @@ if [[ -n "${PROVIDER_PERSIST_TO}" && -n "${PROVIDER_ENV_FILE}" ]]; then
   deleted_permit_id="cmd-deleted-permit-$(date +%s%N)"
   deleted_permit_key="idem-deleted-permit-$(date +%s%N)"
   create_session_fixture "${deleted_permit_session}"
-  deleted_permit="$(create_reminder_at_in_session \
-    "${deleted_permit_id}" "${deleted_permit_key}" \
-    "2099-01-01T09:00:00Z" "${deleted_permit_session}")"
-  test "$(jq -r '.state' <<<"${deleted_permit}")" = "queued"
+  # Inserted still queued so the zero-attempt permit lands before any
+  # execution; a POSTed command would drain inline and start the effect.
+  insert_queued_reminder_fixture \
+    "${deleted_permit_id}" "2099-01-01T00:00:00.000Z" "${deleted_permit_session}"
   insert_zero_attempt_permit_fixture "${deleted_permit_id}"
   delete_session_fixture "${deleted_permit_session}"
   if [[ -n "${PROVIDER_LOG}" ]]; then
@@ -602,8 +640,7 @@ fi
 cancel_reconcile_id="cmd-cancel-reconcile-$(date +%s%N)"
 cancel_reconcile_key="idem-cancel-reconcile-$(date +%s%N)"
 cancel_reconcile="$(create_reminder "${cancel_reconcile_id}" "${cancel_reconcile_key}")"
-test "$(jq -r '.state' <<<"${cancel_reconcile}")" = "queued"
-curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+test "$(jq -r '.state' <<<"${cancel_reconcile}")" = "succeeded"
 cancel_response="$(curl --silent --show-error --max-time "${HTTP_TIMEOUT_SECONDS:-10}" \
   -H 'content-type: application/json' "${user_auth[@]}" \
   -X POST "${BASE_URL}/v1/phone/commands/${cancel_reconcile_id}/undo" \
@@ -625,8 +662,9 @@ if [[ -n "${PROVIDER_LOG}" ]]; then
   reconcile_delivery_before="$(count_provider_requests '/reminders/deliver' "${PROVIDER_LOG}")"
 fi
 reconcile="$(create_reminder "${reconcile_id}" "${reconcile_key}")"
-test "$(jq -r '.state' <<<"${reconcile}")" = "queued"
-curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+# First delivery 503s in the mock; the post-drain POST response carries the
+# structured error, and the canonical GET must agree.
+assert_structured_command_error "${reconcile}"
 first="$(get_json "${user_auth[@]}" "${BASE_URL}/v1/phone/commands/${reconcile_id}")"
 assert_structured_command_error "${first}"
 sleep "${WAIT_SECONDS}"
@@ -652,8 +690,7 @@ if [[ -n "${PROVIDER_LOG}" ]]; then
 fi
 elapsed_reconcile="$(create_reminder_at \
   "${elapsed_reconcile_id}" "${elapsed_reconcile_key}" "${elapsed_reconcile_due_at}")"
-test "$(jq -r '.state' <<<"${elapsed_reconcile}")" = "queued"
-curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+assert_structured_command_error "${elapsed_reconcile}"
 elapsed_first="$(get_json "${user_auth[@]}" \
   "${BASE_URL}/v1/phone/commands/${elapsed_reconcile_id}")"
 assert_structured_command_error "${elapsed_first}"
@@ -690,10 +727,13 @@ message="$(create_message "${message_id}" "${message_key}")"
 test "$(jq -r '.state' <<<"${message}")" = "awaiting_confirmation"
 confirmation_token="$(jq -r '.confirmation_token' <<<"${message}")"
 test -n "${confirmation_token}" && test "${confirmation_token}" != "null"
-json "${user_auth[@]}" -X POST \
+message_confirmed="$(http_json "${user_auth[@]}" -X POST \
   "${BASE_URL}/v1/phone/commands/${message_id}/confirm" \
-  -d "$(jq -nc --arg token "${confirmation_token}" '{confirmation_token:$token}')" >/dev/null
-curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  -d "$(jq -nc --arg token "${confirmation_token}" '{confirmation_token:$token}')")"
+# Confirm drains inline; message delivery is asynchronously accepted, so the
+# post-drain snapshot is already the pending/unknown shape.
+jq -e '(.state == "unknown" or .state == "retryable")' <<<"${message_confirmed}" >/dev/null
+test "$(jq -r '.error.code' <<<"${message_confirmed}")" = "provider_pending"
 message_first="$(get_json "${user_auth[@]}" "${BASE_URL}/v1/phone/commands/${message_id}")"
 jq -e '(.state == "unknown" or .state == "retryable")' <<<"${message_first}" >/dev/null
 test "$(jq -r '.error.code' <<<"${message_first}")" = "provider_pending"
@@ -723,8 +763,7 @@ if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
   cancel_replay_id="cmd-cancel-replay-mismatch-$(date +%s%N)"
   cancel_replay_key="idem-cancel-replay-mismatch-$(date +%s%N)"
   cancel_replay="$(create_reminder "${cancel_replay_id}" "${cancel_replay_key}")"
-  test "$(jq -r '.state' <<<"${cancel_replay}")" = "queued"
-  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  test "$(jq -r '.state' <<<"${cancel_replay}")" = "succeeded"
   cancel_replay_first="$(get_json "${user_auth[@]}" \
     "${BASE_URL}/v1/phone/commands/${cancel_replay_id}")"
   test "$(jq -r '.state' <<<"${cancel_replay_first}")" = "succeeded"
@@ -747,8 +786,7 @@ if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
   cancel_missing_id="cmd-cancel-missing-id-$(date +%s%N)"
   cancel_missing_key="idem-cancel-missing-id-$(date +%s%N)"
   cancel_missing="$(create_reminder "${cancel_missing_id}" "${cancel_missing_key}")"
-  test "$(jq -r '.state' <<<"${cancel_missing}")" = "queued"
-  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  test "$(jq -r '.state' <<<"${cancel_missing}")" = "succeeded"
   cancel_missing_response="$(curl --silent --show-error --max-time "${HTTP_TIMEOUT_SECONDS:-10}" \
     -H 'content-type: application/json' "${user_auth[@]}" \
     -X POST "${BASE_URL}/v1/phone/commands/${cancel_missing_id}/undo" \
@@ -777,8 +815,7 @@ if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
   cancel_mismatch_id="cmd-cancel-mismatch-$(date +%s%N)"
   cancel_mismatch_key="idem-cancel-mismatch-$(date +%s%N)"
   cancel_mismatch="$(create_reminder "${cancel_mismatch_id}" "${cancel_mismatch_key}")"
-  test "$(jq -r '.state' <<<"${cancel_mismatch}")" = "queued"
-  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+  test "$(jq -r '.state' <<<"${cancel_mismatch}")" = "succeeded"
   cancel_mismatch_response="$(curl --silent --show-error --max-time "${HTTP_TIMEOUT_SECONDS:-10}" \
     -H 'content-type: application/json' "${user_auth[@]}" \
     -X POST "${BASE_URL}/v1/phone/commands/${cancel_mismatch_id}/undo" \
@@ -804,10 +841,12 @@ if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
   message_mismatch="$(create_message "${message_mismatch_id}" "${message_mismatch_key}")"
   test "$(jq -r '.state' <<<"${message_mismatch}")" = "awaiting_confirmation"
   message_mismatch_token="$(jq -r '.confirmation_token' <<<"${message_mismatch}")"
-  json "${user_auth[@]}" -X POST \
+  message_mismatch_confirmed="$(http_json "${user_auth[@]}" -X POST \
     "${BASE_URL}/v1/phone/commands/${message_mismatch_id}/confirm" \
-    -d "$(jq -nc --arg token "${message_mismatch_token}" '{confirmation_token:$token}')" >/dev/null
-  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+    -d "$(jq -nc --arg token "${message_mismatch_token}" '{confirmation_token:$token}')")"
+  jq -e '(.state == "unknown" or .state == "retryable")' \
+    <<<"${message_mismatch_confirmed}" >/dev/null
+  test "$(jq -r '.error.code' <<<"${message_mismatch_confirmed}")" = "provider_pending"
   message_mismatch_first="$(get_json "${user_auth[@]}" \
     "${BASE_URL}/v1/phone/commands/${message_mismatch_id}")"
   jq -e '(.state == "unknown" or .state == "retryable")' \
@@ -837,10 +876,11 @@ if [[ "${PROVIDER_STRICT_RESOURCE_IDENTITY}" == "true" ]]; then
   message_missing="$(create_message "${message_missing_id}" "${message_missing_key}")"
   test "$(jq -r '.state' <<<"${message_missing}")" = "awaiting_confirmation"
   message_missing_token="$(jq -r '.confirmation_token' <<<"${message_missing}")"
-  json "${user_auth[@]}" -X POST \
+  message_missing_confirmed="$(http_json "${user_auth[@]}" -X POST \
     "${BASE_URL}/v1/phone/commands/${message_missing_id}/confirm" \
-    -d "$(jq -nc --arg token "${message_missing_token}" '{confirmation_token:$token}')" >/dev/null
-  curl --fail-with-body --silent --show-error "${BASE_URL}/__scheduled" >/dev/null
+    -d "$(jq -nc --arg token "${message_missing_token}" '{confirmation_token:$token}')")"
+  jq -e '(.state == "unknown" or .state == "retryable")' <<<"${message_missing_confirmed}" >/dev/null
+  test "$(jq -r '.error.code' <<<"${message_missing_confirmed}")" = "provider_missing_id"
   message_missing_final="$(get_json "${user_auth[@]}" "${BASE_URL}/v1/phone/commands/${message_missing_id}")"
   jq -e '(.state == "unknown" or .state == "retryable")' <<<"${message_missing_final}" >/dev/null
   test "$(jq -r '.error.code' <<<"${message_missing_final}")" = "provider_missing_id"
