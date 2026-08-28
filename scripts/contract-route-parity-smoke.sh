@@ -23,14 +23,47 @@ end.to_set
 # These routes return before the dispatch table because they do not need D1.
 routes.merge([
   ["get", "/health"],
+  ["get", "/ready"],
   ["get", "/v1/health"],
   ["get", "/metrics"]
 ])
 
 contract = YAML.load_file(ENV.fetch("CONTRACT"))
-contract_routes = contract.fetch("paths").flat_map do |path, operations|
-  operations.keys.grep(/^(get|post|patch|put|delete)$/).map { |method| [method, path] }
+paths = contract.fetch("paths")
+abort "OpenAPI paths must be an object" unless paths.is_a?(Hash)
+
+http_methods = %w[get post patch put delete].freeze
+contract_routes = paths.flat_map do |path, path_item|
+  abort "OpenAPI path item #{path} must be an object" unless path_item.is_a?(Hash)
+
+  path_item.each_with_object([]) do |(method, operation), route_list|
+    next unless http_methods.include?(method)
+
+    unless operation.is_a?(Hash)
+      abort "OpenAPI operation #{method.upcase} #{path} must be a non-null object"
+    end
+    operation_id = operation["operationId"]
+    unless operation_id.is_a?(String) && !operation_id.empty?
+      abort "OpenAPI operation #{method.upcase} #{path} requires a non-empty operationId"
+    end
+    responses = operation["responses"]
+    unless responses.is_a?(Hash) && !responses.empty?
+      abort "OpenAPI operation #{method.upcase} #{path} requires a non-empty responses object"
+    end
+
+    route_list << [method, path]
+  end
 end.to_set
+
+register_operation = paths.fetch("/v1/auth/register").fetch("post")
+unless register_operation["tags"] == ["Auth"] &&
+    register_operation["security"] == [] &&
+    register_operation.dig("requestBody", "required") == true &&
+    register_operation.dig("requestBody", "content", "application/json", "schema", "$ref") == "#/components/schemas/AuthCredentials" &&
+    register_operation["responses"].key?("200") &&
+    register_operation["responses"].key?("default")
+  abort "OpenAPI POST /v1/auth/register is malformed"
+end
 
 missing = routes - contract_routes
 extra = contract_routes - routes
@@ -53,7 +86,9 @@ unless required_memory_routes.subset?(routes) && required_memory_routes.subset?(
 end
 
 operation_ids = contract.fetch("paths").flat_map do |_path, operations|
-  operations.values.map { |operation| operation["operationId"] }.compact
+  operations.each_with_object([]) do |(method, operation), ids|
+    ids << operation["operationId"] if http_methods.include?(method)
+  end
 end
 unless operation_ids.uniq.length == operation_ids.length
   abort "OpenAPI operationId values must be unique"

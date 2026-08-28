@@ -38,7 +38,7 @@ use crate::auth::{
 use crate::error::{ApiError, ApiResult};
 use crate::models::{
     ActionResultRequest, AuthCredentials, CommandEnvelope, CreateAgentRequest, DeviceRequest,
-    EventRequest, PairingClaimRequest, PairingCodeRequest, PhoneConfirmRequest, PhoneReplyRequest,
+    PairingClaimRequest, PairingCodeRequest, PhoneConfirmRequest, PhoneReplyRequest,
     PhoneSessionUpdateRequest, ProgressRequest, RefreshRequest, SessionRequest,
 };
 
@@ -163,9 +163,233 @@ pub async fn run_scheduled_outbox(_event: ScheduledEvent, env: Env, _ctx: Schedu
     }
 }
 
+fn environment_requires_apns(env: &Env) -> bool {
+    !matches!(
+        config_value(env, "NODE_ENV", "development")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "development" | "test"
+    )
+}
+
+fn apns_gate_ready(apns_required: bool, apns_bundle_id_ready: bool, apns_ready: bool) -> bool {
+    !apns_required || (apns_bundle_id_ready && apns_ready)
+}
+
+fn readiness_status(
+    runtime_configuration_ready: bool,
+    schema_ready: bool,
+    apns_configuration_ready: bool,
+) -> u16 {
+    if runtime_configuration_ready && schema_ready && apns_configuration_ready {
+        200
+    } else {
+        503
+    }
+}
+
+fn readiness_body(
+    runtime_configuration_ready: bool,
+    schema_ready: bool,
+    apns_required: bool,
+    apns_bundle_id: &str,
+    apns_ready: bool,
+) -> Value {
+    let apns_bundle_id_ready = crate::apns::is_canonical_bundle_id(apns_bundle_id);
+    let apns_configuration_ready = apns_gate_ready(apns_required, apns_bundle_id_ready, apns_ready);
+    if runtime_configuration_ready && schema_ready && apns_configuration_ready {
+        json!({
+            "ok": true,
+            "runtime_configuration_ready": true,
+            "schema_ready": true,
+            "schema_0022_compatible": schema_ready,
+            "apns_required": apns_required,
+            "apns_ready": apns_ready,
+            "apns_bundle_id": apns_bundle_id,
+            "apns_bundle_id_ready": apns_bundle_id_ready,
+            "required_migrations": ["0017", "0018", "0019", "0020", "0021", "0022"],
+        })
+    } else {
+        let code = if !runtime_configuration_ready {
+            "runtime_configuration_not_ready"
+        } else if !schema_ready {
+            "schema_not_ready"
+        } else if !apns_bundle_id_ready {
+            "apns_identity_not_ready"
+        } else {
+            "apns_not_ready"
+        };
+        json!({
+            "ok": false,
+            "runtime_configuration_ready": runtime_configuration_ready,
+            "schema_ready": schema_ready,
+            "schema_0022_compatible": schema_ready,
+            "apns_required": apns_required,
+            "apns_ready": apns_ready,
+            "apns_bundle_id": apns_bundle_id,
+            "apns_bundle_id_ready": apns_bundle_id_ready,
+            "code": code,
+            "message": "Required runtime configuration or D1 schema is unavailable",
+            "required_migrations": ["0017", "0018", "0019", "0020", "0021", "0022"],
+        })
+    }
+}
+
+fn readiness_identity_body(
+    mut body: Value,
+    environment: &str,
+    version: &str,
+    push_mode: &str,
+    apns_production: bool,
+    action_provider_mode: &str,
+    action_provider_ready: bool,
+    action_reminder_enabled: bool,
+    action_message_enabled: bool,
+) -> Value {
+    if let Some(fields) = body.as_object_mut() {
+        fields.insert("environment".to_string(), json!(environment));
+        fields.insert("version".to_string(), json!(version));
+        fields.insert("push_mode".to_string(), json!(push_mode));
+        fields.insert("apns_production".to_string(), json!(apns_production));
+        fields.insert(
+            "action_provider_mode".to_string(),
+            json!(action_provider_mode),
+        );
+        fields.insert(
+            "action_provider_ready".to_string(),
+            json!(action_provider_ready),
+        );
+        fields.insert(
+            "action_reminder_enabled".to_string(),
+            json!(action_reminder_enabled),
+        );
+        fields.insert(
+            "action_message_enabled".to_string(),
+            json!(action_message_enabled),
+        );
+    }
+    body
+}
+
+fn required_schema_probe_sql() -> &'static str {
+    concat!(
+        "SELECT '0017-0022' AS id WHERE ",
+        "(SELECT count(*) FROM pragma_table_info('agent_chat_bindings') WHERE name IN ('id','user_id','agent_id','chat_id','chat_title','listener_instance_id','status','last_seen_at','expires_at','revoked_at','created_at','updated_at','lease_id','generation')) = 14 ",
+        "AND (SELECT count(*) FROM pragma_table_info('agent_listener_leases') WHERE name IN ('agent_id','user_id','binding_id','chat_id','chat_title','listener_instance_id','lease_id','generation','acquired_at','last_seen_at','expires_at','released_at','updated_at')) = 13 ",
+        "AND (SELECT count(*) FROM pragma_table_info('phone_asks') WHERE name IN ('binding_id','target_chat_id','claimed_by_chat_id','client_turn_id','conversation_id','lease_id','listener_generation','claim_token','claim_deadline','claim_generation','answered_at','reply_event_id','attempt_count')) = 13 ",
+        "AND (SELECT count(*) FROM pragma_table_info('outbox_events') WHERE name IN ('topic','state','next_attempt_at','created_at')) = 4 ",
+        "AND (SELECT count(*) FROM pragma_table_info('action_attempts') WHERE name IN ('provider','state','next_attempt_at','updated_at')) = 4 ",
+        "AND (SELECT count(*) FROM pragma_table_info('devices') WHERE name IN ('id','user_id','platform','device_id','push_token','locale','timezone','created_at','updated_at')) = 9 ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('agent_chat_bindings') WHERE \"unique\" = 1 AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info(pragma_index_list.name) ORDER BY seqno)) = 'agent_id,chat_id') ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('agent_listener_leases') WHERE \"unique\" = 1 AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info(pragma_index_list.name) ORDER BY seqno)) = 'lease_id') ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('agent_chat_bindings') WHERE name = 'idx_agent_chat_bindings_active' AND \"unique\" = 0 AND partial = 0) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_agent_chat_bindings_active') ORDER BY seqno)) = 'agent_id,status,expires_at' ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('phone_asks') WHERE name = 'idx_phone_asks_binding_status' AND \"unique\" = 0 AND partial = 0) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_phone_asks_binding_status') ORDER BY seqno)) = 'binding_id,status,created_at' ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('agent_chat_bindings') WHERE name = 'idx_agent_chat_bindings_generation' AND \"unique\" = 0 AND partial = 0) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_agent_chat_bindings_generation') ORDER BY seqno)) = 'agent_id,generation' ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('agent_listener_leases') WHERE name = 'idx_agent_listener_leases_expiry' AND \"unique\" = 0 AND partial = 0) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_agent_listener_leases_expiry') ORDER BY seqno)) = 'expires_at' ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('phone_asks') WHERE name = 'idx_phone_asks_client_turn' AND \"unique\" = 1 AND partial = 1) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_phone_asks_client_turn') ORDER BY seqno)) = 'user_id,agent_id,client_turn_id' ",
+        "AND instr(lower((SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_phone_asks_client_turn')), 'where client_turn_id is not null') > 0 ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('phone_asks') WHERE name = 'idx_phone_asks_reply_event' AND \"unique\" = 1 AND partial = 1) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_phone_asks_reply_event') ORDER BY seqno)) = 'reply_event_id' ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('phone_asks') WHERE name = 'idx_phone_asks_claim_recovery' AND \"unique\" = 0 AND partial = 0) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_phone_asks_claim_recovery') ORDER BY seqno)) = 'binding_id,target_chat_id,status,claim_deadline,created_at' ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('outbox_events') WHERE name = 'idx_outbox_session_event_notification_due' AND \"unique\" = 0 AND partial = 1) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_outbox_session_event_notification_due') ORDER BY seqno)) = 'topic,state,next_attempt_at,created_at' ",
+        "AND instr(lower((SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_outbox_session_event_notification_due')), 'session.event.apns') > 0 ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('action_attempts') WHERE name = 'idx_action_attempts_session_event_apns_state' AND \"unique\" = 0 AND partial = 1) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_action_attempts_session_event_apns_state') ORDER BY seqno)) = 'provider,state,next_attempt_at,updated_at' ",
+        "AND instr(lower((SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_action_attempts_session_event_apns_state')), 'apns.session_event') > 0 ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('devices') WHERE name = 'idx_devices_registration_owner' AND \"unique\" = 1 AND partial = 0) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_devices_registration_owner') ORDER BY seqno)) = 'user_id,platform,device_id' ",
+        "AND EXISTS (SELECT 1 FROM pragma_index_list('devices') WHERE name = 'idx_devices_active_push_token' AND \"unique\" = 1 AND partial = 1) ",
+        "AND (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('idx_devices_active_push_token') ORDER BY seqno)) = 'push_token' ",
+        "AND instr(lower((SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_devices_active_push_token')), 'push_token is not null') > 0 ",
+        "AND (SELECT count(*) FROM d1_migrations WHERE name IN ('0017_agent_chat_bindings.sql','0018_listener_lease_fencing.sql','0019_phone_ask_claim_fencing.sql','0020_session_event_apns_outbox.sql','0021_push_registration_uniqueness.sql','0022_listener_lease_release.sql')) = 6 ",
+        "AND EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'devices' AND name = 'trg_devices_push_token_normalized_insert') ",
+        "AND EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'devices' AND name = 'trg_devices_push_token_normalized_update')"
+    )
+}
+
+async fn required_schema_ready(db: &D1Database) -> bool {
+    db::first::<IdOnly>(db, required_schema_probe_sql(), vec![])
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+async fn readiness_response(env: &Env) -> ApiResult<Response> {
+    let action_provider_config = providers::load(env);
+    let runtime_configuration_ready =
+        runtime_configuration(env).is_ok() && action_provider_config.is_ok();
+    let apns_required = environment_requires_apns(env);
+    let apns_bundle_id = crate::apns::bundle_id(env);
+    let apns_bundle_id_ready = crate::apns::is_canonical_bundle_id(&apns_bundle_id);
+    let apns_ready = crate::apns::is_ready(env);
+    let apns_configuration_ready = apns_gate_ready(apns_required, apns_bundle_id_ready, apns_ready);
+    let schema_ready = match env.d1("DB") {
+        Ok(db) => required_schema_ready(&db).await,
+        Err(_) => false,
+    };
+    let (action_provider_mode, action_provider_ready, action_reminder_enabled, action_message_enabled) =
+        match action_provider_config.as_ref() {
+            Ok(config) => (
+                config.mode().as_str().to_string(),
+                providers::ready(config),
+                config.enabled("create_reminder"),
+                config.enabled("send_message"),
+            ),
+            Err(_) => (
+                config_value(env, "ACTION_PROVIDER_MODE", "invalid")
+                    .trim()
+                    .to_ascii_lowercase(),
+                false,
+                false,
+                false,
+            ),
+        };
+    let body = readiness_identity_body(
+        readiness_body(
+            runtime_configuration_ready,
+            schema_ready,
+            apns_required,
+            &apns_bundle_id,
+            apns_ready,
+        ),
+        &config_value(env, "NODE_ENV", "development")
+            .trim()
+            .to_ascii_lowercase(),
+        &config_value(env, "SERVICE_VERSION", "unknown"),
+        &config_value(env, "PUSH_MODE", "dev")
+            .trim()
+            .to_ascii_lowercase(),
+        config_value(env, "APNS_PRODUCTION", "false") == "true",
+        &action_provider_mode,
+        action_provider_ready,
+        action_reminder_enabled,
+        action_message_enabled,
+    );
+    json_response(
+        body,
+        readiness_status(
+            runtime_configuration_ready,
+            schema_ready,
+            apns_configuration_ready,
+        ),
+    )
+}
+
 async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
     let path = req.path();
     let method = req.method();
+    if path == "/ready" && method == Method::Get {
+        return readiness_response(&env).await;
+    }
     runtime_configuration(&env)?;
     let action_provider_config = providers::load(&env)?;
 
@@ -173,15 +397,24 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         return Ok(Response::empty()?);
     }
     if matches!(path.as_str(), "/health" | "/v1/health") && method == Method::Get {
+        let apns_required = environment_requires_apns(&env);
+        let apns_bundle_id = crate::apns::bundle_id(&env);
+        let apns_bundle_id_ready = crate::apns::is_canonical_bundle_id(&apns_bundle_id);
+        let apns_ready = crate::apns::is_ready(&env);
+        let health_ok = apns_gate_ready(apns_required, apns_bundle_id_ready, apns_ready);
         return json_response(
             json!({
-                "ok": true,
+                "ok": health_ok,
                 "runtime": "cloudflare-worker",
                 "api": "rust",
+                "environment": config_value(&env, "NODE_ENV", "development").trim().to_ascii_lowercase(),
                 "version": config_value(&env, "SERVICE_VERSION", "unknown"),
                 "push_mode": config_value(&env, "PUSH_MODE", "dev"),
-                "apns_ready": crate::apns::is_ready(&env),
+                "apns_required": apns_required,
+                "apns_ready": apns_ready,
                 "apns_production": config_value(&env, "APNS_PRODUCTION", "false") == "true",
+                "apns_bundle_id": apns_bundle_id,
+                "apns_bundle_id_ready": apns_bundle_id_ready,
                 "action_provider_mode": action_provider_config.mode().as_str(),
                 "action_provider_ready": providers::ready(&action_provider_config),
                 "action_reminder_enabled": action_provider_config.enabled("create_reminder"),
@@ -218,10 +451,13 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
         ))?);
     }
 
+    reject_get_ask_claim(&method, &path, query_value(&req, "claim")?.is_some())?;
+
     let db = env.d1("DB")?;
     let segments = path_segments(&path);
     let identity = rate_limit_identity(&req)?;
-    rate_limits::enforce(&db, &path, &identity).await?;
+    let rate_limit_policy = rate_limits::route_policy(&method, &path);
+    rate_limits::enforce_with_policy(&db, &path, &identity, rate_limit_policy).await?;
 
     match (method, segments.as_slice()) {
         (Method::Post, ["v1", "auth", "register"]) => auth_register(&mut req, &env, &db).await,
@@ -238,11 +474,17 @@ async fn dispatch(mut req: Request, env: Env) -> ApiResult<Response> {
             list_agent_pending(&req, &db).await
         }
         (Method::Get, ["v1", "agents", "me", "asks"]) => list_agent_asks(&req, &db).await,
+        (Method::Post, ["v1", "agents", "me", "asks", "claim"]) => {
+            claim_agent_asks(&req, &db).await
+        }
         (Method::Post, ["v1", "agents", "me", "listener"]) => {
             register_agent_listener(&mut req, &db).await
         }
+        (Method::Post, ["v1", "agents", "me", "listener", "heartbeat"]) => {
+            renew_agent_listener(&mut req, &db).await
+        }
         (Method::Delete, ["v1", "agents", "me", "listener"]) => {
-            disconnect_agent_listener(&req, &db).await
+            release_agent_listener(&req, &db).await
         }
 
         (Method::Post, ["v1", "pairing", "code"]) => create_pairing_code(&mut req, &env, &db).await,
@@ -468,6 +710,18 @@ fn query_claim(request: &Request) -> ApiResult<bool> {
             .as_str(),
         "0" | "false" | "no"
     ))
+}
+
+fn reject_get_ask_claim(method: &Method, path: &str, claim_present: bool) -> ApiResult<()> {
+    if method == &Method::Get && path.trim_end_matches('/') == "/v1/agents/me/asks" && claim_present
+    {
+        return Err(ApiError::new(
+            400,
+            "ask_claim_requires_post",
+            "The claim query parameter is not supported; use POST /v1/agents/me/asks/claim",
+        ));
+    }
+    Ok(())
 }
 
 fn request_metadata(request: &Request) -> ApiResult<(Option<String>, Option<String>)> {
@@ -756,30 +1010,67 @@ async fn auth_logout(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult
     json_response(json!({ "ok": true }), 200)
 }
 
+#[derive(Deserialize)]
+struct AgentListRow {
+    id: String,
+    user_id: String,
+    label: String,
+    host_label: Option<String>,
+    created_at: String,
+    last_seen_at: Option<String>,
+    listener_binding_id: Option<String>,
+    listener_lease_id: Option<String>,
+    listener_generation: Option<i64>,
+    listener_chat_id: Option<String>,
+    listener_chat_title: Option<String>,
+    listener_expires_at: Option<String>,
+}
+
+const LIST_AGENTS_SQL: &str = "SELECT a.id, a.user_id, a.label, a.host_label, a.created_at, a.last_seen_at, b.id AS listener_binding_id, l.lease_id AS listener_lease_id, l.generation AS listener_generation, l.chat_id AS listener_chat_id, l.chat_title AS listener_chat_title, l.expires_at AS listener_expires_at FROM agents a LEFT JOIN agent_listener_leases l ON l.agent_id = a.id AND l.released_at IS NULL AND l.expires_at > ? LEFT JOIN agent_chat_bindings b ON b.id = l.binding_id WHERE a.user_id = ? ORDER BY a.created_at DESC";
+
+fn agent_list_value(row: AgentListRow) -> Value {
+    let listening = row.listener_binding_id.is_some()
+        && row.listener_lease_id.is_some()
+        && row.listener_generation.is_some()
+        && row.listener_chat_id.is_some()
+        && row.listener_expires_at.is_some();
+    let binding_id = row.listener_binding_id.clone();
+    let lease_id = row.listener_lease_id.clone();
+    let generation = row.listener_generation;
+    let target_chat_id = row.listener_chat_id.clone();
+    json!({
+        "agent_id": row.id,
+        "user_id": row.user_id,
+        "label": row.label,
+        "host_label": row.host_label,
+        "created_at": row.created_at,
+        "last_seen_at": row.last_seen_at,
+        "listening": listening,
+        "listener_binding_id": row.listener_binding_id,
+        "listener_lease_id": row.listener_lease_id,
+        "listener_generation": row.listener_generation,
+        "listener_chat_id": row.listener_chat_id,
+        "listener_chat_title": row.listener_chat_title,
+        "listener_expires_at": row.listener_expires_at,
+        "binding_id": binding_id,
+        "lease_id": lease_id,
+        "generation": generation,
+        "target_chat_id": target_chat_id,
+    })
+}
+
 async fn list_agents(req: &Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
+
     let user = require_user(req, env, db).await?;
-    let rows: Vec<models::AgentRow> = db::all(
+    let rows: Vec<AgentListRow> = db::all(
         db,
-        "SELECT a.id, a.user_id, a.label, a.host_label, a.created_at, a.last_seen_at, b.id AS listener_binding_id, b.chat_id AS listener_chat_id, b.chat_title AS listener_chat_title, b.expires_at AS listener_expires_at FROM agents a LEFT JOIN agent_chat_bindings b ON b.id = (SELECT b2.id FROM agent_chat_bindings b2 WHERE b2.agent_id = a.id AND b2.status = 'active' AND b2.expires_at > ? ORDER BY b2.updated_at DESC LIMIT 1) WHERE a.user_id = ? ORDER BY a.created_at DESC",
+        LIST_AGENTS_SQL,
         vec![db::text(&db::now_iso()), db::text(&user.user_id)],
     )
     .await?;
     let agents = rows
         .into_iter()
-        .map(|row| {
-            json!({
-                "agent_id": row.id,
-                "user_id": row.user_id,
-                "label": row.label,
-                "host_label": row.host_label,
-                "created_at": row.created_at,
-                "last_seen_at": row.last_seen_at,
-                "listener_binding_id": row.listener_binding_id,
-                "listener_chat_id": row.listener_chat_id,
-                "listener_chat_title": row.listener_chat_title,
-                "listener_expires_at": row.listener_expires_at,
-            })
-        })
+        .map(agent_list_value)
         .collect::<Vec<_>>();
     json_response(json!({ "agents": agents }), 200)
 }
@@ -1083,7 +1374,15 @@ async fn update_session_progress(
         .filter(|row| row.deleted_at.is_none())
         .ok_or_else(|| ApiError::not_found("Session not found"))?;
     let body: ProgressRequest = read_json(req).await?;
-    json_response(sessions::update_progress(db, &row, &body).await?, 200)
+    let binding = if sessions::progress_requires_ask_authority(&row, &body) {
+        Some(listener_bindings::require_request_binding(db, req, &agent.agent_id).await?)
+    } else {
+        None
+    };
+    json_response(
+        sessions::update_progress(db, &row, &body, binding.as_ref()).await?,
+        200,
+    )
 }
 
 async fn report_session_event(
@@ -1106,7 +1405,7 @@ async fn report_session_event(
             ));
         }
     }
-    let body: EventRequest = read_json(req).await?;
+    let body: sessions::ReportEventRequest = read_json(req).await?;
     json_response(sessions::report_event(db, env, &row, &body).await?, 200)
 }
 
@@ -1116,7 +1415,7 @@ async fn list_agent_pending(req: &Request, db: &D1Database) -> ApiResult<Respons
     json_response(
         json!({
             "actions": sessions::pending_actions(db, &agent.agent_id, None, query_claim(req)?).await?,
-            "asks": asks::list_agent_asks(db, &agent.agent_id, &binding, false).await?,
+            "asks": asks::list_agent_asks(db, &agent.agent_id, &binding).await?,
         }),
         200,
     )
@@ -1127,12 +1426,35 @@ async fn list_agent_asks(req: &Request, db: &D1Database) -> ApiResult<Response> 
     let binding = listener_bindings::require_request_binding(db, req, &agent.agent_id).await?;
     json_response(
         json!({
-            "asks": asks::list_agent_asks(db, &agent.agent_id, &binding, query_claim(req)?).await?,
+            "asks": asks::list_agent_asks(db, &agent.agent_id, &binding).await?,
             "binding": {
                 "binding_id": binding.id,
                 "chat_id": binding.chat_id,
                 "chat_title": binding.chat_title,
+                "lease_id": binding.lease_id,
+                "generation": binding.generation,
                 "expires_at": binding.expires_at,
+                "renew_after_ms": listener_bindings::LISTENER_RENEW_AFTER_MS,
+            }
+        }),
+        200,
+    )
+}
+
+async fn claim_agent_asks(req: &Request, db: &D1Database) -> ApiResult<Response> {
+    let agent = require_agent(req, db).await?;
+    let binding = listener_bindings::require_request_binding(db, req, &agent.agent_id).await?;
+    json_response(
+        json!({
+            "asks": asks::claim_agent_asks(db, &agent.agent_id, &binding).await?,
+            "binding": {
+                "binding_id": binding.id,
+                "chat_id": binding.chat_id,
+                "chat_title": binding.chat_title,
+                "lease_id": binding.lease_id,
+                "generation": binding.generation,
+                "expires_at": binding.expires_at,
+                "renew_after_ms": listener_bindings::LISTENER_RENEW_AFTER_MS,
             }
         }),
         200,
@@ -1148,10 +1470,19 @@ async fn register_agent_listener(req: &mut Request, db: &D1Database) -> ApiResul
     )
 }
 
-async fn disconnect_agent_listener(req: &Request, db: &D1Database) -> ApiResult<Response> {
+async fn renew_agent_listener(req: &mut Request, db: &D1Database) -> ApiResult<Response> {
+    let agent = require_agent(req, db).await?;
+    let body: listener_bindings::RenewListenerRequest = read_json(req).await?;
+    json_response(
+        listener_bindings::renew_listener(db, &agent, &body).await?,
+        200,
+    )
+}
+
+async fn release_agent_listener(req: &Request, db: &D1Database) -> ApiResult<Response> {
     let agent = require_agent(req, db).await?;
     json_response(
-        listener_bindings::disconnect_listener(db, req, &agent.agent_id).await?,
+        listener_bindings::release_listener(db, req, &agent).await?,
         200,
     )
 }
@@ -2079,90 +2410,137 @@ async fn phone_history(
     )
 }
 
+const LEGACY_DEVICE_REGISTRATION_KEY: &str = "__legacy_device__";
+const MIN_APNS_TOKEN_HEX_LENGTH: usize = 32;
+const MAX_APNS_TOKEN_HEX_LENGTH: usize = 512;
+
+fn normalized_device_platform(platform: &str) -> ApiResult<&'static str> {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "ios" => Ok("ios"),
+        "ios_simulator" => Ok("ios_simulator"),
+        _ => Err(ApiError::validation(
+            "platform must be ios or ios_simulator",
+        )),
+    }
+}
+
+fn normalized_apns_token(push_token: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(push_token) = push_token.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let length = push_token.len();
+    if !(MIN_APNS_TOKEN_HEX_LENGTH..=MAX_APNS_TOKEN_HEX_LENGTH).contains(&length)
+        || length % 2 != 0
+        || !push_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApiError::validation(
+            "push_token must be an even-length hexadecimal APNs token between 32 and 512 characters",
+        ));
+    }
+    Ok(Some(push_token.to_ascii_lowercase()))
+}
+
+fn device_registration_key(device_id: Option<&str>) -> String {
+    device_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(LEGACY_DEVICE_REGISTRATION_KEY)
+        .to_string()
+}
+
 fn retire_device_token_from_previous_bindings_sql() -> &'static str {
-    "UPDATE devices SET push_token = NULL, updated_at = ? WHERE push_token = ?"
+    "UPDATE devices SET push_token = NULL, updated_at = ? WHERE push_token = ? AND NOT (user_id = ? AND platform = ? AND device_id = ?)"
+}
+
+fn upsert_device_registration_sql() -> &'static str {
+    "INSERT INTO devices (id, user_id, platform, device_id, push_token, locale, timezone, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, platform, device_id) DO UPDATE SET push_token = excluded.push_token, locale = excluded.locale, timezone = excluded.timezone, updated_at = excluded.updated_at RETURNING id"
+}
+
+fn cap_active_device_registrations_sql() -> &'static str {
+    "UPDATE devices SET push_token = NULL, updated_at = ? WHERE user_id = ? AND push_token IS NOT NULL AND push_token != '' AND id NOT IN (SELECT id FROM devices WHERE user_id = ? AND platform = 'ios' AND push_token IS NOT NULL AND push_token != '' ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?)"
 }
 
 async fn register_device(req: &mut Request, env: &Env, db: &D1Database) -> ApiResult<Response> {
     let user = require_user(req, env, db).await?;
     let body: DeviceRequest = read_json(req).await?;
-    if body.platform.trim().is_empty() {
-        return Err(ApiError::validation("platform is required"));
-    }
-    let existing = if let Some(device_id) = body.device_id.as_deref() {
-        db::first::<IdOnly>(
-            db,
-            "SELECT id FROM devices WHERE user_id = ? AND device_id = ? ORDER BY updated_at DESC LIMIT 1",
-            vec![db::text(&user.user_id), db::text(device_id)],
-        )
-        .await?
+    let platform = normalized_device_platform(&body.platform)?;
+    let device_key = device_registration_key(body.device_id.as_deref());
+    let push_token = if platform == "ios" {
+        normalized_apns_token(body.push_token.as_deref())?
     } else {
-        db::first::<IdOnly>(
-            db,
-            "SELECT id FROM devices WHERE user_id = ? AND platform = ? ORDER BY updated_at DESC LIMIT 1",
-            vec![db::text(&user.user_id), db::text(&body.platform)],
-        )
-        .await?
+        None
     };
     let now = db::now_iso();
-    let push_token = body
-        .push_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let mut statements = Vec::new();
-    if let Some(push_token) = push_token {
-        // An APNs token identifies one current app installation. Transfer it
-        // away from every previous row before binding it to this device. This
-        // includes stale rows owned by the same account after an app reinstall
-        // as well as rows owned by a previous account. Both statements run in
-        // one D1 batch, so the token is never left unbound after a successful
-        // registration.
+    let candidate_id = new_id("dev")?;
+    let mut statements = Vec::with_capacity(if push_token.is_some() { 3 } else { 2 });
+
+    if let Some(push_token) = push_token.as_deref() {
+        // Explicit token registration is last-committer-wins. The release and
+        // owner UPSERT are one D1 transaction, so a reinstall or account
+        // change cannot leave one token active on two registrations.
         statements.push(db::prepare(
             db,
             retire_device_token_from_previous_bindings_sql(),
-            vec![db::text(&now), db::text(push_token)],
+            vec![
+                db::text(&now),
+                db::text(push_token),
+                db::text(&user.user_id),
+                db::text(platform),
+                db::text(&device_key),
+            ],
         )?);
     }
-    let device_id = if let Some(existing) = existing {
-        statements.push(db::prepare(
-            db,
-            "UPDATE devices SET device_id = COALESCE(?, device_id), push_token = ?, locale = ?, timezone = ?, updated_at = ? WHERE id = ?",
-            vec![
-                db::optional_text(body.device_id.as_deref()),
-                db::optional_text(push_token),
-                db::optional_text(body.locale.as_deref()),
-                db::optional_text(body.timezone.as_deref()),
-                db::text(&now),
-                db::text(&existing._id),
-            ],
-        )?);
-        db.batch(statements).await?;
-        existing._id
-    } else {
-        let id = new_id("dev")?;
-        statements.push(db::prepare(
-            db,
-            "INSERT INTO devices (id, user_id, platform, device_id, push_token, locale, timezone, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            vec![
-                db::text(&id),
-                db::text(&user.user_id),
-                db::text(&body.platform),
-                db::optional_text(body.device_id.as_deref()),
-                db::optional_text(push_token),
-                db::optional_text(body.locale.as_deref()),
-                db::optional_text(body.timezone.as_deref()),
-                db::text(&now),
-                db::text(&now),
-            ],
-        )?);
-        db.batch(statements).await?;
-        id
-    };
+
+    let upsert_result_index = statements.len();
+    statements.push(db::prepare(
+        db,
+        upsert_device_registration_sql(),
+        vec![
+            db::text(&candidate_id),
+            db::text(&user.user_id),
+            db::text(platform),
+            db::text(&device_key),
+            db::optional_text(push_token.as_deref()),
+            db::optional_text(body.locale.as_deref()),
+            db::optional_text(body.timezone.as_deref()),
+            db::text(&now),
+            db::text(&now),
+        ],
+    )?);
+    statements.push(db::prepare(
+        db,
+        cap_active_device_registrations_sql(),
+        vec![
+            db::text(&now),
+            db::text(&user.user_id),
+            db::text(&user.user_id),
+            db::number(push::MAX_ACTIVE_DEVICE_REGISTRATIONS_PER_USER),
+        ],
+    )?);
+
+    let results = db.batch(statements).await?;
+    let registrations: Vec<IdOnly> = results
+        .get(upsert_result_index)
+        .ok_or_else(|| {
+            ApiError::new(
+                500,
+                "device_registration_error",
+                "Device registration UPSERT returned no result",
+            )
+        })?
+        .results()?;
+    let registration = registrations.into_iter().next().ok_or_else(|| {
+        ApiError::new(
+            500,
+            "device_registration_error",
+            "Device registration UPSERT returned no resource",
+        )
+    })?;
+
     json_response(
         json!({
-            "device_id": device_id,
-            "platform": body.platform,
+            "device_id": registration._id,
+            "platform": platform,
             "push_token_registered": push_token.is_some(),
             "locale": body.locale,
             "timezone": body.timezone,
@@ -2493,7 +2871,7 @@ fn add_common_headers(
     }
     response.headers_mut().set(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Agent-Key, X-Device-ID, X-Request-ID, X-Knock-Chat-ID, X-Knock-Listener-Instance",
+        "Authorization, Content-Type, X-Agent-Key, X-Device-ID, X-Request-ID, X-Knock-Chat-ID, X-Knock-Listener-Instance, X-Knock-Listener-Lease-ID, X-Knock-Listener-Generation",
     )?;
     response.headers_mut().set(
         "Access-Control-Allow-Methods",
@@ -2514,11 +2892,24 @@ fn add_common_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        phone_change_event_type, retire_device_token_from_previous_bindings_sql,
-        valid_model_r2_key, valid_request_id, valid_semantic_version, validate_model_manifest,
+        apns_gate_ready, phone_change_event_type, rate_limits, readiness_body, readiness_status,
+        retire_device_token_from_previous_bindings_sql, valid_model_r2_key, valid_request_id,
+        valid_semantic_version, validate_model_manifest,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
+    use worker::Method;
+
+    #[test]
+    fn get_ask_claim_query_fails_closed_before_route_authentication() {
+        let error =
+            super::reject_get_ask_claim(&Method::Get, "/v1/agents/me/asks", true).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert_eq!(error.code, "ask_claim_requires_post");
+        assert!(
+            super::reject_get_ask_claim(&Method::Post, "/v1/agents/me/asks/claim", false,).is_ok()
+        );
+    }
 
     #[test]
     fn model_manifest_requires_integrity_and_capability_fields() {
@@ -2582,6 +2973,27 @@ mod tests {
     }
 
     #[test]
+    fn route_policy_keeps_ask_poll_read_only_without_exempting_writes() {
+        assert_eq!(
+            rate_limits::route_policy(&Method::Get, "/v1/agents/me/asks"),
+            rate_limits::RateLimitPolicy::ReadOnly
+        );
+        for (method, path) in [
+            (Method::Post, "/v1/phone/agents/agt_1/asks"),
+            (Method::Post, "/v1/agents/me/asks/claim"),
+            (Method::Post, "/v1/pairing/claim"),
+            (Method::Post, "/v1/agents/me/listener/heartbeat"),
+            (Method::Delete, "/v1/agents/me/listener"),
+        ] {
+            assert_eq!(
+                rate_limits::route_policy(&method, path),
+                rate_limits::RateLimitPolicy::Persistent,
+                "{method:?} {path} must retain persistent rate limiting"
+            );
+        }
+    }
+
+    #[test]
     fn json_reader_rejects_oversized_bodies_before_decoding() {
         let oversized = vec![b' '; super::MAX_JSON_BODY_BYTES + 1];
         let error = super::decode_json::<serde_json::Value>(&oversized).unwrap_err();
@@ -2606,11 +3018,68 @@ mod tests {
     #[test]
     fn device_registration_rebinds_one_apns_token_after_reinstall_or_account_change() {
         let sql = retire_device_token_from_previous_bindings_sql();
+        assert!(sql.contains("WHERE push_token = ?"));
+        assert!(sql.contains("NOT (user_id = ? AND platform = ? AND device_id = ?)"));
+    }
+
+    #[test]
+    fn device_registration_upsert_returns_one_stable_owner_resource() {
+        let sql = super::upsert_device_registration_sql();
+        assert!(sql.contains("ON CONFLICT(user_id, platform, device_id) DO UPDATE"));
+        assert!(sql.ends_with("RETURNING id"));
+    }
+
+    #[test]
+    fn device_registration_accepts_ios_and_safe_simulator_mode() {
+        assert_eq!(super::normalized_device_platform("ios").unwrap(), "ios");
+        assert_eq!(super::normalized_device_platform(" iOS ").unwrap(), "ios");
         assert_eq!(
-            sql,
-            "UPDATE devices SET push_token = NULL, updated_at = ? WHERE push_token = ?"
+            super::normalized_device_platform("ios_simulator").unwrap(),
+            "ios_simulator"
         );
-        assert!(!sql.contains("user_id"));
+        assert!(super::normalized_device_platform("android").is_err());
+        assert!(super::normalized_device_platform("").is_err());
+    }
+
+    #[test]
+    fn apns_token_validation_is_hex_bounded_but_not_fixed_length() {
+        let short_valid = "A0".repeat(16);
+        let historical = "b1".repeat(32);
+        let future_valid = "C2".repeat(64);
+        assert_eq!(
+            super::normalized_apns_token(Some(&short_valid)).unwrap(),
+            Some(short_valid.to_ascii_lowercase())
+        );
+        assert_eq!(
+            super::normalized_apns_token(Some(&historical)).unwrap(),
+            Some(historical)
+        );
+        assert_eq!(
+            super::normalized_apns_token(Some(&future_valid)).unwrap(),
+            Some(future_valid.to_ascii_lowercase())
+        );
+        assert_eq!(super::normalized_apns_token(None).unwrap(), None);
+        assert_eq!(super::normalized_apns_token(Some("  ")).unwrap(), None);
+        assert!(super::normalized_apns_token(Some(&"a".repeat(30))).is_err());
+        assert!(super::normalized_apns_token(Some(&"a".repeat(33))).is_err());
+        assert!(super::normalized_apns_token(Some(&"a".repeat(514))).is_err());
+        assert!(super::normalized_apns_token(Some(&format!("{}z0", "a".repeat(62)))).is_err());
+    }
+
+    #[test]
+    fn missing_legacy_device_id_uses_one_stable_registration_key() {
+        assert_eq!(
+            super::device_registration_key(None),
+            super::LEGACY_DEVICE_REGISTRATION_KEY
+        );
+        assert_eq!(
+            super::device_registration_key(Some("  ")),
+            super::LEGACY_DEVICE_REGISTRATION_KEY
+        );
+        assert_eq!(
+            super::device_registration_key(Some(" device-a ")),
+            "device-a"
+        );
     }
 
     #[test]
@@ -2677,5 +3146,163 @@ mod tests {
         let body = super::command_body_after_outbox_drain(fallback, Some(snapshot));
         assert_eq!(body["state"], json!("awaiting_confirmation"));
         assert_eq!(body["confirmation_token"], json!("ctok_live"));
+    }
+
+    #[test]
+    fn readiness_is_fail_closed_until_0017_through_0022_are_queryable() {
+        assert_eq!(readiness_status(true, true, true), 200);
+        assert_eq!(readiness_status(false, true, true), 503);
+        assert_eq!(readiness_status(true, false, true), 503);
+        assert_eq!(readiness_status(true, true, false), 503);
+        assert!(!apns_gate_ready(true, false, true));
+        assert!(!apns_gate_ready(true, true, false));
+        assert!(apns_gate_ready(false, false, false));
+        let bundle_id = crate::apns::CANONICAL_APNS_BUNDLE_ID;
+        assert_eq!(
+            readiness_body(true, true, true, bundle_id, true)["schema_ready"],
+            json!(true)
+        );
+        assert_eq!(
+            readiness_body(true, true, true, bundle_id, true)["schema_0022_compatible"],
+            json!(true)
+        );
+        assert_eq!(
+            readiness_body(true, false, true, bundle_id, true)["schema_0022_compatible"],
+            json!(false)
+        );
+        assert_eq!(
+            readiness_body(true, true, true, bundle_id, true)["apns_bundle_id"],
+            json!(bundle_id)
+        );
+        assert_eq!(
+            readiness_body(true, true, true, bundle_id, true)["apns_bundle_id_ready"],
+            json!(true)
+        );
+        assert_eq!(
+            readiness_body(false, true, true, bundle_id, true)["code"],
+            json!("runtime_configuration_not_ready")
+        );
+        assert_eq!(
+            readiness_body(true, false, true, bundle_id, true)["code"],
+            json!("schema_not_ready")
+        );
+        assert_eq!(
+            readiness_body(true, false, true, bundle_id, true)["required_migrations"],
+            json!(["0017", "0018", "0019", "0020", "0021", "0022"])
+        );
+        assert_eq!(
+            readiness_body(true, true, true, "hk.knockknock.wrong", true)["code"],
+            json!("apns_identity_not_ready")
+        );
+        assert_eq!(
+            readiness_body(true, true, true, "hk.knockknock.wrong", true)["ok"],
+            json!(false)
+        );
+        assert_eq!(
+            readiness_body(true, true, true, bundle_id, false)["code"],
+            json!("apns_not_ready")
+        );
+        assert_eq!(
+            readiness_body(true, true, true, bundle_id, false)["ok"],
+            json!(false)
+        );
+        assert_eq!(
+            readiness_body(true, true, false, "", false)["ok"],
+            json!(true)
+        );
+        assert_eq!(
+            readiness_body(false, true, true, "hk.knockknock.wrong", true)["apns_bundle_id_ready"],
+            json!(false)
+        );
+        assert_eq!(
+            readiness_body(false, true, true, "", true)["apns_bundle_id_ready"],
+            json!(false)
+        );
+        let identified = super::readiness_identity_body(
+            readiness_body(true, true, true, bundle_id, true),
+            "production",
+            "candidate-sha",
+            "both",
+            true,
+            "external",
+            false,
+            false,
+            false,
+        );
+        assert_eq!(identified["environment"], json!("production"));
+        assert_eq!(identified["version"], json!("candidate-sha"));
+        assert_eq!(identified["push_mode"], json!("both"));
+        assert_eq!(identified["apns_production"], json!(true));
+        assert_eq!(identified["action_provider_mode"], json!("external"));
+        assert_eq!(identified["action_provider_ready"], json!(false));
+        let probe = super::required_schema_probe_sql();
+        for required in [
+            "agent_chat_bindings",
+            "agent_listener_leases",
+            "idx_phone_asks_client_turn",
+            "idx_phone_asks_claim_recovery",
+            "idx_outbox_session_event_notification_due",
+            "idx_action_attempts_session_event_apns_state",
+            "idx_devices_registration_owner",
+            "idx_devices_active_push_token",
+            "d1_migrations",
+            "0017_agent_chat_bindings.sql",
+            "0018_listener_lease_fencing.sql",
+            "0019_phone_ask_claim_fencing.sql",
+            "0020_session_event_apns_outbox.sql",
+            "0021_push_registration_uniqueness.sql",
+            "0022_listener_lease_release.sql",
+            "trg_devices_push_token_normalized_insert",
+            "trg_devices_push_token_normalized_update",
+        ] {
+            assert!(
+                probe.contains(required),
+                "missing readiness probe for {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn released_agent_projection_is_immediately_not_listening() {
+        let released = super::agent_list_value(super::AgentListRow {
+            id: "agent-1".to_string(),
+            user_id: "user-1".to_string(),
+            label: "Agent".to_string(),
+            host_label: None,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            last_seen_at: Some("2026-01-01T00:00:01.000Z".to_string()),
+            listener_binding_id: None,
+            listener_lease_id: None,
+            listener_generation: None,
+            listener_chat_id: None,
+            listener_chat_title: None,
+            listener_expires_at: None,
+        });
+        assert_eq!(released["listening"], json!(false));
+        for field in [
+            "listener_binding_id",
+            "listener_lease_id",
+            "listener_generation",
+            "listener_chat_id",
+            "listener_chat_title",
+            "listener_expires_at",
+            "binding_id",
+            "lease_id",
+            "generation",
+            "target_chat_id",
+        ] {
+            assert!(released[field].is_null(), "released projection retained {field}");
+        }
+        assert!(super::LIST_AGENTS_SQL.contains("l.released_at IS NULL"));
+        assert!(super::LIST_AGENTS_SQL.contains("l.expires_at > ?"));
+    }
+
+    #[test]
+    fn active_device_cap_is_deterministic_and_does_not_delete_history() {
+        let sql = super::cap_active_device_registrations_sql();
+        assert!(sql.starts_with("UPDATE devices SET push_token = NULL"));
+        assert!(sql.contains("ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?"));
+        assert!(!sql.contains("DELETE FROM"));
+        assert_eq!(super::push::MAX_ACTIVE_DEVICE_REGISTRATIONS_PER_USER, 8);
     }
 }

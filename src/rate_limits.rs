@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use worker::D1Database;
+use worker::{D1Database, Method};
 
 use crate::db;
 use crate::error::{ApiError, ApiResult};
@@ -8,6 +8,33 @@ use crate::error::{ApiError, ApiResult};
 #[derive(Debug, Deserialize)]
 struct RateLimitRow {
     request_count: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitPolicy {
+    ReadOnly,
+    Persistent,
+}
+
+impl RateLimitPolicy {
+    pub const fn is_persistent(self) -> bool {
+        match self {
+            Self::ReadOnly => false,
+            Self::Persistent => true,
+        }
+    }
+}
+
+/// High-frequency Ask polls authenticate and validate their listener fence,
+/// but must not create D1 write traffic when there is no work to claim.
+/// Every other route remains on the persistent abuse-control path.
+pub fn route_policy(method: &Method, path: &str) -> RateLimitPolicy {
+    let normalized_path = path.trim_end_matches('/');
+    if method == &Method::Get && normalized_path == "/v1/agents/me/asks" {
+        RateLimitPolicy::ReadOnly
+    } else {
+        RateLimitPolicy::Persistent
+    }
 }
 
 fn digest(value: &str) -> String {
@@ -82,6 +109,18 @@ pub async fn enforce(db: &D1Database, path: &str, identity: &str) -> ApiResult<(
     enforce_bucket(db, kind, limit, identity).await
 }
 
+pub async fn enforce_with_policy(
+    db: &D1Database,
+    path: &str,
+    identity: &str,
+    policy: RateLimitPolicy,
+) -> ApiResult<()> {
+    if !policy.is_persistent() {
+        return Ok(());
+    }
+    enforce(db, path, identity).await
+}
+
 /// Applies verified user/agent limits and an optional per-device bucket. This
 /// is called after auth has resolved the principal, so token rotation cannot
 /// bypass the account quota.
@@ -99,9 +138,23 @@ pub async fn enforce_authenticated(
     Ok(())
 }
 
+pub async fn enforce_authenticated_with_policy(
+    db: &D1Database,
+    path: &str,
+    principal: &str,
+    device_id: Option<&str>,
+    policy: RateLimitPolicy,
+) -> ApiResult<()> {
+    if !policy.is_persistent() {
+        return Ok(());
+    }
+    enforce_authenticated(db, path, principal, device_id).await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::category;
+    use super::{category, route_policy, RateLimitPolicy};
+    use worker::Method;
 
     #[test]
     fn rate_limit_categories_cover_reconnect_and_model_paths() {
@@ -120,6 +173,38 @@ mod tests {
         assert_eq!(
             category("/v1/actions/action_1/result"),
             ("agent_event", 120)
+        );
+    }
+
+    #[test]
+    fn only_high_frequency_ask_get_uses_read_only_rate_policy() {
+        assert_eq!(
+            route_policy(&Method::Get, "/v1/agents/me/asks"),
+            RateLimitPolicy::ReadOnly
+        );
+        assert_eq!(
+            route_policy(&Method::Get, "/v1/agents/me/asks/"),
+            RateLimitPolicy::ReadOnly
+        );
+        assert_eq!(
+            route_policy(&Method::Post, "/v1/phone/agents/agt_1/asks"),
+            RateLimitPolicy::Persistent
+        );
+        assert_eq!(
+            route_policy(&Method::Post, "/v1/agents/me/asks/claim"),
+            RateLimitPolicy::Persistent
+        );
+        assert_eq!(
+            route_policy(&Method::Post, "/v1/pairing/claim"),
+            RateLimitPolicy::Persistent
+        );
+        assert_eq!(
+            route_policy(&Method::Post, "/v1/agents/me/listener/heartbeat"),
+            RateLimitPolicy::Persistent
+        );
+        assert_eq!(
+            route_policy(&Method::Delete, "/v1/agents/me/listener"),
+            RateLimitPolicy::Persistent
         );
     }
 }

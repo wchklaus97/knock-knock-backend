@@ -2,11 +2,6 @@ name: Staging contract gate
 
 on:
   workflow_dispatch:
-    inputs:
-      staging_url:
-        description: Deployed staging Worker URL
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -17,12 +12,7 @@ jobs:
     timeout-minutes: 10
     environment: staging
     env:
-      BASE_URL: ${{ inputs.staging_url }}
-      SMOKE_EMAIL: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_EMAIL }}
-      SMOKE_PASSWORD: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_PASSWORD }}
-      SMOKE_OTHER_EMAIL: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_OTHER_EMAIL }}
-      SMOKE_OTHER_PASSWORD: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_OTHER_PASSWORD }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CANONICAL_STAGING_ORIGIN: https://knock-knock-backend-staging.wch-klaus.workers.dev
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
       STAGING_D1_DATABASE_ID: ${{ vars.KNOCK_KNOCK_STAGING_D1_DATABASE_ID }}
       STAGING_R2_BUCKET: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
@@ -30,19 +20,23 @@ jobs:
       STAGING_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_STAGING_CORS_ORIGIN }}
       STAGING_RELEASE_VERSION: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify exact canonical Staging origin before credentials
+        run: |
+          set -euo pipefail
+          test "$CANONICAL_STAGING_ORIGIN" = 'https://knock-knock-backend-staging.wch-klaus.workers.dev'
+          test "$STAGING_CORS_ORIGIN" = "$CANONICAL_STAGING_ORIGIN"
       - name: Install smoke dependencies
         run: |
           npm install --global wrangler@4.81.1
-          ./scripts/ci-prerequisites.sh staging
       - name: Materialize staging Wrangler config
         run: |
-          test -n "$CLOUDFLARE_API_TOKEN"
-          test -n "$CLOUDFLARE_ACCOUNT_ID"
-          test -n "$STAGING_D1_DATABASE_ID"
-          test -n "$STAGING_R2_BUCKET"
-          test -n "$STAGING_SUPABASE_URL"
-          test -n "$STAGING_CORS_ORIGIN"
+          set -euo pipefail
+          test "$CLOUDFLARE_ACCOUNT_ID" = 'bb3bd088c02d3baa52f7bd175c3ce953'
+          test "$STAGING_D1_DATABASE_ID" = 'cc97b563-2e1a-4ab2-96a2-3d0ba8201d9c'
+          test "$STAGING_R2_BUCKET" = 'knock-knock-staging'
+          test "$STAGING_SUPABASE_URL" = 'https://awrvwbgkzzvhbehwjues.supabase.co'
+          test "$STAGING_CORS_ORIGIN" = "$CANONICAL_STAGING_ORIGIN"
           test -n "$STAGING_RELEASE_VERSION"
           config="$RUNNER_TEMP/wrangler.staging.toml"
           sed \
@@ -52,7 +46,24 @@ jobs:
             -e "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|$STAGING_D1_DATABASE_ID|g" \
             -e "s|REPLACE_WITH_STAGING_R2_BUCKET_NAME|$STAGING_R2_BUCKET|g" \
             wrangler.staging.toml.example > "$config"
+          grep -Fqx 'APNS_BUNDLE_ID = "hk.knockknock.app"' "$config"
           echo "STAGING_WRANGLER_CONFIG=$config" >> "$GITHUB_ENV"
           echo "R2_SMOKE_BUCKET=$STAGING_R2_BUCKET" >> "$GITHUB_ENV"
       - name: Run deployed staging contract gate
-        run: ./scripts/staging-contract-gate.sh
+        env:
+          BASE_URL: ${{ env.CANONICAL_STAGING_ORIGIN }}
+          SMOKE_AUTH_MODE: login
+          SMOKE_EMAIL: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_EMAIL }}
+          SMOKE_PASSWORD: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_PASSWORD }}
+          SMOKE_OTHER_EMAIL: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_OTHER_EMAIL }}
+          SMOKE_OTHER_PASSWORD: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_OTHER_PASSWORD }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$BASE_URL" = "$CANONICAL_STAGING_ORIGIN"
+          : "${SMOKE_EMAIL:?KNOCK_KNOCK_STAGING_SMOKE_EMAIL is required}"
+          : "${SMOKE_PASSWORD:?KNOCK_KNOCK_STAGING_SMOKE_PASSWORD is required}"
+          : "${SMOKE_OTHER_EMAIL:?KNOCK_KNOCK_STAGING_SMOKE_OTHER_EMAIL is required}"
+          : "${SMOKE_OTHER_PASSWORD:?KNOCK_KNOCK_STAGING_SMOKE_OTHER_PASSWORD is required}"
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required}"
+          ./scripts/staging-contract-gate.sh

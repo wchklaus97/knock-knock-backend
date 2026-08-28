@@ -99,11 +99,26 @@ test -n "$agent_key" && test "$agent_key" != "null"
 agent_auth=(-H "x-agent-key: $agent_key")
 agents="$(get "${user_auth[@]}" "$BASE_URL/v1/agents")"
 test "$(jq -r '.agents | length' <<<"$agents")" -ge 1
+jq -e --arg agent_id "$agent_id" '
+  (.agents | map(select(.agent_id == $agent_id))) as $matches |
+  ($matches | length) == 1 and
+  ($matches[0].listening == false) and
+  ($matches[0].listener_binding_id == null) and
+  ($matches[0].listener_lease_id == null) and
+  ($matches[0].listener_generation == null) and
+  ($matches[0].listener_chat_id == null) and
+  ($matches[0].listener_chat_title == null) and
+  ($matches[0].listener_expires_at == null) and
+  ($matches[0].binding_id == null) and
+  ($matches[0].lease_id == null) and
+  ($matches[0].generation == null) and
+  ($matches[0].target_chat_id == null)
+' <<<"$agents" >/dev/null
 skills="$(get "${user_auth[@]}" "$BASE_URL/v1/skills")"
 test "$(jq -r '.skills | length' <<<"$skills")" -ge 1
 
 device_correlation_id="device-contract-$(date +%s%N)"
-device_push_token="contract-smoke-device-token-$(date +%s%N)"
+device_push_token="$(printf '%064d' 0)"
 device="$(json "${user_auth[@]}" -X POST "$BASE_URL/v1/phone/devices" \
   -d "$(jq -nc --arg device_id "$device_correlation_id" \
     --arg push_token "$device_push_token" \

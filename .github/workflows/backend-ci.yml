@@ -48,6 +48,11 @@ jobs:
         run: npm install --global wrangler@4.81.1
       - name: Verify dynamic gate prerequisites
         run: ./scripts/ci-prerequisites.sh dynamic
+      - name: Run listener lease and APNs outbox D1 integration gate
+        run: |
+          ./scripts/listener-lease-d1-integration.sh
+          ./scripts/ask-protocol-d1-integration.sh
+          ./scripts/readiness-d1-integration.sh
       - name: Run isolated contract, R2, and provider gates
         run: |
           ./scripts/local-contract-gate.sh

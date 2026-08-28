@@ -15,11 +15,6 @@ on:
         description: Current Cloudflare Worker version ID recorded before rollout
         required: true
         type: string
-      apply_migrations:
-        description: Apply pending D1 migrations after backup verification
-        required: true
-        default: false
-        type: boolean
       approval_phrase:
         description: Type RELEASE KNOCK KNOCK PRODUCTION
         required: true
@@ -169,14 +164,40 @@ jobs:
             exit 64
           fi
           grep -Fqx 'NODE_ENV = "production"' "$config"
+          grep -Fqx 'PUSH_MODE = "both"' "$config"
+          grep -Fqx 'APNS_BUNDLE_ID = "hk.knockknock.app"' "$config"
           grep -Fqx 'APNS_PRODUCTION = "true"' "$config"
+          grep -Fqx 'ACTION_PROVIDER_MODE = "external"' "$config"
+          grep -Fqx 'ACTION_REMINDER_ENABLED = "false"' "$config"
+          grep -Fqx 'ACTION_MESSAGE_ENABLED = "false"' "$config"
+          grep -Fqx "SERVICE_VERSION = \"$RELEASE_SHA\"" "$config"
           test -d "$GITHUB_WORKSPACE/migrations"
+          test -f "$GITHUB_WORKSPACE/migrations/0022_listener_lease_release.sql"
+          grep -Fq 'ALTER TABLE agent_listener_leases ADD COLUMN released_at TEXT' \
+            "$GITHUB_WORKSPACE/migrations/0022_listener_lease_release.sql"
           grep -Fqx "migrations_dir = \"$GITHUB_WORKSPACE/migrations\"" "$config"
           echo "PRODUCTION_WRANGLER_CONFIG=$config" >> "$GITHUB_ENV"
 
-      - name: Apply approved production migrations
-        if: ${{ inputs.apply_migrations == true }}
-        run: wrangler d1 migrations apply knock-knock --remote --config "$PRODUCTION_WRANGLER_CONFIG"
+      - name: Apply mandatory Production migrations through 0022
+        run: |
+          set -euo pipefail
+          wrangler d1 migrations apply DB --remote --config "$PRODUCTION_WRANGLER_CONFIG"
+
+      - name: Verify Production migration 0022 and schema before deploy
+        run: |
+          set -euo pipefail
+          migration_state="$(wrangler d1 execute DB \
+            --remote \
+            --json \
+            --config "$PRODUCTION_WRANGLER_CONFIG" \
+            --command "SELECT EXISTS(SELECT 1 FROM d1_migrations WHERE name = '0022_listener_lease_release.sql') AS migration_0022, (SELECT GROUP_CONCAT(name, ',') FROM (SELECT name FROM d1_migrations WHERE name IN ('0017_agent_chat_bindings.sql', '0018_listener_lease_fencing.sql', '0019_phone_ask_claim_fencing.sql', '0020_session_event_apns_outbox.sql', '0021_push_registration_uniqueness.sql', '0022_listener_lease_release.sql') ORDER BY id)) AS migration_tail, EXISTS(SELECT 1 FROM pragma_table_info('agent_listener_leases') WHERE name = 'released_at') AS schema_0022_compatible")"
+          jq -e '
+            type == "array" and length == 1 and
+            (.[0].results | length == 1) and
+            .[0].results[0].migration_0022 == 1 and
+            .[0].results[0].schema_0022_compatible == 1 and
+            .[0].results[0].migration_tail == "0017_agent_chat_bindings.sql,0018_listener_lease_fencing.sql,0019_phone_ask_claim_fencing.sql,0020_session_event_apns_outbox.sql,0021_push_registration_uniqueness.sql,0022_listener_lease_release.sql"
+          ' <<<"$migration_state" >/dev/null
 
       - name: Deploy exact approved Worker
         run: wrangler deploy --cwd "$GITHUB_WORKSPACE" --config "$PRODUCTION_WRANGLER_CONFIG"

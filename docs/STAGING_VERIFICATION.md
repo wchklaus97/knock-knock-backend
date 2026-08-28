@@ -1,6 +1,6 @@
 # Knock Knock Staging Verification
 
-**Last verified:** 2026-08-12 (Asia/Hong_Kong)
+**Last workflow-contract review:** 2026-08-28 (Asia/Hong_Kong)
 
 **Scope:** Remote staging Worker/D1/R2 deployment for the Phase 4/5 completion
 branch. This document records staging evidence only; it is not production
@@ -17,6 +17,7 @@ approval.
 - `AUTH_PROVIDER`: `supabase`
 - `PUSH_MODE`: `both` (APNs sandbox plus development push inbox)
 - `APNS_PRODUCTION`: `false`
+- `APNS_BUNDLE_ID`: `hk.knockknock.app` (source-controlled identity lock)
 - `ACTION_PROVIDER_MODE`: `disabled`
 - Reminder/message effects: disabled
 - Voice model rollout: disabled
@@ -30,8 +31,10 @@ rollout remains deferred.
 
 ## Evidence completed
 
-- The protected GitHub **Staging deploy** workflow succeeded for `c83b04d`
-  without applying migrations: [run 31496029273](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31496029273).
+- The historical protected GitHub **Staging deploy** workflow succeeded for
+  `c83b04d`: [run 31496029273](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31496029273).
+  That run predates the current unconditional migration-through-0021 gate and
+  is not evidence for the current workflow revision.
 - The protected GitHub **Staging contract gate** succeeded for the same commit:
   [run 31496803603](https://github.com/wchklaus97/knock-knock-backend/actions/runs/31496803603).
 - Twenty consecutive read-only `/health` probes passed on 2026-08-11 with
@@ -60,8 +63,9 @@ rollout remains deferred.
   with an email-confirmed account; login, protected API access, refresh, and
   logout passed against the staging Worker. Its email and password are stored
   only as GitHub environment secrets.
-- Staging Supabase Email auth was enabled and `mailer_autoconfirm` was set to
-  `true`; registration smoke no longer depends on the built-in email provider.
+- Staging contract verification uses two pre-provisioned, email-confirmed UAT
+  accounts in login mode. Remote gates never fall back to registration or the
+  built-in email provider.
 - The remote R2 smoke now waits for the deployed one-minute Cloudflare cron
   instead of calling the local-only `/__scheduled` test path.
 - iOS `Staging` configuration was added and built successfully for the iOS
@@ -93,6 +97,13 @@ The staging GitHub environment now has the scoped non-interactive Cloudflare
 credential and UAT credentials needed by these protected workflows. Secret
 values were not printed or copied into the repository.
 
+Both the standalone contract workflow and the post-deploy contract step are
+hard-locked to the exact origin
+`https://knock-knock-backend-staging.wch-klaus.workers.dev`. There is no URL
+dispatch input. Empty, alternate, Production, lookalike, credential-bearing,
+redirect, path, query, fragment, and trailing-slash variants are rejected
+before UAT or Cloudflare credentials are made available to the contract step.
+
 ## Next controlled steps
 
 1. Review and merge the paired voice-workflow PRs. The changes documented in
@@ -110,49 +121,66 @@ values were not printed or copied into the repository.
 
 ## Rollback
 
-No production resource was changed. Roll back staging by routing the Worker to
-the previous Cloudflare Worker version; do not delete the staging D1/R2
-resources. The applied migrations are additive and must be rolled back only
-through an approved migration plan.
+No production resource was changed. Migration 0021 changes registration data
+and is not expand-only. The workflow restores the exact previously captured
+Staging Worker version only when that deployment's pre-migration `/health`
+response explicitly reports `schema_0021_compatible=true`. If the evidence is
+absent, or a compatible rollback fails, the workflow emits a **HOLD: manual
+forward recovery required** summary and leaves the candidate/current Worker for
+operator review. D1 Time Travel is never run automatically because restoring
+the captured pre-migration bookmark would overwrite concurrent writes. Review
+the job-summary command and intervening writes before any manual recovery. Do
+not delete the Staging D1/R2 resources.
+
+The HOLD fence is armed before Wrangler starts the remote migration command.
+If Wrangler exits non-zero after a partial or uncertain migration, the run is
+therefore treated as potentially migrated and requires the same manual forward
+recovery review.
 
 ## Protected staging deployment workflow
 
 `.github/workflows/staging-deploy.yml` is a `workflow_dispatch`-only release
-entry point. It was executed successfully for `c83b04d` with
-`apply_migrations=false`; the separate migration job was skipped. This local
-voice completion worktree has not dispatched a workflow, deployed a Worker,
-changed a secret, or applied a remote migration.
+entry point. The current workflow has no optional migration switch: after its
+exact Staging/Production identity lock and Wrangler dry run, it captures the
+current Worker version and pre-migration D1 bookmark, then applies all pending
+repository migrations through `0021_push_registration_uniqueness.sql` before
+deploying Worker traffic. This worktree has not dispatched the workflow,
+deployed a Worker, changed a secret, or applied a remote migration.
 
 Before using it, keep the existing `staging` GitHub environment protected with
-required reviewers and provision only its staging-scoped values: the
-Cloudflare account ID, staging D1 database ID, private staging R2 bucket,
-staging Supabase URL, staging CORS origin, staging release version, and a
-least-privilege `CLOUDFLARE_API_TOKEN`. The workflow materializes the checked-in
-staging template in the runner temporary directory without printing its values;
-it does not read `.dev.vars`, Wrangler OAuth state, `wrangler.production.toml`,
-or production secrets.
+required reviewers. Every Cloudflare account, D1, R2, Worker, workers.dev route,
+Worker URL, and Supabase project value must exactly match the source-controlled
+Staging and Production identities. The template is materialized in the runner
+temporary directory without printing values and never reads `.dev.vars`,
+Wrangler OAuth state, or `wrangler.production.toml`.
 
 Runbook:
 
-1. Dispatch with the HTTPS staging Worker URL and leave `apply_migrations` at
-   its default `false`. This deploys only the staging Worker/D1/R2 bindings
-   and never invokes a migration or production command.
-2. Confirm the workflow's post-deploy `/health` assertion: Rust Worker,
-   `push_mode=both`, `apns_ready=true`, `apns_production=false`, and the action
-   provider disabled. This is a deployment smoke, not the full contract gate.
-3. Run the existing **Staging contract gate** workflow separately against the
-   same URL; it remains the owner of authenticated REST/SSE, D1, R2, and
-   isolation evidence.
-4. Only when the expand review is approved, dispatch the workflow with
-   `apply_migrations=true`. The separate protected staging job copies exactly
-   `migrations/0013_retrieval_retention_status.sql` and
-   `migrations/0014_command_safety.sql` into a temporary migration directory,
-   then runs Wrangler's remote migration command with that directory. A
-   staging D1 already containing the earlier schema is required; no other
-   migration file is made available to the command.
+1. Dispatch without a URL or migration choice. The workflow accepts only the
+   canonical workers.dev Staging identity and rejects a Staging/Production
+   variable swap.
+2. Confirm the pre-migration Wrangler dry run succeeds before bookmark capture
+   or remote D1 migration.
+3. Confirm the pre-traffic migration/data gate reports migrations `0017`
+   through `0021`, both 0021 normalization triggers, both uniqueness indexes,
+   normalized single-owner APNs tokens, and no foreign-key violations.
+4. Confirm `/health` reports the exact commit, Rust Worker runtime,
+   `push_mode=both`, `apns_ready=true`, `apns_production=false`,
+   `apns_bundle_id=hk.knockknock.app`, `schema_0021_compatible=true`, and
+   disabled external action effects.
+5. Confirm `/ready` reports runtime and schema readiness, the required migration
+   ledger through `0021`, `apns_bundle_id_ready=true`,
+   `schema_0021_compatible=true`, the normalization-trigger/index checks, and
+   the APNs outbox/schema prerequisites expected by the current Worker.
+6. Confirm the post-deploy contract gate uses only the pre-provisioned Staging
+   accounts with `SMOKE_AUTH_MODE=login`; missing credentials fail closed and
+   registration fallback is forbidden.
+7. Run the standalone **Staging contract gate** when separate authenticated
+   REST/SSE, remote R2, retention, and cross-user isolation evidence is needed.
 
-Rollback/runbook notes: if the Worker deploy is unhealthy, route staging back
-to the previous Cloudflare Worker version and keep the staging D1/R2 resources
-in place. If the explicit migration path has run, preserve the Wrangler/D1
-backup and use the approved forward/compensating migration plan; do not run
-destructive rollback SQL and do not point this workflow at production.
+Rollback/runbook notes: post-deploy failure restores the previously captured
+Worker version only when its health contract provides machine-verifiable schema
+0021 compatibility. Otherwise the workflow enters HOLD and requires manual
+forward recovery. D1 is not auto-restored. Keep the Staging D1/R2 resources in
+place, review the pre-migration Time Travel bookmark manually if recovery is
+required, and never point either workflow at Production.
