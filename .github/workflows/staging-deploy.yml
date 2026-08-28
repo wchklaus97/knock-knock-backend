@@ -333,7 +333,16 @@ jobs:
 
           staging_url="${STAGING_URL%/}"
           previous_health="$(curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 20 "${staging_url}/health")"
-          previous_ready="$(curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 20 "${staging_url}/ready")"
+          previous_ready_file="$RUNNER_TEMP/staging-ready-before.json"
+          previous_ready_http_code="$(curl --silent --show-error --connect-timeout 10 --max-time 20 --output "$previous_ready_file" --write-out '%{http_code}' "${staging_url}/ready" || true)"
+          if [[ "$previous_ready_http_code" == "404" ]]; then
+            printf '%s\n' '{"ok":false,"schema_ready":false,"schema_0022_compatible":false}' > "$previous_ready_file"
+          elif [[ "$previous_ready_http_code" != "200" ]]; then
+            cat "$previous_ready_file"
+            echo "Unexpected Staging /ready status: $previous_ready_http_code" >&2
+            exit 1
+          fi
+          previous_ready="$(cat "$previous_ready_file")"
           previous_service_version="$(jq -r 'select(.ok == true) | .version // empty' <<<"$previous_health")"
           test -n "$previous_service_version"
           previous_schema_0022_compatible="$(jq -r '
