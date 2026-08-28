@@ -220,6 +220,7 @@ jobs:
             -e "s|REPLACE_WITH_STAGING_R2_BUCKET_NAME|${STAGING_R2_BUCKET_NAME}|g" \
             "$config_base" > "$config"
           rm -f -- "$config_base"
+          cp -R -- "$GITHUB_WORKSPACE/migrations" "$RUNNER_TEMP/migrations"
 
           test -s "$config"
           if grep -Eq 'REPLACE_WITH_|wrangler\.production\.toml|--env[[:space:]]+production' "$config"; then
