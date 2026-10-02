@@ -20,6 +20,7 @@ AUTH_PROVIDER = "supabase"
 SUPABASE_URL = "REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL"
 PUSH_MODE = "both"
 APNS_PRODUCTION = "false"
+APNS_BUNDLE_ID = "hk.knockknock.app"
 CORS_ORIGIN = "REPLACE_WITH_STAGING_ALLOWED_ORIGIN"
 SERVICE_VERSION = "REPLACE_WITH_STAGING_RELEASE_VERSION"
 ACTION_PROVIDER_MODE = "disabled"
@@ -44,7 +45,8 @@ bucket_name = "REPLACE_WITH_STAGING_R2_BUCKET_NAME"
 # Required secret:
 # wrangler secret put SUPABASE_PUBLISHABLE_KEY --config wrangler.staging.toml
 # For the agreed APNs sandbox profile, also configure APNS_KEY,
-# APNS_KEY_ID, and APNS_TEAM_ID as staging-only secrets. Never set
+# APNS_KEY_ID, and APNS_TEAM_ID as staging-only secrets. APNS_BUNDLE_ID is a
+# source-controlled non-secret identity lock. Never set
 # APNS_PRODUCTION to true in this environment.
 # If AUTH_PROVIDER is changed to legacy for a temporary test, also set:
 # wrangler secret put JWT_SECRET --config wrangler.staging.toml

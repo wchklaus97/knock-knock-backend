@@ -123,6 +123,60 @@ pub fn parse_mode(raw: &str) -> ApiResult<ActionProviderMode> {
     }
 }
 
+fn validate_deployment_policy_values(
+    node_env: &str,
+    mode: ActionProviderMode,
+    reminder_enabled: bool,
+    message_enabled: bool,
+) -> ApiResult<()> {
+    match node_env {
+        "production" => {
+            if mode != ActionProviderMode::External {
+                return Err(ApiError::new(
+                    500,
+                    "configuration_error",
+                    "ACTION_PROVIDER_MODE must be external in production",
+                ));
+            }
+            if reminder_enabled || message_enabled {
+                return Err(ApiError::new(
+                    500,
+                    "configuration_error",
+                    "ACTION_REMINDER_ENABLED and ACTION_MESSAGE_ENABLED must both be false in production",
+                ));
+            }
+        }
+        "staging" => {
+            if mode != ActionProviderMode::Disabled {
+                return Err(ApiError::new(
+                    500,
+                    "configuration_error",
+                    "ACTION_PROVIDER_MODE must be disabled in staging",
+                ));
+            }
+            if reminder_enabled || message_enabled {
+                return Err(ApiError::new(
+                    500,
+                    "configuration_error",
+                    "ACTION_REMINDER_ENABLED and ACTION_MESSAGE_ENABLED must both be false in staging",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn validate_deployment_policy(env: &Env, node_env: &str) -> ApiResult<()> {
+    if !matches!(node_env, "staging" | "production") {
+        return Ok(());
+    }
+    let mode = parse_mode(&config_value(env, "ACTION_PROVIDER_MODE", ""))?;
+    let reminder_enabled = bool_value(env, "ACTION_REMINDER_ENABLED", "")?;
+    let message_enabled = bool_value(env, "ACTION_MESSAGE_ENABLED", "")?;
+    validate_deployment_policy_values(node_env, mode, reminder_enabled, message_enabled)
+}
+
 pub fn load(env: &Env) -> ApiResult<ActionProviderConfig> {
     let node_env = config_value(env, "NODE_ENV", "development")
         .trim()
@@ -687,6 +741,57 @@ mod tests {
             ActionProviderMode::Disabled
         );
         assert!(parse_mode("sendgrid").is_err());
+    }
+
+    #[test]
+    fn deployment_provider_policy_is_environment_specific_and_fail_closed() {
+        assert!(validate_deployment_policy_values(
+            "production",
+            ActionProviderMode::External,
+            false,
+            false,
+        )
+        .is_ok());
+        for mode in [ActionProviderMode::Internal, ActionProviderMode::Disabled] {
+            assert!(validate_deployment_policy_values("production", mode, false, false).is_err());
+        }
+        assert!(validate_deployment_policy_values(
+            "production",
+            ActionProviderMode::External,
+            true,
+            false,
+        )
+        .is_err());
+        assert!(validate_deployment_policy_values(
+            "production",
+            ActionProviderMode::External,
+            false,
+            true,
+        )
+        .is_err());
+
+        assert!(validate_deployment_policy_values(
+            "staging",
+            ActionProviderMode::Disabled,
+            false,
+            false,
+        )
+        .is_ok());
+        assert!(validate_deployment_policy_values(
+            "staging",
+            ActionProviderMode::External,
+            false,
+            false,
+        )
+        .is_err());
+
+        assert!(validate_deployment_policy_values(
+            "development",
+            ActionProviderMode::External,
+            true,
+            true,
+        )
+        .is_ok());
     }
 
     #[test]

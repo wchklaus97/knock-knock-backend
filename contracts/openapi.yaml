@@ -37,6 +37,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
+  /ready:
+    get:
+      tags: [Auth]
+      security: []
+      operationId: getWorkerReadiness
+      responses:
+        '200':
+          description: Runtime configuration and migrations 0017 through 0022 are ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+        '503':
+          description: Runtime configuration or the required D1 schema is incomplete or drifted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
   /metrics:
     get:
       tags: [Auth]
@@ -201,7 +219,6 @@ paths:
         - agentKey: []
       operationId: listAgentPendingActions
       parameters:
-        - $ref: '#/components/parameters/SessionId'
         - $ref: '#/components/parameters/Claim'
       responses:
         '200':
@@ -225,20 +242,37 @@ paths:
         - agentKey: []
       operationId: listAgentPhoneAsks
       parameters:
-        - $ref: '#/components/parameters/Claim'
+        - $ref: '#/components/parameters/ListenerChatId'
+        - $ref: '#/components/parameters/ListenerInstanceId'
+        - $ref: '#/components/parameters/ListenerLeaseId'
+        - $ref: '#/components/parameters/ListenerGeneration'
       responses:
         '200':
-          description: User voice asks queued for this agent.
+          description: Read-only snapshot of pending Asks. This operation never claims, expires, or updates rows.
           content:
             application/json:
               schema:
-                type: object
-                required: [asks]
-                properties:
-                  asks:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/PhoneAsk'
+                $ref: '#/components/schemas/AgentAskPage'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/agents/me/asks/claim:
+    post:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: claimAgentPhoneAsks
+      parameters:
+        - $ref: '#/components/parameters/ListenerChatId'
+        - $ref: '#/components/parameters/ListenerInstanceId'
+        - $ref: '#/components/parameters/ListenerLeaseId'
+        - $ref: '#/components/parameters/ListenerGeneration'
+      responses:
+        '200':
+          description: Claims available Asks for the exact active listener lease and returns answer credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentAskPage'
         default:
           $ref: '#/components/responses/Error'
   /v1/agents/me/listener:
@@ -252,43 +286,14 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              additionalProperties: false
-              required: [chat_id, chat_title, listener_instance_id]
-              properties:
-                chat_id:
-                  type: string
-                chat_title:
-                  type: string
-                listener_instance_id:
-                  type: string
-                takeover:
-                  type: boolean
+              $ref: '#/components/schemas/ListenerRegistrationRequest'
       responses:
         '200':
           description: Active listener binding for this agent.
           content:
             application/json:
               schema:
-                type: object
-                required: [agent_id, binding_id, chat_id, chat_title, last_seen_at, expires_at, listener_instance_id, status]
-                properties:
-                  agent_id:
-                    type: string
-                  binding_id:
-                    type: string
-                  chat_id:
-                    type: string
-                  chat_title:
-                    type: string
-                  last_seen_at:
-                    type: string
-                  expires_at:
-                    type: string
-                  listener_instance_id:
-                    type: string
-                  status:
-                    type: string
+                $ref: '#/components/schemas/ListenerLease'
         default:
           $ref: '#/components/responses/Error'
     delete:
@@ -296,19 +301,41 @@ paths:
       security:
         - agentKey: []
       operationId: disconnectAgentListener
+      description: Idempotently releases the exact current listener lease. A replay of the same explicit release returns the original release record; expired or superseded authority is fenced.
+      x-idempotent: true
+      parameters:
+        - $ref: '#/components/parameters/ListenerChatId'
+        - $ref: '#/components/parameters/ListenerInstanceId'
+        - $ref: '#/components/parameters/ListenerLeaseId'
+        - $ref: '#/components/parameters/ListenerGeneration'
       responses:
         '200':
-          description: Listener binding disconnected.
+          description: Exact listener lease released, or the same release was already recorded.
           content:
             application/json:
               schema:
-                type: object
-                required: [ok, binding_id]
-                properties:
-                  ok:
-                    type: boolean
-                  binding_id:
-                    type: string
+                $ref: '#/components/schemas/ListenerDisconnectResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/agents/me/listener/heartbeat:
+    post:
+      tags: [Agent]
+      security:
+        - agentKey: []
+      operationId: renewAgentListener
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ListenerHeartbeatRequest'
+      responses:
+        '200':
+          description: Renewed exact listener lease. Stale or legacy authority is rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListenerLease'
         default:
           $ref: '#/components/responses/Error'
   /v1/pairing/code:
@@ -468,6 +495,10 @@ paths:
       operationId: updateSessionProgress
       parameters:
         - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/ProgressListenerChatId'
+        - $ref: '#/components/parameters/ProgressListenerInstanceId'
+        - $ref: '#/components/parameters/ProgressListenerLeaseId'
+        - $ref: '#/components/parameters/ProgressListenerGeneration'
       requestBody:
         required: true
         content:
@@ -572,7 +603,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/OkResponse'
+                $ref: '#/components/schemas/DeviceRegistrationResponse'
         default:
           $ref: '#/components/responses/Error'
   /v1/phone/events:
@@ -1206,6 +1237,50 @@ components:
       in: query
       required: false
       schema: { type: boolean, default: false }
+    ListenerChatId:
+      name: X-Knock-Chat-Id
+      in: header
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 128 }
+    ListenerInstanceId:
+      name: X-Knock-Listener-Instance
+      in: header
+      required: true
+      schema: { type: string, minLength: 8, maxLength: 128 }
+    ListenerLeaseId:
+      name: X-Knock-Listener-Lease-Id
+      in: header
+      required: true
+      schema: { type: string, minLength: 8, maxLength: 128 }
+    ListenerGeneration:
+      name: X-Knock-Listener-Generation
+      in: header
+      required: true
+      schema: { type: integer, minimum: 1 }
+    ProgressListenerChatId:
+      name: X-Knock-Chat-Id
+      in: header
+      required: false
+      description: Required with Ask-bearing progress; must identify the currently active listener chat.
+      schema: { type: string, minLength: 1, maxLength: 128 }
+    ProgressListenerInstanceId:
+      name: X-Knock-Listener-Instance
+      in: header
+      required: false
+      description: Required with Ask-bearing progress; must identify the currently active listener instance.
+      schema: { type: string, minLength: 8, maxLength: 128 }
+    ProgressListenerLeaseId:
+      name: X-Knock-Listener-Lease-Id
+      in: header
+      required: false
+      description: Required with Ask-bearing progress; stale or superseded leases fail with 409 lease_fenced.
+      schema: { type: string, minLength: 8, maxLength: 128 }
+    ProgressListenerGeneration:
+      name: X-Knock-Listener-Generation
+      in: header
+      required: false
+      description: Required with Ask-bearing progress and must equal listener_generation in the body.
+      schema: { type: integer, minimum: 1 }
   responses:
     Error:
       description: Structured API error.
@@ -1237,35 +1312,183 @@ components:
         email: { type: string, format: email }
     Agent:
       type: object
-      required: [agent_id, label]
+      additionalProperties: false
+      required: [agent_id, user_id, label, host_label, created_at, last_seen_at, listening, listener_binding_id, listener_lease_id, listener_generation, listener_chat_id, listener_chat_title, listener_expires_at, binding_id, lease_id, generation, target_chat_id]
       properties:
         agent_id: { type: string }
+        user_id: { type: string }
         label: { type: string }
         host_label: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
         last_seen_at: { type: [string, 'null'], format: date-time }
+        listening: { type: boolean, description: True only while a complete, unexpired, unreleased listener lease is active. A successful listener DELETE makes this false immediately. }
+        listener_binding_id: { type: [string, 'null'] }
+        listener_lease_id: { type: [string, 'null'] }
+        listener_generation: { type: [integer, 'null'], minimum: 1 }
+        listener_chat_id: { type: [string, 'null'] }
+        listener_chat_title: { type: [string, 'null'] }
+        listener_expires_at: { type: [string, 'null'], format: date-time }
+        binding_id: { type: [string, 'null'], description: Compatibility alias of listener_binding_id. }
+        lease_id: { type: [string, 'null'], description: Compatibility alias of listener_lease_id. }
+        generation: { type: [integer, 'null'], minimum: 1, description: Compatibility alias of listener_generation. }
+        target_chat_id: { type: [string, 'null'], description: Compatibility alias of listener_chat_id. }
     PhoneAsk:
       type: object
-      required: [ask_id, agent_id, transcript, status, created_at]
+      additionalProperties: false
+      required: [ask_id, agent_id, user_id, transcript, locale, session_id, turn_sequence, context_messages, status, claimed_at, expires_at, created_at, binding_id, target_chat_id, claimed_by_chat_id, client_turn_id, conversation_id, lease_id, listener_generation, resolved_generation, claim_token, claim_deadline, claim_generation, generation, answered_at, reply_event_id, attempt_count, answerable, legacy, legacy_fence, legacy_drain, receipt]
       properties:
         ask_id: { type: string }
         agent_id: { type: string }
         user_id: { type: string }
-        agent_label: { type: string }
+        agent_label: { type: [string, 'null'] }
         transcript: { type: string, minLength: 1, maxLength: 2000 }
         locale: { type: [string, 'null'] }
         session_id: { type: [string, 'null'] }
-        status: { type: string, enum: [queued, claimed, expired] }
+        turn_sequence: { type: [integer, 'null'], minimum: 1 }
+        context_messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/AskContextMessage'
+        status: { type: string, enum: [queued, claimed, answered, expired] }
         claimed_at: { type: [string, 'null'], format: date-time }
         expires_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
+        binding_id: { type: [string, 'null'] }
+        target_chat_id: { type: [string, 'null'] }
+        claimed_by_chat_id: { type: [string, 'null'] }
+        client_turn_id: { type: [string, 'null'] }
+        conversation_id: { type: [string, 'null'] }
+        lease_id: { type: [string, 'null'] }
+        listener_generation: { type: [integer, 'null'], minimum: 1 }
+        resolved_generation: { type: [integer, 'null'], minimum: 1 }
+        claim_token: { type: [string, 'null'] }
+        claim_deadline: { type: [string, 'null'], format: date-time }
+        claim_generation: { type: [integer, 'null'], minimum: 1 }
+        generation: { type: [integer, 'null'], minimum: 1, description: Compatibility alias of claim_generation. }
+        answered_at: { type: [string, 'null'], format: date-time }
+        reply_event_id: { type: [string, 'null'] }
+        attempt_count: { type: integer, minimum: 0 }
+        answerable: { type: boolean }
+        legacy: { type: boolean }
+        legacy_fence: { type: boolean }
+        legacy_drain: { type: boolean, description: Legacy claimed Ask may be observed for drain-only handling but cannot be answered without claim credentials. }
+        receipt:
+          $ref: '#/components/schemas/AskReceipt'
+        deduped: { type: boolean }
     CreatePhoneAskRequest:
       type: object
       additionalProperties: false
-      required: [transcript, idempotency_key]
+      required: [transcript, client_turn_id, binding_id, lease_id, generation, target_chat_id]
       properties:
         transcript: { type: string, minLength: 1, maxLength: 2000 }
-        locale: { type: string, minLength: 2, maxLength: 35 }
+        locale: { type: [string, 'null'], minLength: 2, maxLength: 35 }
+        client_turn_id: { type: string, minLength: 8, maxLength: 128 }
         idempotency_key: { type: string, minLength: 8, maxLength: 128 }
+        binding_id: { type: string, minLength: 1, maxLength: 128 }
+        lease_id: { type: string, minLength: 8, maxLength: 128 }
+        generation: { type: integer, minimum: 1 }
+        target_chat_id: { type: string, minLength: 1, maxLength: 128 }
+        session_id: { type: [string, 'null'], maxLength: 128 }
+    AskContextMessage:
+      type: object
+      additionalProperties: false
+      required: [message_id, role, content, metadata, sequence, created_at]
+      properties:
+        message_id: { type: string }
+        role: { type: string }
+        content: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        sequence: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+    AskReceipt:
+      type: object
+      additionalProperties: false
+      required: [ask_id, client_turn_id, conversation_id, binding_id, lease_id, listener_generation, target_chat_id, idempotency_key, status, created_at]
+      properties:
+        ask_id: { type: string }
+        client_turn_id: { type: [string, 'null'] }
+        conversation_id: { type: [string, 'null'] }
+        binding_id: { type: [string, 'null'] }
+        lease_id: { type: [string, 'null'] }
+        listener_generation: { type: [integer, 'null'], minimum: 1 }
+        target_chat_id: { type: [string, 'null'] }
+        idempotency_key: { type: string }
+        status: { type: string, enum: [queued, claimed, answered, expired] }
+        created_at: { type: string, format: date-time }
+    ListenerBindingSummary:
+      type: object
+      additionalProperties: false
+      required: [binding_id, chat_id, chat_title, lease_id, generation, expires_at, renew_after_ms]
+      properties:
+        binding_id: { type: string }
+        chat_id: { type: string }
+        chat_title: { type: string }
+        lease_id: { type: string }
+        generation: { type: integer, minimum: 1 }
+        expires_at: { type: string, format: date-time }
+        renew_after_ms: { type: integer, minimum: 1 }
+    AgentAskPage:
+      type: object
+      additionalProperties: false
+      required: [asks, binding]
+      properties:
+        asks:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhoneAsk'
+        binding:
+          $ref: '#/components/schemas/ListenerBindingSummary'
+    ListenerRegistrationRequest:
+      type: object
+      additionalProperties: false
+      required: [chat_id, chat_title, listener_instance_id]
+      dependentRequired:
+        lease_id: [generation]
+        generation: [lease_id]
+      properties:
+        chat_id: { type: string, minLength: 1, maxLength: 128 }
+        chat_title: { type: string, minLength: 1, maxLength: 160 }
+        listener_instance_id: { type: string, minLength: 8, maxLength: 128 }
+        lease_id: { type: string, minLength: 8, maxLength: 128 }
+        generation: { type: integer, minimum: 1 }
+        takeover: { type: boolean, default: false }
+    ListenerHeartbeatRequest:
+      type: object
+      additionalProperties: false
+      required: [lease_id, generation]
+      properties:
+        lease_id: { type: string, minLength: 8, maxLength: 128 }
+        generation: { type: integer, minimum: 1 }
+    ListenerLease:
+      type: object
+      additionalProperties: false
+      required: [binding_id, agent_id, chat_id, chat_title, listener_instance_id, lease_id, generation, status, last_seen_at, expires_at, renew_after_ms]
+      properties:
+        binding_id: { type: string }
+        agent_id: { type: string }
+        chat_id: { type: string }
+        chat_title: { type: string }
+        listener_instance_id: { type: string }
+        lease_id: { type: string }
+        generation: { type: integer, minimum: 1 }
+        status: { type: string, enum: [active] }
+        last_seen_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        renew_after_ms: { type: integer, minimum: 1 }
+    ListenerDisconnectResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, released, binding_id, agent_id, chat_id, listener_instance_id, lease_id, generation, released_at]
+      properties:
+        ok: { type: boolean, const: true }
+        released: { type: boolean, const: true }
+        binding_id: { type: string }
+        agent_id: { type: string }
+        chat_id: { type: string, minLength: 1, maxLength: 128 }
+        listener_instance_id: { type: string, minLength: 8, maxLength: 128 }
+        lease_id: { type: string }
+        generation: { type: integer, minimum: 1 }
+        released_at: { type: string, format: date-time }
     RotateAgentKeyResponse:
       type: object
       required: [agent, api_key]
@@ -1330,13 +1553,24 @@ components:
         host_label: { type: [string, 'null'] }
     DeviceRegistration:
       type: object
-      required: [platform, push_token, locale]
+      additionalProperties: false
+      required: [platform]
       properties:
         platform: { type: string, enum: [ios, ios_simulator] }
-        push_token: { type: string, minLength: 1 }
-        locale: { type: string, minLength: 2, maxLength: 32 }
+        push_token: { type: [string, 'null'], minLength: 32, maxLength: 512, pattern: '^(?:[0-9A-Fa-f]{2}){16,256}$', description: Even-length hexadecimal APNs token. Ignored and never delivered when platform is ios_simulator. }
+        locale: { type: [string, 'null'], minLength: 2, maxLength: 32 }
         timezone: { type: [string, 'null'] }
         device_id: { type: [string, 'null'] }
+    DeviceRegistrationResponse:
+      type: object
+      additionalProperties: false
+      required: [device_id, platform, push_token_registered, locale, timezone]
+      properties:
+        device_id: { type: string }
+        platform: { type: string, enum: [ios, ios_simulator] }
+        push_token_registered: { type: boolean }
+        locale: { type: [string, 'null'] }
+        timezone: { type: [string, 'null'] }
     CreateSessionRequest:
       type: object
       required: [skill_id]
@@ -1351,6 +1585,8 @@ components:
           additionalProperties: true
     ProgressRequest:
       type: object
+      additionalProperties: false
+      description: Generic sessions need only status. For phone.ask or any Ask-bearing update, ask_id, claim_token, listener_generation, and all four listener headers are required and atomically fenced.
       required: [status]
       properties:
         status: { type: string, enum: [started, running, blocked, succeeded, failed, cancelled] }
@@ -1359,14 +1595,22 @@ components:
         facts:
           type: [object, 'null']
           additionalProperties: true
+        ask_id: { type: [string, 'null'], minLength: 1, description: Exact claimed Ask identity; required for Ask-bearing progress. }
+        claim_token: { type: [string, 'null'], minLength: 1, description: Exact active Ask claim token; required for Ask-bearing progress. }
+        listener_generation: { type: [integer, 'null'], minimum: 1, description: Exact current listener and Ask claim generation; required for Ask-bearing progress. }
     ReportEventRequest:
       type: object
+      additionalProperties: false
       required: [status, idempotency_key]
       properties:
         status: { type: string, enum: [info, needs_user, succeeded, failed] }
         idempotency_key: { type: string, minLength: 1 }
         summary: { type: [string, 'null'] }
-        voice_script: { type: [string, 'null'] }
+        ask_id: { type: [string, 'null'], description: Required when answering a phone.ask session. }
+        in_reply_to_ask_id: { type: [string, 'null'], deprecated: true, description: Compatibility alias of ask_id. }
+        claim_token: { type: [string, 'null'], description: Required claim credential when answering a phone.ask session. }
+        generation: { type: [integer, 'null'], minimum: 1, description: Required claim generation when answering a phone.ask session. }
+        claim_generation: { type: [integer, 'null'], minimum: 1, deprecated: true, description: Compatibility alias of generation. }
         actions:
           type: array
           items:
@@ -1381,6 +1625,7 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [title, url, content_hash]
             properties:
               title: { type: string, minLength: 1, maxLength: 500 }
@@ -1389,6 +1634,40 @@ components:
               score: { type: [number, 'null'] }
               content_hash: { type: string, minLength: 1, maxLength: 256 }
               r2_key: { type: [string, 'null'] }
+    ReadinessResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, runtime_configuration_ready, schema_ready, schema_0022_compatible, environment, version, push_mode, apns_required, apns_ready, apns_production, apns_bundle_id, apns_bundle_id_ready, action_provider_mode, action_provider_ready, action_reminder_enabled, action_message_enabled, required_migrations]
+      properties:
+        ok: { type: boolean }
+        runtime_configuration_ready: { type: boolean }
+        schema_ready: { type: boolean }
+        schema_0022_compatible: { type: boolean, description: Live D1 probe result for the complete required schema through migration 0022. }
+        environment: { type: string, enum: [development, test, staging, production] }
+        version: { type: string }
+        push_mode: { type: string, enum: [dev, apns, both] }
+        apns_required: { type: boolean }
+        apns_ready: { type: boolean }
+        apns_production: { type: boolean }
+        apns_bundle_id: { type: string }
+        apns_bundle_id_ready: { type: boolean }
+        action_provider_mode: { type: string, enum: [internal, external, disabled, invalid] }
+        action_provider_ready: { type: boolean }
+        action_reminder_enabled: { type: boolean }
+        action_message_enabled: { type: boolean }
+        code: { type: string, enum: [schema_not_ready, runtime_configuration_not_ready, apns_identity_not_ready, apns_not_ready] }
+        message: { type: string }
+        required_migrations:
+          type: array
+          prefixItems:
+            - { const: '0017' }
+            - { const: '0018' }
+            - { const: '0019' }
+            - { const: '0020' }
+            - { const: '0021' }
+            - { const: '0022' }
+          minItems: 6
+          maxItems: 6
     SearchHistoryCommandArgs:
       type: object
       additionalProperties: false
@@ -2040,15 +2319,20 @@ components:
         ok: { type: boolean, const: true }
     HealthResponse:
       type: object
-      required: [ok]
+      additionalProperties: false
+      required: [ok, api, runtime, environment, version, push_mode, apns_required, apns_ready, apns_production, apns_bundle_id, apns_bundle_id_ready, action_provider_mode, action_provider_ready, action_reminder_enabled, action_message_enabled]
       properties:
         ok: { type: boolean }
         api: { type: string }
         runtime: { type: string }
+        environment: { type: string, enum: [development, test, staging, production] }
         version: { type: string }
         push_mode: { type: string, enum: [dev, apns, both] }
+        apns_required: { type: boolean }
         apns_ready: { type: boolean }
         apns_production: { type: boolean }
+        apns_bundle_id: { type: string }
+        apns_bundle_id_ready: { type: boolean }
         action_provider_mode: { type: string, enum: [internal, external, disabled] }
         action_provider_ready: { type: boolean }
         action_reminder_enabled: { type: boolean }

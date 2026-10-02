@@ -56,16 +56,6 @@ pub struct AgentRow {
     pub label: String,
     pub host_label: Option<String>,
     pub created_at: String,
-    #[serde(default)]
-    pub last_seen_at: Option<String>,
-    #[serde(default)]
-    pub listener_binding_id: Option<String>,
-    #[serde(default)]
-    pub listener_chat_id: Option<String>,
-    #[serde(default)]
-    pub listener_chat_title: Option<String>,
-    #[serde(default)]
-    pub listener_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -385,12 +375,19 @@ pub struct SessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProgressRequest {
     pub status: String,
     pub message: Option<String>,
     pub percent: Option<f64>,
     #[serde(default)]
     pub facts: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub ask_id: Option<String>,
+    #[serde(default)]
+    pub claim_token: Option<String>,
+    #[serde(default)]
+    pub listener_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -408,22 +405,6 @@ pub struct InlineAction {
 pub enum ActionInput {
     Key(String),
     Definition(InlineAction),
-}
-
-#[derive(Debug, Deserialize)]
-pub struct EventRequest {
-    pub status: String,
-    pub summary: Option<String>,
-    #[serde(default)]
-    pub in_reply_to_ask_id: Option<String>,
-    #[serde(default)]
-    pub facts: Option<Map<String, Value>>,
-    #[serde(default)]
-    pub actions: Option<Vec<ActionInput>>,
-    pub idempotency_key: String,
-    pub force_push: Option<bool>,
-    #[serde(default)]
-    pub retrievals: Option<Vec<RetrievalInput>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,6 +433,7 @@ pub struct ActionResultRequest {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceRequest {
     pub platform: String,
     pub push_token: Option<String>,

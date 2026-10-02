@@ -176,6 +176,24 @@ fn validate_supabase_configuration(env: &Env) -> ApiResult<()> {
 /// Local development deliberately uses permissive defaults. Production must
 /// opt in explicitly so deploying the local Wrangler file cannot silently
 /// fall back to a demo JWT secret, wildcard CORS, or development push inbox.
+fn staging_push_readiness(
+    push_mode: &str,
+    apns_production: &str,
+    apns_bundle_id: &str,
+    apns_ready: bool,
+) -> bool {
+    matches!(
+        push_mode.trim().to_ascii_lowercase().as_str(),
+        "apns" | "both"
+    ) && apns_production.trim().eq_ignore_ascii_case("false")
+        && crate::apns::is_canonical_bundle_id(apns_bundle_id)
+        && apns_ready
+}
+
+fn production_apns_mode_is_enabled(value: &str) -> bool {
+    value == "true"
+}
+
 pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
     let node_env = config_value(env, "NODE_ENV", "development")
         .trim()
@@ -214,6 +232,8 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
         return Ok(());
     }
 
+    crate::providers::validate_deployment_policy(env, &node_env)?;
+
     if node_env == "staging" {
         let cors_origin = config_value(env, "CORS_ORIGIN", "");
         if cors_origin.trim().is_empty()
@@ -237,11 +257,11 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
         let push_mode = config_value(env, "PUSH_MODE", "")
             .trim()
             .to_ascii_lowercase();
-        if !matches!(push_mode.as_str(), "dev" | "apns" | "both") {
+        if !matches!(push_mode.as_str(), "apns" | "both") {
             return Err(ApiError::new(
                 500,
                 "configuration_error",
-                "PUSH_MODE must be dev, apns, or both in staging",
+                "PUSH_MODE must be apns or both in staging",
             ));
         }
         let apns_production = config_value(env, "APNS_PRODUCTION", "false")
@@ -252,6 +272,26 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
                 500,
                 "configuration_error",
                 "APNS_PRODUCTION must be false in staging",
+            ));
+        }
+        let apns_bundle_id = crate::apns::bundle_id(env);
+        if !crate::apns::is_canonical_bundle_id(&apns_bundle_id) {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "APNS_BUNDLE_ID must be hk.knockknock.app in staging",
+            ));
+        }
+        if !staging_push_readiness(
+            &push_mode,
+            &apns_production,
+            &apns_bundle_id,
+            crate::apns::is_ready(env),
+        ) {
+            return Err(ApiError::new(
+                500,
+                "configuration_error",
+                "Staging APNs signing configuration is incomplete",
             ));
         }
         return Ok(());
@@ -292,6 +332,15 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
         ));
     }
 
+    let apns_bundle_id = crate::apns::bundle_id(env);
+    if !crate::apns::is_canonical_bundle_id(&apns_bundle_id) {
+        return Err(ApiError::new(
+            500,
+            "configuration_error",
+            "APNS_BUNDLE_ID must be hk.knockknock.app in production",
+        ));
+    }
+
     if config_value(env, "VOICE_MODEL_ENABLED", "false") == "true" {
         let model_url = config_value(env, "VOICE_MODEL_URL", "");
         let model_r2_key = config_value(env, "VOICE_MODEL_R2_KEY", "");
@@ -326,7 +375,6 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
             "APNS_TEAM_ID",
             secret_value(env, "APNS_TEAM_ID").unwrap_or_default(),
         ),
-        ("APNS_BUNDLE_ID", config_value(env, "APNS_BUNDLE_ID", "")),
     ] {
         if value.trim().is_empty() || value.trim().starts_with("REPLACE_") {
             return Err(ApiError::new(
@@ -337,18 +385,53 @@ pub fn runtime_configuration(env: &Env) -> ApiResult<()> {
         }
     }
 
-    let apns_production = config_value(env, "APNS_PRODUCTION", "")
-        .trim()
-        .to_ascii_lowercase();
-    if !matches!(apns_production.as_str(), "true" | "false") {
+    let apns_production = config_value(env, "APNS_PRODUCTION", "");
+    if !production_apns_mode_is_enabled(&apns_production) {
         return Err(ApiError::new(
             500,
             "configuration_error",
-            "APNS_PRODUCTION must be true or false in production",
+            "APNS_PRODUCTION must be true in production",
         ));
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod staging_push_readiness_tests {
+    use super::{production_apns_mode_is_enabled, staging_push_readiness};
+
+    #[test]
+    fn staging_requires_real_sandbox_apns() {
+        let bundle_id = crate::apns::CANONICAL_APNS_BUNDLE_ID;
+        assert!(staging_push_readiness("apns", "false", bundle_id, true));
+        assert!(staging_push_readiness("both", "FALSE", bundle_id, true));
+        assert!(!staging_push_readiness("dev", "false", bundle_id, true));
+        assert!(!staging_push_readiness("apns", "true", bundle_id, true));
+        assert!(!staging_push_readiness("apns", "false", bundle_id, false));
+        assert!(!staging_push_readiness("apns", "false", "", true));
+        assert!(!staging_push_readiness(
+            "apns",
+            "false",
+            "hk.knockknock.wrong",
+            true
+        ));
+        assert!(!staging_push_readiness(
+            "apns",
+            "false",
+            " hk.knockknock.app",
+            true
+        ));
+    }
+
+    #[test]
+    fn production_requires_exactly_enabled_apns_mode() {
+        assert!(production_apns_mode_is_enabled("true"));
+        assert!(!production_apns_mode_is_enabled("false"));
+        assert!(!production_apns_mode_is_enabled("TRUE"));
+        assert!(!production_apns_mode_is_enabled(" true"));
+        assert!(!production_apns_mode_is_enabled("true "));
+    }
 }
 
 fn supabase_error_message(raw: &str) -> String {
@@ -738,6 +821,10 @@ fn agent_key_header(request: &Request) -> ApiResult<Option<String>> {
     Ok(request.headers().get("x-agent-key")?)
 }
 
+fn should_touch_agent_seen(policy: crate::rate_limits::RateLimitPolicy) -> bool {
+    policy.is_persistent()
+}
+
 pub async fn require_user(
     request: &Request,
     env: &Env,
@@ -783,9 +870,21 @@ pub async fn require_user(
     Ok(user)
 }
 
+fn valid_agent_key_shape(key: &str) -> bool {
+    key.strip_prefix("vak_").is_some_and(|encoded| {
+        encoded.len() == 32
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
+}
+
 pub async fn require_agent(request: &Request, db: &D1Database) -> ApiResult<AgentPrincipal> {
     let key =
         agent_key_header(request)?.ok_or_else(|| ApiError::unauthorized("Missing X-Agent-Key"))?;
+    if !valid_agent_key_shape(&key) {
+        return Err(ApiError::unauthorized("Invalid agent key"));
+    }
     let row: Option<AgentRow> = db::first(
         db,
         "SELECT id, user_id, label, host_label, created_at, last_seen_at FROM agents WHERE api_key_hash = ?",
@@ -797,15 +896,38 @@ pub async fn require_agent(request: &Request, db: &D1Database) -> ApiResult<Agen
         agent_id: row.id,
         user_id: row.user_id,
     };
-    crate::rate_limits::enforce_authenticated(
+    let method = request.method();
+    let path = request.path();
+    let policy = crate::rate_limits::route_policy(&method, &path);
+    crate::rate_limits::enforce_authenticated_with_policy(
         db,
-        request.path().as_str(),
+        &path,
         &format!("agent:{}", principal.agent_id),
         None,
+        policy,
     )
     .await?;
-    crate::asks::touch_agent_seen(db, &principal.agent_id).await?;
+    if should_touch_agent_seen(policy) {
+        crate::asks::touch_agent_seen(db, &principal.agent_id).await?;
+    }
     Ok(principal)
+}
+
+#[cfg(test)]
+mod agent_key_shape_tests {
+    use super::valid_agent_key_shape;
+
+    #[test]
+    fn malformed_agent_keys_are_rejected_before_d1_lookup() {
+        assert!(valid_agent_key_shape(
+            "vak_abcdefghijklmnopqrstuvwxyz012345"
+        ));
+        assert!(!valid_agent_key_shape("not-an-agent-key"));
+        assert!(!valid_agent_key_shape("vak_short"));
+        assert!(!valid_agent_key_shape(
+            "vak_abcdefghijklmnopqrstuvwxyz01234!"
+        ));
+    }
 }
 
 pub async fn require_user_or_agent(
@@ -978,5 +1100,21 @@ mod tests {
                 || character == '_'
                 || character == '-'));
         assert_ne!(api_key, mint_api_key().unwrap());
+    }
+
+    #[test]
+    fn agent_auth_records_activity_only_for_persistent_routes() {
+        let ask_poll = crate::rate_limits::route_policy(&Method::Get, "/v1/agents/me/asks");
+        let heartbeat =
+            crate::rate_limits::route_policy(&Method::Post, "/v1/agents/me/listener/heartbeat");
+        let release =
+            crate::rate_limits::route_policy(&Method::Delete, "/v1/agents/me/listener");
+
+        assert!(!ask_poll.is_persistent());
+        assert!(!should_touch_agent_seen(ask_poll));
+        assert!(heartbeat.is_persistent());
+        assert!(should_touch_agent_seen(heartbeat));
+        assert!(release.is_persistent());
+        assert!(should_touch_agent_seen(release));
     }
 }

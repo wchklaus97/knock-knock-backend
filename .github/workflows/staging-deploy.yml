@@ -1,154 +1,475 @@
-name: Staging deploy
+name: Staging deploy gate
 
 on:
   workflow_dispatch:
-    inputs:
-      staging_url:
-        description: HTTPS URL of the non-production staging Worker to health-check
-        required: true
-        type: string
-      apply_migrations:
-        description: Apply only migrations 0013, 0014, 0015, 0016, and 0017 through the separately gated staging path
-        required: true
-        default: false
-        type: boolean
+
+concurrency:
+  group: knock-knock-backend-staging-deploy
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
   deploy:
-    name: Deploy staging Worker/D1/R2 (no migrations)
+    name: Migrate, deploy, and verify Staging only
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     environment:
       name: staging
-      url: ${{ inputs.staging_url }}
+      url: ${{ vars.KNOCK_KNOCK_STAGING_URL }}
     env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
       STAGING_D1_DATABASE_ID: ${{ vars.KNOCK_KNOCK_STAGING_D1_DATABASE_ID }}
-      STAGING_R2_BUCKET: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
+      PRODUCTION_D1_DATABASE_ID: ${{ vars.KNOCK_KNOCK_PRODUCTION_D1_DATABASE_ID }}
+      STAGING_R2_BUCKET_NAME: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
+      PRODUCTION_R2_BUCKET_NAME: ${{ vars.KNOCK_KNOCK_PRODUCTION_R2_BUCKET }}
       STAGING_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_STAGING_SUPABASE_URL }}
+      PRODUCTION_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_PRODUCTION_SUPABASE_URL }}
+      STAGING_SUPABASE_PROJECT_REF: ${{ vars.KNOCK_KNOCK_STAGING_SUPABASE_PROJECT_REF }}
+      PRODUCTION_SUPABASE_PROJECT_REF: ${{ vars.KNOCK_KNOCK_PRODUCTION_SUPABASE_PROJECT_REF }}
       STAGING_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_STAGING_CORS_ORIGIN }}
-      # Bind health/version evidence to the exact immutable revision selected
-      # for this workflow run; a mutable environment variable is not release
-      # provenance.
+      STAGING_URL: ${{ vars.KNOCK_KNOCK_STAGING_URL }}
+      PRODUCTION_URL: ${{ vars.KNOCK_KNOCK_PRODUCTION_URL }}
+      STAGING_WORKER_NAME: ${{ vars.KNOCK_KNOCK_STAGING_WORKER_NAME }}
+      PRODUCTION_WORKER_NAME: ${{ vars.KNOCK_KNOCK_PRODUCTION_WORKER_NAME }}
+      STAGING_WORKER_ROUTE: ${{ vars.KNOCK_KNOCK_STAGING_WORKER_ROUTE }}
+      PRODUCTION_WORKER_ROUTE: ${{ vars.KNOCK_KNOCK_PRODUCTION_WORKER_ROUTE }}
       STAGING_RELEASE_VERSION: ${{ github.sha }}
-      STAGING_URL: ${{ inputs.staging_url }}
+      STAGING_DEPLOY_STARTED: "false"
+      STAGING_D1_MIGRATION_ATTEMPTED: "false"
+      STAGING_D1_0021_APPLIED: "false"
+      STAGING_ROLLBACK_COMPLETED: "false"
+      PREVIOUS_SCHEMA_0022_COMPATIBLE: "false"
+      EXPECTED_CLOUDFLARE_ACCOUNT_ID: bb3bd088c02d3baa52f7bd175c3ce953
+      EXPECTED_STAGING_D1_DATABASE_ID: cc97b563-2e1a-4ab2-96a2-3d0ba8201d9c
+      EXPECTED_PRODUCTION_D1_DATABASE_ID: cd2674a1-6363-4343-8f9f-c8307134d732
+      EXPECTED_STAGING_R2_BUCKET_NAME: knock-knock-staging
+      EXPECTED_PRODUCTION_R2_BUCKET_NAME: knock-knock-production
+      EXPECTED_STAGING_WORKER_NAME: knock-knock-backend-staging
+      EXPECTED_PRODUCTION_WORKER_NAME: knock-knock-backend-production
+      EXPECTED_STAGING_WORKER_ROUTE: knock-knock-backend-staging.wch-klaus.workers.dev
+      EXPECTED_PRODUCTION_WORKER_ROUTE: knock-knock-backend-production.wch-klaus.workers.dev
+      EXPECTED_STAGING_URL: https://knock-knock-backend-staging.wch-klaus.workers.dev
+      EXPECTED_PRODUCTION_URL: https://knock-knock-backend-production.wch-klaus.workers.dev
+      EXPECTED_STAGING_SUPABASE_PROJECT_REF: awrvwbgkzzvhbehwjues
+      EXPECTED_PRODUCTION_SUPABASE_PROJECT_REF: ccisdatvaabuekflbabo
+      EXPECTED_STAGING_SUPABASE_URL: https://awrvwbgkzzvhbehwjues.supabase.co
+      EXPECTED_PRODUCTION_SUPABASE_URL: https://ccisdatvaabuekflbabo.supabase.co
     steps:
       - name: Check out the requested backend revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain for the Worker build
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install pinned worker-build
-        run: cargo install worker-build --version 0.8.3 --locked
-
-      - name: Install pinned Wrangler
-        run: npm install --global wrangler@4.81.1
+      - name: Install pinned Worker deployment tools
+        run: |
+          set -euo pipefail
+          cargo install worker-build --version 0.8.3 --locked
+          npm install --global wrangler@4.81.1
 
       - name: Verify staging deployment prerequisites
         run: ./scripts/ci-prerequisites.sh staging
 
-      - name: Materialize staging-only Wrangler config
+      - name: Materialize hard-locked Staging Wrangler config
         run: |
           set -euo pipefail
           umask 077
 
-          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required in the staging environment}"
           : "${CLOUDFLARE_ACCOUNT_ID:?KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID is required in the staging environment}"
           : "${STAGING_D1_DATABASE_ID:?KNOCK_KNOCK_STAGING_D1_DATABASE_ID is required in the staging environment}"
-          : "${STAGING_R2_BUCKET:?KNOCK_KNOCK_STAGING_R2_BUCKET is required in the staging environment}"
+          : "${PRODUCTION_D1_DATABASE_ID:?KNOCK_KNOCK_PRODUCTION_D1_DATABASE_ID is required in the staging environment}"
+          : "${STAGING_R2_BUCKET_NAME:?KNOCK_KNOCK_STAGING_R2_BUCKET is required in the staging environment}"
+          : "${PRODUCTION_R2_BUCKET_NAME:?KNOCK_KNOCK_PRODUCTION_R2_BUCKET is required in the staging environment}"
           : "${STAGING_SUPABASE_URL:?KNOCK_KNOCK_STAGING_SUPABASE_URL is required in the staging environment}"
+          : "${PRODUCTION_SUPABASE_URL:?KNOCK_KNOCK_PRODUCTION_SUPABASE_URL is required in the staging environment}"
+          : "${STAGING_SUPABASE_PROJECT_REF:?KNOCK_KNOCK_STAGING_SUPABASE_PROJECT_REF is required in the staging environment}"
+          : "${PRODUCTION_SUPABASE_PROJECT_REF:?KNOCK_KNOCK_PRODUCTION_SUPABASE_PROJECT_REF is required in the staging environment}"
           : "${STAGING_CORS_ORIGIN:?KNOCK_KNOCK_STAGING_CORS_ORIGIN is required in the staging environment}"
-          : "${STAGING_RELEASE_VERSION:?KNOCK_KNOCK_STAGING_RELEASE_VERSION is required in the staging environment}"
+          : "${STAGING_URL:?KNOCK_KNOCK_STAGING_URL is required in the staging environment}"
+          : "${PRODUCTION_URL:?KNOCK_KNOCK_PRODUCTION_URL is required in the staging environment}"
+          : "${STAGING_WORKER_NAME:?KNOCK_KNOCK_STAGING_WORKER_NAME is required in the staging environment}"
+          : "${PRODUCTION_WORKER_NAME:?KNOCK_KNOCK_PRODUCTION_WORKER_NAME is required in the staging environment}"
+          : "${STAGING_WORKER_ROUTE:?KNOCK_KNOCK_STAGING_WORKER_ROUTE is required in the staging environment}"
+          : "${PRODUCTION_WORKER_ROUTE:?KNOCK_KNOCK_PRODUCTION_WORKER_ROUTE is required in the staging environment}"
+          : "${STAGING_RELEASE_VERSION:?github.sha is required}"
 
-          reject_production_target() {
+          require_distinct() {
             local label="$1"
-            local value="$2"
-            local normalized
-            normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
-            case "$normalized" in
-              *production*|*prod-*|*prod.*|*prod/*|*prod_*|*primary*|live|*live-*|*live.*|*live/*)
-                echo "refusing production-looking ${label}" >&2
-                exit 64
-                ;;
-            esac
+            local staging_value="$2"
+            local production_value="$3"
+            if [[ "$staging_value" == "$production_value" ]]; then
+              echo "Staging and Production ${label} must differ" >&2
+              exit 64
+            fi
           }
 
-          case "$STAGING_URL" in
-            https://*) ;;
-            *) echo 'staging_url must use HTTPS' >&2; exit 64 ;;
-          esac
-          reject_production_target 'staging URL' "$STAGING_URL"
-          reject_production_target 'staging D1 target' "$STAGING_D1_DATABASE_ID"
-          reject_production_target 'staging R2 target' "$STAGING_R2_BUCKET"
-          reject_production_target 'staging Supabase target' "$STAGING_SUPABASE_URL"
-          reject_production_target 'staging CORS origin' "$STAGING_CORS_ORIGIN"
+          require_exact() {
+            local label="$1"
+            local actual="$2"
+            local expected="$3"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "${label} does not match the source-controlled project identity" >&2
+              exit 64
+            fi
+          }
+
+          validate_worker_route() {
+            local route="$1"
+            local label="$2"
+            local segment
+            local -a segments
+            [[ "$route" =~ ^[a-z0-9.-]+$ && ${#route} -le 253 ]] \
+              || { echo "${label} must be a lowercase DNS hostname" >&2; exit 64; }
+            IFS='.' read -r -a segments <<<"$route"
+            (( ${#segments[@]} >= 2 )) \
+              || { echo "${label} must be a fully-qualified DNS hostname" >&2; exit 64; }
+            for segment in "${segments[@]}"; do
+              [[ "$segment" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+                || { echo "${label} contains an invalid DNS label" >&2; exit 64; }
+            done
+          }
+
+          parse_supabase_project_ref() {
+            local url="$1"
+            local label="$2"
+            if [[ "$url" =~ ^https://([a-z0-9]{20})\.supabase\.co$ ]]; then
+              printf '%s\n' "${BASH_REMATCH[1]}"
+              return 0
+            fi
+            echo "${label} must be exactly https://<20-character-project-ref>.supabase.co" >&2
+            exit 64
+          }
+
+          d1_id_pattern='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          bucket_pattern='^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$'
+          worker_name_pattern='^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$'
+          project_ref_pattern='^[a-z0-9]{20}$'
+          account_id_pattern='^[0-9a-f]{32}$'
+          release_pattern='^[0-9a-f]{40}$'
+
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ $account_id_pattern ]] \
+            || { echo 'Cloudflare account ID must be exactly 32 lowercase hexadecimal characters' >&2; exit 64; }
+          [[ "$STAGING_D1_DATABASE_ID" =~ $d1_id_pattern && "$PRODUCTION_D1_DATABASE_ID" =~ $d1_id_pattern ]] \
+            || { echo 'Staging and Production D1 IDs must be canonical UUIDs' >&2; exit 64; }
+          [[ "$STAGING_R2_BUCKET_NAME" =~ $bucket_pattern && "$PRODUCTION_R2_BUCKET_NAME" =~ $bucket_pattern ]] \
+            || { echo 'Staging and Production R2 bucket names are invalid' >&2; exit 64; }
+          [[ "$STAGING_WORKER_NAME" =~ $worker_name_pattern && "$PRODUCTION_WORKER_NAME" =~ $worker_name_pattern ]] \
+            || { echo 'Staging and Production Worker names are invalid' >&2; exit 64; }
+          [[ "$STAGING_SUPABASE_PROJECT_REF" =~ $project_ref_pattern && "$PRODUCTION_SUPABASE_PROJECT_REF" =~ $project_ref_pattern ]] \
+            || { echo 'Staging and Production Supabase project refs must be exactly 20 lowercase alphanumeric characters' >&2; exit 64; }
+          [[ "$STAGING_RELEASE_VERSION" =~ $release_pattern ]] \
+            || { echo 'Staging release version must be the exact Git commit SHA' >&2; exit 64; }
+
+          validate_worker_route "$STAGING_WORKER_ROUTE" 'Staging Worker route'
+          validate_worker_route "$PRODUCTION_WORKER_ROUTE" 'Production Worker route'
+          require_exact 'Cloudflare account ID' "$CLOUDFLARE_ACCOUNT_ID" "$EXPECTED_CLOUDFLARE_ACCOUNT_ID"
+          require_exact 'Staging D1 ID' "$STAGING_D1_DATABASE_ID" "$EXPECTED_STAGING_D1_DATABASE_ID"
+          require_exact 'Production D1 ID' "$PRODUCTION_D1_DATABASE_ID" "$EXPECTED_PRODUCTION_D1_DATABASE_ID"
+          require_exact 'Staging R2 bucket name' "$STAGING_R2_BUCKET_NAME" "$EXPECTED_STAGING_R2_BUCKET_NAME"
+          require_exact 'Production R2 bucket name' "$PRODUCTION_R2_BUCKET_NAME" "$EXPECTED_PRODUCTION_R2_BUCKET_NAME"
+          require_exact 'Staging Worker name' "$STAGING_WORKER_NAME" "$EXPECTED_STAGING_WORKER_NAME"
+          require_exact 'Production Worker name' "$PRODUCTION_WORKER_NAME" "$EXPECTED_PRODUCTION_WORKER_NAME"
+          require_exact 'Staging Worker route' "$STAGING_WORKER_ROUTE" "$EXPECTED_STAGING_WORKER_ROUTE"
+          require_exact 'Production Worker route' "$PRODUCTION_WORKER_ROUTE" "$EXPECTED_PRODUCTION_WORKER_ROUTE"
+          require_exact 'Staging Worker URL' "$STAGING_URL" "$EXPECTED_STAGING_URL"
+          require_exact 'Production Worker URL' "$PRODUCTION_URL" "$EXPECTED_PRODUCTION_URL"
+          require_exact 'Staging Supabase project ref' "$STAGING_SUPABASE_PROJECT_REF" "$EXPECTED_STAGING_SUPABASE_PROJECT_REF"
+          require_exact 'Production Supabase project ref' "$PRODUCTION_SUPABASE_PROJECT_REF" "$EXPECTED_PRODUCTION_SUPABASE_PROJECT_REF"
+          require_exact 'Staging Supabase URL' "$STAGING_SUPABASE_URL" "$EXPECTED_STAGING_SUPABASE_URL"
+          require_exact 'Production Supabase URL' "$PRODUCTION_SUPABASE_URL" "$EXPECTED_PRODUCTION_SUPABASE_URL"
+          [[ "$STAGING_URL" == "https://${STAGING_WORKER_ROUTE}" ]] \
+            || { echo 'Staging URL must exactly match the Staging Worker route' >&2; exit 64; }
+          [[ "$PRODUCTION_URL" == "https://${PRODUCTION_WORKER_ROUTE}" ]] \
+            || { echo 'Production URL must exactly match the Production Worker route' >&2; exit 64; }
+          [[ "$STAGING_CORS_ORIGIN" == "$STAGING_URL" ]] \
+            || { echo 'Staging CORS origin must exactly match the Staging URL' >&2; exit 64; }
+
+          parsed_staging_supabase_ref="$(parse_supabase_project_ref "$STAGING_SUPABASE_URL" 'Staging Supabase URL')"
+          parsed_production_supabase_ref="$(parse_supabase_project_ref "$PRODUCTION_SUPABASE_URL" 'Production Supabase URL')"
+          [[ "$parsed_staging_supabase_ref" == "$STAGING_SUPABASE_PROJECT_REF" ]] \
+            || { echo 'Staging Supabase URL does not match its exact project ref' >&2; exit 64; }
+          [[ "$parsed_production_supabase_ref" == "$PRODUCTION_SUPABASE_PROJECT_REF" ]] \
+            || { echo 'Production Supabase URL does not match its exact project ref' >&2; exit 64; }
+
+          require_distinct 'D1 IDs' "$STAGING_D1_DATABASE_ID" "$PRODUCTION_D1_DATABASE_ID"
+          require_distinct 'R2 bucket names' "$STAGING_R2_BUCKET_NAME" "$PRODUCTION_R2_BUCKET_NAME"
+          require_distinct 'Worker names' "$STAGING_WORKER_NAME" "$PRODUCTION_WORKER_NAME"
+          require_distinct 'Worker routes' "$STAGING_WORKER_ROUTE" "$PRODUCTION_WORKER_ROUTE"
+          require_distinct 'Supabase project refs' "$parsed_staging_supabase_ref" "$parsed_production_supabase_ref"
 
           config="$RUNNER_TEMP/wrangler.staging.toml"
+          config_base="$RUNNER_TEMP/wrangler.staging.base.toml"
+          awk \
+            -v worker_name="$STAGING_WORKER_NAME" '
+              /^name = / {
+                print "name = \"" worker_name "\""
+                next
+              }
+              { print }
+            ' "$GITHUB_WORKSPACE/wrangler.staging.toml.example" > "$config_base"
           sed \
             -e "s|^main = .*|main = \"${GITHUB_WORKSPACE}/build/worker/shim.mjs\"|" \
             -e "s|REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL|${STAGING_SUPABASE_URL}|g" \
             -e "s|REPLACE_WITH_STAGING_ALLOWED_ORIGIN|${STAGING_CORS_ORIGIN}|g" \
             -e "s|REPLACE_WITH_STAGING_RELEASE_VERSION|${STAGING_RELEASE_VERSION}|g" \
             -e "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|${STAGING_D1_DATABASE_ID}|g" \
-            -e "s|REPLACE_WITH_STAGING_R2_BUCKET_NAME|${STAGING_R2_BUCKET}|g" \
-            wrangler.staging.toml.example > "$config"
+            -e "s|REPLACE_WITH_STAGING_R2_BUCKET_NAME|${STAGING_R2_BUCKET_NAME}|g" \
+            "$config_base" > "$config"
+          rm -f -- "$config_base"
+          cp -R -- "$GITHUB_WORKSPACE/migrations" "$RUNNER_TEMP/migrations"
 
           test -s "$config"
+          if grep -Eq 'REPLACE_WITH_|wrangler\.production\.toml|--env[[:space:]]+production' "$config"; then
+            echo 'Staging config contains an unresolved placeholder or Production reference' >&2
+            exit 64
+          fi
+          grep -Fqx "name = \"${STAGING_WORKER_NAME}\"" "$config"
           grep -Fqx "main = \"${GITHUB_WORKSPACE}/build/worker/shim.mjs\"" "$config"
-          grep -Fqx 'name = "knock-knock-backend-staging"' "$config"
+          grep -Fqx 'workers_dev = true' "$config"
+          if grep -Eq '^[[:space:]]*(routes|route)[[:space:]]*=|custom_domain' "$config"; then
+            echo 'workers.dev Staging config must not declare a custom route or custom domain' >&2
+            exit 64
+          fi
           grep -Fqx 'NODE_ENV = "staging"' "$config"
           grep -Fqx 'PUSH_MODE = "both"' "$config"
           grep -Fqx 'APNS_PRODUCTION = "false"' "$config"
+          grep -Fqx 'APNS_BUNDLE_ID = "hk.knockknock.app"' "$config"
           grep -Fqx 'ACTION_PROVIDER_MODE = "disabled"' "$config"
           grep -Fqx 'ACTION_REMINDER_ENABLED = "false"' "$config"
           grep -Fqx 'ACTION_MESSAGE_ENABLED = "false"' "$config"
+          grep -Fqx "SUPABASE_URL = \"${STAGING_SUPABASE_URL}\"" "$config"
+          grep -Fqx "CORS_ORIGIN = \"${STAGING_CORS_ORIGIN}\"" "$config"
           grep -Fqx "database_id = \"${STAGING_D1_DATABASE_ID}\"" "$config"
-          grep -Fqx "bucket_name = \"${STAGING_R2_BUCKET}\"" "$config"
+          grep -Fqx "bucket_name = \"${STAGING_R2_BUCKET_NAME}\"" "$config"
+          grep -Fqx 'migrations_dir = "migrations"' "$config"
           test "$(grep -Fc '[[d1_databases]]' "$config")" -eq 1
           test "$(grep -Fc '[[r2_buckets]]' "$config")" -eq 1
 
           for forbidden_binding in kv_namespaces durable_objects queues services vectorize hyperdrive dispatch_namespaces; do
             if grep -Fq "[[$forbidden_binding]]" "$config"; then
-              echo "staging config contains an unsupported non-staging binding: $forbidden_binding" >&2
+              echo "Staging config contains unsupported binding: $forbidden_binding" >&2
               exit 64
             fi
           done
 
-          if grep -Eq 'wrangler\.production\.toml|--env[[:space:]]+production' "$config"; then
-            echo 'staging config contains a production deployment reference' >&2
-            exit 64
-          fi
+          python3 - "$config" <<'PY'
+          import os
+          import pathlib
+          import sys
+          import tomllib
 
-          # Only the path is exported; config values and secrets are never printed.
+          with pathlib.Path(sys.argv[1]).open("rb") as config_file:
+              config = tomllib.load(config_file)
+
+          assert config["name"] == os.environ["STAGING_WORKER_NAME"]
+          assert config["workers_dev"] is True
+          assert "route" not in config
+          assert "routes" not in config
+          assert config["vars"]["SUPABASE_URL"] == os.environ["STAGING_SUPABASE_URL"]
+          assert config["vars"]["APNS_BUNDLE_ID"] == "hk.knockknock.app"
+          assert config["d1_databases"] == [{
+              "binding": "DB",
+              "database_name": "knock-knock-staging",
+              "database_id": os.environ["STAGING_D1_DATABASE_ID"],
+              "migrations_dir": "migrations",
+          }]
+          assert config["r2_buckets"] == [{
+              "binding": "R2",
+              "bucket_name": os.environ["STAGING_R2_BUCKET_NAME"],
+          }]
+          PY
+
           echo "STAGING_WRANGLER_CONFIG=$config" >> "$GITHUB_ENV"
 
-      - name: Deploy staging Worker with only staging D1/R2 bindings
+      - name: Dry-run hard-locked Staging Worker config before D1 changes
         run: |
           set -euo pipefail
           test -n "${STAGING_WRANGLER_CONFIG:-}"
-          test ! -e "$GITHUB_WORKSPACE/wrangler.production.toml"
-          # The config is intentionally materialized outside the checkout so
-          # its values are not part of the project tree. Keep Wrangler's
-          # project root anchored to the checkout so the custom worker-build
-          # output and the config's relative main path resolve together.
-          # This job intentionally has no `wrangler d1 migrations apply` path.
-          wrangler deploy --cwd "$GITHUB_WORKSPACE" --config "$STAGING_WRANGLER_CONFIG"
+          grep -Fqx 'workers_dev = true' "$STAGING_WRANGLER_CONFIG"
+          if grep -Eq '^[[:space:]]*(routes|route)[[:space:]]*=|custom_domain' "$STAGING_WRANGLER_CONFIG"; then
+            echo 'refusing a custom route for the workers.dev Staging Worker' >&2
+            exit 64
+          fi
+          wrangler deploy \
+            --dry-run \
+            --strict \
+            --cwd "$GITHUB_WORKSPACE" \
+            --config "$STAGING_WRANGLER_CONFIG"
 
-      - name: Verify deployed staging health contract
+      - name: Record current Staging Worker and D1 restore points
+        id: snapshot
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required for Staging restore-point capture}"
+          test -n "${STAGING_WRANGLER_CONFIG:-}"
+
+          deployment_status="$RUNNER_TEMP/staging-deployment-before.json"
+          wrangler deployments status \
+            --json \
+            --cwd "$GITHUB_WORKSPACE" \
+            --config "$STAGING_WRANGLER_CONFIG" > "$deployment_status"
+          active_versions="$(jq -c '
+            [
+              .. | objects
+              | select((.version_id? // .versionId?) != null)
+              | {
+                  id: (.version_id? // .versionId?),
+                  percentage: (.percentage? // .traffic? // null)
+                }
+            ]
+            | unique_by(.id)
+          ' "$deployment_status")"
+          jq -e '
+            length == 1 and
+            (.[0].id | type == "string" and length >= 32) and
+            (.[0].percentage == null or (.[0].percentage | tonumber) == 100)
+          ' <<<"$active_versions" >/dev/null
+          previous_version_id="$(jq -r '.[0].id' <<<"$active_versions")"
+
+          staging_url="${STAGING_URL%/}"
+          previous_health="$(curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 20 "${staging_url}/health")"
+          previous_ready_file="$RUNNER_TEMP/staging-ready-before.json"
+          previous_ready_http_code="$(curl --silent --show-error --connect-timeout 10 --max-time 20 --output "$previous_ready_file" --write-out '%{http_code}' "${staging_url}/ready" || true)"
+          if [[ "$previous_ready_http_code" == "404" ]]; then
+            printf '%s\n' '{"ok":false,"schema_ready":false,"schema_0022_compatible":false}' > "$previous_ready_file"
+          elif [[ "$previous_ready_http_code" != "200" ]]; then
+            cat "$previous_ready_file"
+            echo "Unexpected Staging /ready status: $previous_ready_http_code" >&2
+            exit 1
+          fi
+          previous_ready="$(cat "$previous_ready_file")"
+          previous_service_version="$(jq -r 'select(.ok == true) | .version // empty' <<<"$previous_health")"
+          test -n "$previous_service_version"
+          previous_schema_0022_compatible="$(jq -r '
+            if .ok == true and .schema_ready == true and .schema_0022_compatible == true then "true" else "false" end
+          ' <<<"$previous_ready")"
+
+          d1_bookmark_file="$RUNNER_TEMP/staging-d1-bookmark-before.json"
+          wrangler d1 time-travel info DB \
+            --json \
+            --cwd "$GITHUB_WORKSPACE" \
+            --config "$STAGING_WRANGLER_CONFIG" > "$d1_bookmark_file"
+          d1_bookmark="$(jq -r '[.. | objects | .bookmark? // empty] | first // empty' "$d1_bookmark_file")"
+          test -n "$d1_bookmark"
+
+          d1_state_file="$RUNNER_TEMP/staging-d1-state-before.json"
+          wrangler d1 execute DB \
+            --remote \
+            --json \
+            --cwd "$GITHUB_WORKSPACE" \
+            --config "$STAGING_WRANGLER_CONFIG" \
+            --command "SELECT COUNT(*) AS migration_count, COALESCE((SELECT name FROM d1_migrations ORDER BY id DESC LIMIT 1), '') AS latest_migration FROM d1_migrations" > "$d1_state_file"
+          jq -e 'type == "array" and length == 1 and (.[0].results | length == 1)' "$d1_state_file" >/dev/null
+          d1_latest_migration="$(jq -r '.[0].results[0].latest_migration' "$d1_state_file")"
+          d1_migration_count="$(jq -r '.[0].results[0].migration_count' "$d1_state_file")"
+
+          {
+            echo "PREVIOUS_WORKER_VERSION_ID=$previous_version_id"
+            echo "PREVIOUS_SERVICE_VERSION=$previous_service_version"
+            echo "PREVIOUS_SCHEMA_0022_COMPATIBLE=$previous_schema_0022_compatible"
+            echo "PREDEPLOY_D1_BOOKMARK=$d1_bookmark"
+          } >> "$GITHUB_ENV"
+
+          printf '%s\n' \
+            '### Staging pre-deploy restore points' \
+            "- Worker version ID: $previous_version_id" \
+            "- Worker service version: $previous_service_version" \
+            "- Previous Worker schema 0022 compatibility: $previous_schema_0022_compatible" \
+            "- D1 Time Travel bookmark: $d1_bookmark" \
+            "- D1 migrations before gate: $d1_migration_count (latest: $d1_latest_migration)" \
+            '' \
+            '### Manual D1 recovery only' \
+            'Migration 0021 changes registration data and is not expand-only. Do not restore automatically: first review writes after the bookmark because Time Travel overwrites the database in place.' \
+            '```bash' \
+            "CLOUDFLARE_ACCOUNT_ID='${CLOUDFLARE_ACCOUNT_ID}' wrangler d1 time-travel restore '${STAGING_D1_DATABASE_ID}' --bookmark='${d1_bookmark}'" \
+            '```' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply Staging migrations through 0022 before Worker traffic
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required for Staging D1 migration}"
+          test -f migrations/0021_push_registration_uniqueness.sql
+          test -f migrations/0022_listener_lease_release.sql
+          # Set this before the remote command. Wrangler can return non-zero
+          # after D1 has accepted part or all of a migration batch, so any
+          # attempted migration must enter the conservative HOLD path.
+          echo 'STAGING_D1_MIGRATION_ATTEMPTED=true' >> "$GITHUB_ENV"
+          wrangler d1 migrations apply DB \
+            --remote \
+            --cwd "$GITHUB_WORKSPACE" \
+            --config "$STAGING_WRANGLER_CONFIG"
+          echo 'STAGING_D1_0022_APPLIED=true' >> "$GITHUB_ENV"
+
+      - name: Probe Staging 0022 readiness schema and 0021 uniqueness invariants
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required for Staging D1 schema probes}"
+          schema_probe="$(wrangler d1 execute DB \
+            --remote \
+            --json \
+            --cwd "$GITHUB_WORKSPACE" \
+            --config "$STAGING_WRANGLER_CONFIG" \
+            --command "SELECT EXISTS(SELECT 1 FROM d1_migrations WHERE name = '0021_push_registration_uniqueness.sql') AS migration_0021, EXISTS(SELECT 1 FROM d1_migrations WHERE name = '0022_listener_lease_release.sql') AS migration_0022, (SELECT GROUP_CONCAT(name, ',') FROM (SELECT name FROM d1_migrations WHERE name IN ('0017_agent_chat_bindings.sql', '0018_listener_lease_fencing.sql', '0019_phone_ask_claim_fencing.sql', '0020_session_event_apns_outbox.sql', '0021_push_registration_uniqueness.sql', '0022_listener_lease_release.sql') ORDER BY id)) AS migration_tail, EXISTS(SELECT 1 FROM pragma_table_info('agent_listener_leases') WHERE name = 'released_at') AS schema_0022_compatible, EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_devices_registration_owner') AS owner_index, EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_devices_active_push_token') AS token_index, EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_devices_push_token_normalized_insert') AS normalization_insert_trigger, EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_devices_push_token_normalized_update') AS normalization_update_trigger, (SELECT COUNT(*) FROM (SELECT user_id, platform, device_id FROM devices WHERE device_id IS NOT NULL GROUP BY user_id, platform, device_id HAVING COUNT(*) > 1)) AS duplicate_owners, (SELECT COUNT(*) FROM (SELECT LOWER(TRIM(push_token)) FROM devices WHERE push_token IS NOT NULL GROUP BY LOWER(TRIM(push_token)) HAVING COUNT(*) > 1)) AS duplicate_tokens, (SELECT COUNT(*) FROM devices WHERE push_token IS NOT NULL AND push_token <> LOWER(TRIM(push_token))) AS non_normalized_tokens")"
+          jq -e '
+            type == "array" and length == 1 and
+            (.[0].results | length == 1) and
+            (.[0].results[0] |
+              .migration_0021 == 1 and
+              .migration_0022 == 1 and
+              .migration_tail == "0017_agent_chat_bindings.sql,0018_listener_lease_fencing.sql,0019_phone_ask_claim_fencing.sql,0020_session_event_apns_outbox.sql,0021_push_registration_uniqueness.sql,0022_listener_lease_release.sql" and
+              .schema_0022_compatible == 1 and
+              .owner_index == 1 and
+              .token_index == 1 and
+              .normalization_insert_trigger == 1 and
+              .normalization_update_trigger == 1 and
+              .duplicate_owners == 0 and
+              .duplicate_tokens == 0 and
+              .non_normalized_tokens == 0)
+          ' <<<"$schema_probe" >/dev/null
+
+          foreign_key_probe="$(wrangler d1 execute DB \
+            --remote \
+            --json \
+            --cwd "$GITHUB_WORKSPACE" \
+            --config "$STAGING_WRANGLER_CONFIG" \
+            --command "PRAGMA foreign_key_check")"
+          jq -e 'type == "array" and length == 1 and (.[0].results | length == 0)' \
+            <<<"$foreign_key_probe" >/dev/null
+
+      - name: Deploy code to the hard-locked Staging Worker
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required for Staging Worker deployment}"
+          echo 'STAGING_DEPLOY_STARTED=true' >> "$GITHUB_ENV"
+          wrangler deploy \
+            --strict \
+            --cwd "$GITHUB_WORKSPACE" \
+            --config "$STAGING_WRANGLER_CONFIG"
+
+      - name: Verify Staging health and readiness contracts
         run: |
           set -euo pipefail
           staging_url="${STAGING_URL%/}"
-          health_ok=false
+          gate_ok=false
           for attempt in $(seq 1 12); do
-            health=""
+            health=''
+            ready=''
             if health="$(curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 20 "${staging_url}/health")" \
+              && ready="$(curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 20 "${staging_url}/ready")" \
               && jq -e --arg expected_version "$STAGING_RELEASE_VERSION" '
                 (.ok == true) and
                 (.api == "rust") and
@@ -157,142 +478,133 @@ jobs:
                 (.push_mode == "both") and
                 (.apns_ready == true) and
                 (.apns_production == false) and
+                (.apns_bundle_id == "hk.knockknock.app") and
+                (.apns_bundle_id_ready == true) and
                 (.action_provider_mode == "disabled") and
                 (.action_provider_ready == false) and
                 (.action_reminder_enabled == false) and
                 (.action_message_enabled == false)
-              ' <<<"$health" >/dev/null; then
-              health_ok=true
+              ' <<<"$health" >/dev/null \
+              && jq -e --arg expected_version "$STAGING_RELEASE_VERSION" '
+                (.ok == true) and
+                (.runtime_configuration_ready == true) and
+                (.schema_ready == true) and
+                (.schema_0022_compatible == true) and
+                (.environment == "staging") and
+                (.version == $expected_version) and
+                (.push_mode == "both") and
+                (.apns_production == false) and
+                (.apns_ready == true) and
+                (.apns_bundle_id == "hk.knockknock.app") and
+                (.apns_bundle_id_ready == true) and
+                (.action_provider_mode == "disabled") and
+                (.action_provider_ready == false) and
+                (.action_reminder_enabled == false) and
+                (.action_message_enabled == false) and
+                (.required_migrations == ["0017", "0018", "0019", "0020", "0021", "0022"])
+              ' <<<"$ready" >/dev/null; then
+              gate_ok=true
               break
             fi
             if (( attempt < 12 )); then
-              echo "staging health is not ready yet (attempt ${attempt}/12); retrying" >&2
+              echo "Staging health/readiness has not converged (attempt ${attempt}/12)" >&2
               sleep 5
             fi
           done
-          if [[ "$health_ok" != true ]]; then
-            echo 'staging health did not converge to the deployed revision' >&2
-            exit 1
+          [[ "$gate_ok" == true ]] || { echo 'Staging health/readiness gate failed' >&2; exit 1; }
+
+      - name: Lock post-deploy contract origin before login credentials
+        run: |
+          set -euo pipefail
+          test "$STAGING_URL" = "$EXPECTED_STAGING_URL"
+          test "$EXPECTED_STAGING_URL" = 'https://knock-knock-backend-staging.wch-klaus.workers.dev'
+          echo "POST_DEPLOY_CONTRACT_BASE_URL=$EXPECTED_STAGING_URL" >> "$GITHUB_ENV"
+
+      - name: Run the deployed Staging API contract in login mode
+        env:
+          BASE_URL: ${{ env.POST_DEPLOY_CONTRACT_BASE_URL }}
+          SMOKE_AUTH_MODE: login
+          SMOKE_EMAIL: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_EMAIL }}
+          SMOKE_PASSWORD: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_PASSWORD }}
+          SMOKE_OTHER_EMAIL: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_OTHER_EMAIL }}
+          SMOKE_OTHER_PASSWORD: ${{ secrets.KNOCK_KNOCK_STAGING_SMOKE_OTHER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test "$BASE_URL" = 'https://knock-knock-backend-staging.wch-klaus.workers.dev'
+          : "${SMOKE_EMAIL:?KNOCK_KNOCK_STAGING_SMOKE_EMAIL is required}"
+          : "${SMOKE_PASSWORD:?KNOCK_KNOCK_STAGING_SMOKE_PASSWORD is required}"
+          : "${SMOKE_OTHER_EMAIL:?KNOCK_KNOCK_STAGING_SMOKE_OTHER_EMAIL is required}"
+          : "${SMOKE_OTHER_PASSWORD:?KNOCK_KNOCK_STAGING_SMOKE_OTHER_PASSWORD is required}"
+          ./scripts/contract-smoke.sh
+
+      - name: Restore the previous Staging Worker version on gate failure
+        if: ${{ failure() && env.STAGING_DEPLOY_STARTED == 'true' && env.PREVIOUS_WORKER_VERSION_ID != '' && env.PREVIOUS_SCHEMA_0022_COMPATIBLE == 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required for a compatible Staging Worker rollback}"
+          # D1 is intentionally not auto-restored because Time Travel would
+          # overwrite concurrent writes. Restore only the exact Worker version
+          # recorded before this Staging run; the reviewed D1 command is in the
+          # job summary.
+          wrangler rollback "$PREVIOUS_WORKER_VERSION_ID" \
+            --message "Automatic Staging rollback after failed gate for ${GITHUB_SHA}" \
+            --cwd "$GITHUB_WORKSPACE" \
+            --config "$STAGING_WRANGLER_CONFIG"
+
+          staging_url="${STAGING_URL%/}"
+          rollback_ok=false
+          for attempt in $(seq 1 12); do
+            health=''
+            if health="$(curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 20 "${staging_url}/health")" \
+              && jq -e --arg expected_version "$PREVIOUS_SERVICE_VERSION" '
+                .ok == true and .version == $expected_version
+              ' <<<"$health" >/dev/null; then
+              rollback_ok=true
+              break
+            fi
+            if (( attempt < 12 )); then
+              sleep 5
+            fi
+          done
+          [[ "$rollback_ok" == true ]] || { echo 'Previous Staging Worker version did not recover' >&2; exit 1; }
+          echo 'STAGING_ROLLBACK_COMPLETED=true' >> "$GITHUB_ENV"
+          printf 'Restored Staging Worker version %s; manual D1 restore point remains %s.\n' \
+            "$PREVIOUS_WORKER_VERSION_ID" \
+            "$PREDEPLOY_D1_BOOKMARK" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: HOLD for manual forward recovery when Worker rollback is unsafe
+        if: ${{ failure() && env.STAGING_D1_MIGRATION_ATTEMPTED == 'true' && env.STAGING_ROLLBACK_COMPLETED != 'true' }}
+        run: |
+          set -euo pipefail
+          if [[ "${PREVIOUS_SCHEMA_0022_COMPATIBLE:-false}" != "true" ]]; then
+            rollback_reason='Automatic Worker rollback was skipped because the previous deployment did not provide machine-verifiable schema 0022 compatibility.'
+          elif [[ "${STAGING_DEPLOY_STARTED:-false}" != "true" ]]; then
+            rollback_reason='Automatic Worker rollback was skipped because no candidate Worker deployment started; the remote D1 migration attempt still requires forward-recovery review.'
+          else
+            rollback_reason='The previous Worker declared schema 0022 compatibility, but automatic rollback did not complete.'
           fi
-          echo 'staging health contract passed: Rust Worker, APNs sandbox profile, and disabled action provider'
+          if [[ "${STAGING_D1_0022_APPLIED:-false}" == "true" ]]; then
+            migration_state='Wrangler confirmed that the migration batch through 0022 completed.'
+          else
+            migration_state='The remote migration was attempted but completion was not confirmed; treat the migration batch through 0022 as potentially active.'
+          fi
+          printf '%s\n' \
+            '### HOLD: manual forward recovery required' \
+            '' \
+            "$rollback_reason" \
+            "$migration_state" \
+            'Do not restore D1 automatically and do not deploy an unverified previous Worker.' \
+            'Keep Production untouched. Review the candidate failure, current Worker version, D1 bookmark, and writes after the bookmark, then repair forward with a schema-0022-compatible Staging Worker.' \
+            >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Remove materialized staging config
-        if: ${{ always() }}
-        run: rm -f -- "${STAGING_WRANGLER_CONFIG:-}"
-
-  apply-migrations:
-    name: Apply staging expand migrations 0013/0014/0015/0016/0017 (explicit opt-in)
-    needs: deploy
-    if: ${{ inputs.apply_migrations == true }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # Protect this environment with required reviewers. The separate job and
-    # boolean input make remote schema changes an explicit approved path.
-    environment:
-      name: staging
-      url: ${{ inputs.staging_url }}
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ vars.KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID }}
-      STAGING_D1_DATABASE_ID: ${{ vars.KNOCK_KNOCK_STAGING_D1_DATABASE_ID }}
-      STAGING_R2_BUCKET: ${{ vars.KNOCK_KNOCK_STAGING_R2_BUCKET }}
-      STAGING_SUPABASE_URL: ${{ vars.KNOCK_KNOCK_STAGING_SUPABASE_URL }}
-      STAGING_CORS_ORIGIN: ${{ vars.KNOCK_KNOCK_STAGING_CORS_ORIGIN }}
-      STAGING_RELEASE_VERSION: ${{ github.sha }}
-    steps:
-      - name: Check out the requested backend revision
-        uses: actions/checkout@v4
-
-      - name: Install pinned Wrangler
-        run: npm install --global wrangler@4.81.1
-
-      - name: Materialize staging config and expand-only migration config
-        run: |
-          set -euo pipefail
-          umask 077
-
-          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required in the staging environment}"
-          : "${CLOUDFLARE_ACCOUNT_ID:?KNOCK_KNOCK_CLOUDFLARE_ACCOUNT_ID is required in the staging environment}"
-          : "${STAGING_D1_DATABASE_ID:?KNOCK_KNOCK_STAGING_D1_DATABASE_ID is required in the staging environment}"
-          : "${STAGING_R2_BUCKET:?KNOCK_KNOCK_STAGING_R2_BUCKET is required in the staging environment}"
-          : "${STAGING_SUPABASE_URL:?KNOCK_KNOCK_STAGING_SUPABASE_URL is required in the staging environment}"
-          : "${STAGING_CORS_ORIGIN:?KNOCK_KNOCK_STAGING_CORS_ORIGIN is required in the staging environment}"
-          : "${STAGING_RELEASE_VERSION:?KNOCK_KNOCK_STAGING_RELEASE_VERSION is required in the staging environment}"
-
-          reject_production_target() {
-            local label="$1"
-            local value="$2"
-            local normalized
-            normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
-            case "$normalized" in
-              *production*|*prod-*|*prod.*|*prod/*|*prod_*|*primary*|live|*live-*|*live.*|*live/*)
-                echo "refusing production-looking ${label}" >&2
-                exit 64
-                ;;
-            esac
-          }
-
-          reject_production_target 'staging D1 target' "$STAGING_D1_DATABASE_ID"
-          reject_production_target 'staging R2 target' "$STAGING_R2_BUCKET"
-          reject_production_target 'staging Supabase target' "$STAGING_SUPABASE_URL"
-
-          config="$RUNNER_TEMP/wrangler.staging.toml"
-          sed \
-            -e "s|^main = .*|main = \"${GITHUB_WORKSPACE}/build/worker/shim.mjs\"|" \
-            -e "s|REPLACE_WITH_STAGING_SUPABASE_PROJECT_URL|${STAGING_SUPABASE_URL}|g" \
-            -e "s|REPLACE_WITH_STAGING_ALLOWED_ORIGIN|${STAGING_CORS_ORIGIN}|g" \
-            -e "s|REPLACE_WITH_STAGING_RELEASE_VERSION|${STAGING_RELEASE_VERSION}|g" \
-            -e "s|REPLACE_WITH_STAGING_D1_DATABASE_ID|${STAGING_D1_DATABASE_ID}|g" \
-            -e "s|REPLACE_WITH_STAGING_R2_BUCKET_NAME|${STAGING_R2_BUCKET}|g" \
-            wrangler.staging.toml.example > "$config"
-
-          test -s "$config"
-          grep -Fqx "main = \"${GITHUB_WORKSPACE}/build/worker/shim.mjs\"" "$config"
-          grep -Fqx 'name = "knock-knock-backend-staging"' "$config"
-          grep -Fqx 'NODE_ENV = "staging"' "$config"
-          grep -Fqx 'PUSH_MODE = "both"' "$config"
-          grep -Fqx 'APNS_PRODUCTION = "false"' "$config"
-          grep -Fqx 'ACTION_PROVIDER_MODE = "disabled"' "$config"
-          grep -Fqx 'ACTION_REMINDER_ENABLED = "false"' "$config"
-          grep -Fqx 'ACTION_MESSAGE_ENABLED = "false"' "$config"
-          grep -Fqx "database_id = \"${STAGING_D1_DATABASE_ID}\"" "$config"
-          grep -Fqx "bucket_name = \"${STAGING_R2_BUCKET}\"" "$config"
-          test "$(grep -Fc '[[d1_databases]]' "$config")" -eq 1
-          test "$(grep -Fc '[[r2_buckets]]' "$config")" -eq 1
-
-          migration_dir="$RUNNER_TEMP/staging-expand-migrations"
-          mkdir -m 700 "$migration_dir"
-          cp -- migrations/0013_retrieval_retention_status.sql "$migration_dir/"
-          cp -- migrations/0014_command_safety.sql "$migration_dir/"
-          cp -- migrations/0015_structured_memory.sql "$migration_dir/"
-          cp -- migrations/0016_phone_asks.sql "$migration_dir/"
-          cp -- migrations/0017_agent_chat_bindings.sql "$migration_dir/"
-          test -f "$migration_dir/0013_retrieval_retention_status.sql"
-          test -f "$migration_dir/0014_command_safety.sql"
-          test -f "$migration_dir/0015_structured_memory.sql"
-          test -f "$migration_dir/0016_phone_asks.sql"
-          test -f "$migration_dir/0017_agent_chat_bindings.sql"
-          test "$(find "$migration_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 5
-
-          migration_config="$RUNNER_TEMP/wrangler.staging-migrations.toml"
-          sed \
-            -e "s|migrations_dir = \"migrations\"|migrations_dir = \"${migration_dir}\"|" \
-            "$config" > "$migration_config"
-          grep -Fqx "migrations_dir = \"${migration_dir}\"" "$migration_config"
-          echo "STAGING_MIGRATION_CONFIG=$migration_config" >> "$GITHUB_ENV"
-
-      - name: Apply only migrations 0013 through 0017 to staging D1
-        run: |
-          set -euo pipefail
-          test -n "${STAGING_MIGRATION_CONFIG:-}"
-          # The temporary migration directory contains exactly the documented
-          # expand set; no earlier, later, or production config is available.
-          test "$(grep -Fc "migrations_dir = \"${RUNNER_TEMP}/staging-expand-migrations\"" "$STAGING_MIGRATION_CONFIG")" -eq 1
-          wrangler d1 migrations apply DB --remote --cwd "$GITHUB_WORKSPACE" --config "$STAGING_MIGRATION_CONFIG"
-
-      - name: Remove materialized staging migration config
+      - name: Remove materialized Staging evidence and config
         if: ${{ always() }}
         run: |
-          rm -f -- "${STAGING_MIGRATION_CONFIG:-}" "${RUNNER_TEMP}/wrangler.staging.toml"
-          rm -f -- "${RUNNER_TEMP}/staging-expand-migrations/0013_retrieval_retention_status.sql" "${RUNNER_TEMP}/staging-expand-migrations/0014_command_safety.sql" "${RUNNER_TEMP}/staging-expand-migrations/0015_structured_memory.sql" "${RUNNER_TEMP}/staging-expand-migrations/0016_phone_asks.sql" "${RUNNER_TEMP}/staging-expand-migrations/0017_agent_chat_bindings.sql"
-          rmdir -- "${RUNNER_TEMP}/staging-expand-migrations" 2>/dev/null || true
+          rm -f -- \
+            "${STAGING_WRANGLER_CONFIG:-}" \
+            "${RUNNER_TEMP}/staging-deployment-before.json" \
+            "${RUNNER_TEMP}/staging-d1-bookmark-before.json" \
+            "${RUNNER_TEMP}/staging-d1-state-before.json"

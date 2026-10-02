@@ -21,6 +21,7 @@ echo "[phase45] contract, migration, configuration, and adversarial checks"
 ./scripts/adversarial-data-smoke.sh
 ./scripts/execution-time-authority-smoke.sh
 ./scripts/production-config-smoke.sh
+bash ./scripts/staging-contract-hard-lock-smoke.sh
 ./scripts/production-healthcheck-smoke.sh
 ./scripts/backup-restore-smoke.sh
 ./scripts/ci-log-sanitization-smoke.sh
@@ -38,6 +39,7 @@ test -x ./scripts/rate-limit-smoke.sh
 test -x ./scripts/production-healthcheck.sh
 test -x ./scripts/production-healthcheck-smoke.sh
 test -x ./scripts/staging-contract-gate.sh
+test -f ./scripts/staging-contract-hard-lock-smoke.sh
 test -x ./scripts/voice-model-candidate.sh
 test -x ./scripts/voice-model-candidate-smoke.sh
 test -x ./scripts/voice-model-release.sh
@@ -59,6 +61,7 @@ bash -n \
   ./scripts/production-healthcheck.sh \
   ./scripts/production-healthcheck-smoke.sh \
   ./scripts/staging-contract-gate.sh \
+  ./scripts/staging-contract-hard-lock-smoke.sh \
   ./scripts/voice-model-candidate.sh \
   ./scripts/voice-model-candidate-smoke.sh \
   ./scripts/voice-model-release.sh \
